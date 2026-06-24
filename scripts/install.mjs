@@ -142,9 +142,11 @@ function checkPartnerClis(spawn, logStep) {
   logStep("Checking partner CLIs...");
   const hasClaude = cliExists(spawn, "claude");
   const hasCodex = cliExists(spawn, "codex");
+  const hasTmux = runCli(spawn, "tmux", ["-V"], { allowFailure: true });
   console.log(hasClaude ? "  Claude Code CLI OK" : "  WARNING: Claude Code CLI not found on PATH.");
   console.log(hasCodex ? "  Codex CLI OK" : "  WARNING: Codex CLI not found on PATH.");
-  return { hasClaude, hasCodex };
+  console.log(hasTmux ? "  tmux OK" : "  WARNING: tmux not found on PATH. Partner sessions require tmux.");
+  return { hasClaude, hasCodex, hasTmux };
 }
 
 function runCli(spawn, command, args, { allowFailure = false } = {}) {

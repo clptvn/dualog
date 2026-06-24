@@ -15,8 +15,8 @@ Interpret the invocation text as:
 - optional free-text focus area
 - `rounds:N`
 - `effort:<level>`
-- `model:<name>`
-- `timeout:<minutes>` or `timeout:<minutes>m`: optional partner invocation timeout override, in minutes
+- `model:<name>`: optional Claude model override. Accepted examples include `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-8[1m]`, `claude-opus-4-7[1m]`, `claude-opus-4-6[1m]`, and `claude-sonnet-4-6`. Claude Fable 5 has 1M context by default; do not add a `[1m]` suffix.
+- `timeout:<minutes>` or `timeout:<minutes>m`: optional wait hint for long partner turns, in minutes
 
 If no targets are provided, ask the user what files to audit.
 
@@ -49,7 +49,7 @@ Call `mcp__codex-dialog__start_dialog` with:
 - `host_agent: "codex"`
 - `partner_agent: "claude"`
 - `max_rounds` only if explicitly requested
-- `reasoning_effort` only if explicitly requested
+- `reasoning_effort` only if explicitly requested; otherwise omit it so the server default of `high` is used
 - `model` only if explicitly requested
 - `partner_timeout_ms` if `timeout:*` was explicitly requested, or `1800000` if `effort:max` was explicitly requested without a timeout override
 - `problem_description`: a short summary such as `Comprehensive code audit of <targets>. Claude Code will audit for bugs, architecture issues, robustness, and security.`
@@ -104,8 +104,10 @@ Preferred wait strategy:
 If `wait_result` is `timeout_processing` or `timeout_idle`:
 
 1. Call `mcp__codex-dialog__check_partner_alive`
-2. If the runner died, stop and report it honestly
-3. Inspect `last_error`
+2. Inspect `partner_terminal.activity` and `partner_terminal.capture.tail_text` to see Claude's compact live tmux status
+3. If the runner died or `last_error` is populated, stop and report it honestly
+4. If the runner and tmux session are alive and the pane shows useful progress, continue waiting
+5. If the pane shows an idle prompt, repeated unchanged output, a stuck prompt, or malformed sidecar state, end the session or ask the user before restarting
 
 ## Discussion loop
 

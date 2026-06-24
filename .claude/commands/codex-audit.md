@@ -39,7 +39,7 @@ Parse $ARGUMENTS to determine:
 - **targets**: file paths, directory paths, or glob patterns to audit. Can be multiple, space-separated.
 - **focus**: after stripping any `rounds:*`, `effort:*`, and `model:*` tokens, if the last argument(s) look like a focus area rather than a path (e.g. "security", "error handling", "concurrency"), treat it as the review focus.
 - **max_rounds**: if any argument is `rounds:N` (integer), parse and pass it to `start_dialog` as `max_rounds`. Otherwise OMIT the parameter — the server will default to 5. **Never invent or adjust this value on your own.** The 5-round default is tuned to make Codex deliver complete feedback each round instead of drip-feeding. Only override when the user explicitly provided `rounds:N`.
-- **reasoning_effort**: if any argument matches `effort:<level>` where level is one of `low`, `medium`, `high`, `xhigh`, parse it and pass as `reasoning_effort`. Otherwise DO NOT pass it — let Codex use its own configured default.
+- **reasoning_effort**: if any argument matches `effort:<level>` where level is one of `low`, `medium`, `high`, `xhigh`, parse it and pass as `reasoning_effort`. Otherwise DO NOT pass it — let the server default to `high`.
 - **model**: if any argument matches `model:<name>` where name is one of `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, parse it and pass as `model`. These are the ONLY valid model IDs — do not guess or abbreviate (e.g. `gpt-5.3` is NOT valid, use `gpt-5.3-codex`). Otherwise DO NOT pass it — let Codex use its default.
 
 Examples:
@@ -71,7 +71,7 @@ Note any files that were skipped so Codex knows what it hasn't seen.
 Call `start_dialog` with:
 - `project_path`: the git project root
 - `max_rounds`: only if the user provided `rounds:N`. Otherwise OMIT this parameter.
-- `reasoning_effort`: only if the user provided `effort:<level>`. Otherwise omit the parameter entirely and let Codex use its own configured default.
+- `reasoning_effort`: only if the user provided `effort:<level>`. Otherwise omit the parameter entirely and let the server default to `high`.
 - `model`: only if the user provided `model:<id>`. Otherwise omit the parameter entirely and let Codex use its default.
 - `problem_description`: A brief summary like: "Comprehensive code audit of [target files]. Codex will review for bugs, architecture issues, correctness, and potential problems."
 
@@ -195,7 +195,7 @@ tail -F -n 0 "$HOME/.claude/dialogs/<SESSION_ID>/conversation.jsonl" 2>/dev/null
 
 When the notification arrives, call `check_messages` with the latest `since_id` (or `get_full_history`) to read the structured content — the notification itself just confirms a new message landed.
 
-**If the Monitor hits its timeout with no event**, call `check_partner_alive`. If the runner died, restart with a new `start_dialog`. Also inspect `~/.claude/dialogs/<SESSION_ID>/last_error.txt` if it exists.
+**If the Monitor hits its timeout with no event**, call `check_partner_alive`. Inspect `partner_terminal.activity` and `partner_terminal.capture.tail_text` to see Codex's compact live tmux status. If it shows useful progress, continue waiting; restart only if the runner died, `last_error` shows a real failure, or the pane shows an idle/stuck state that you decide cannot recover.
 
 Read the audit carefully once it arrives.
 
@@ -285,7 +285,7 @@ Call `end_dialog` to clean up the session.
 
 ## TROUBLESHOOTING
 
-- **Codex not responding:** Use `check_partner_alive` to check runner status.
+- **Codex not responding:** Use `check_partner_alive` to check runner status and inspect `partner_terminal.activity` plus `partner_terminal.capture.tail_text` from Codex's tmux pane.
 - **Runner died:** Start a new dialog with `start_dialog`.
 - **Too many files:** Break the audit into multiple sessions by directory or module.
 - **Want full context:** Use `get_full_history` for the complete conversation.

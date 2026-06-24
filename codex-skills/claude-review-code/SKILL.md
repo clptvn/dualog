@@ -15,24 +15,25 @@ Interpret the user's invocation text as:
 - `review_focus`: any remaining free text after stripping control tokens
 - `rounds:N`: optional soft round budget override
 - `effort:<level>`: optional Claude effort override. Valid levels are `low`, `medium`, `high`, `max`, and model-specific `xhigh`.
-- `model:<name>`: optional Claude model override. Valid models are `claude-sonnet-4-6`, `claude-opus-4-6[1m]`, `claude-opus-4-7[1m]`, `claude-opus-4-8`, and `claude-opus-4-8[1m]`.
-- `timeout:<minutes>` or `timeout:<minutes>m`: optional partner invocation timeout override, in minutes.
+- `model:<name>`: optional Claude model override. Valid models are `claude-fable-5`, `claude-sonnet-4-6`, `claude-opus-4-6[1m]`, `claude-opus-4-7[1m]`, `claude-opus-4-8`, and `claude-opus-4-8[1m]`. Claude Fable 5 has 1M context by default; do not add a `[1m]` suffix.
+- `timeout:<minutes>` or `timeout:<minutes>m`: optional wait hint for long partner turns, in minutes.
 
 If no diff target is provided, use `uncommitted`.
 
 Model and effort rules:
 
+- `claude-fable-5`: accepts `low`, `medium`, `high`, `xhigh`, `max`
 - `claude-sonnet-4-6`: accepts `low`, `medium`, `high`, `max`
 - `claude-opus-4-6[1m]`: accepts `low`, `medium`, `high`, `max`
 - `claude-opus-4-7[1m]`: accepts `low`, `medium`, `high`, `xhigh`, `max`
-- `claude-opus-4-8`: accepts `low`, `medium`, `high`, `max`
+- `claude-opus-4-8`: accepts `low`, `medium`, `high`, `xhigh`, `max`
 - `claude-opus-4-8[1m]`: accepts `low`, `medium`, `high`, `xhigh`, `max`
 
 If `model:<name>` is provided and is not one of the valid models above, stop and report the accepted model values.
 If `effort:<level>` is provided and is not valid for the selected model, stop and report the accepted effort values for that model.
-If `effort:xhigh` is provided without `model:claude-opus-4-7[1m]` or `model:claude-opus-4-8[1m]`, stop and explain that `xhigh` is only valid with `claude-opus-4-7[1m]` or `claude-opus-4-8[1m]`.
-If `effort:max` is provided and no `timeout:*` override is provided, set `partner_timeout_ms: 1800000` so max-effort Opus runs have 30 minutes instead of the default 15.
-If `timeout:*` is provided, convert minutes to milliseconds and pass `partner_timeout_ms`. Accepted server range is 1 to 60 minutes.
+If `effort:xhigh` is provided with a model that does not list `xhigh` above, stop and report the accepted effort values for that model.
+If `effort:max` is provided and no `timeout:*` override is provided, set `partner_timeout_ms: 1800000` so wait calls use a 30 minute hint instead of the default 15.
+If `timeout:*` is provided, convert minutes to milliseconds and pass `partner_timeout_ms`. This is a wait hint only; the server does not kill interactive tmux partner turns when a wait expires.
 
 ## Start the review
 
@@ -46,7 +47,7 @@ Call `mcp__codex-dialog__start_code_review` with:
 - `host_agent: "codex"`
 - `partner_agent: "claude"`
 - `max_rounds` only if the user explicitly provided `rounds:N`
-- `reasoning_effort` only if the user explicitly provided a valid `effort:<level>` for the selected model
+- `reasoning_effort` only if the user explicitly provided a valid `effort:<level>` for the selected model; otherwise omit it so the server default of `high` is used
 - `model` only if the user explicitly provided a valid `model:<name>`
 - `partner_timeout_ms` if the user explicitly provided `timeout:*`, or if `effort:max` was provided and no timeout override was provided
 
@@ -75,8 +76,10 @@ After every later `send_message`, call `mcp__codex-dialog__wait_for_partner_resp
 If `wait_result` is `timeout_processing` or `timeout_idle`:
 
 1. Call `mcp__codex-dialog__check_partner_alive`
-2. If the runner died, stop and report the error honestly
-3. Inspect `last_error` from the tool response before deciding what to do next
+2. Inspect `partner_terminal.activity` and `partner_terminal.capture.tail_text` to see Claude's compact live tmux status
+3. If the runner died or `last_error` is populated, stop and report the error honestly
+4. If the runner and tmux session are alive and the pane shows useful progress, continue waiting
+5. If the pane shows an idle prompt, repeated unchanged output, a stuck prompt, or malformed sidecar state, end the session or ask the user before restarting
 
 ## Discussion loop
 

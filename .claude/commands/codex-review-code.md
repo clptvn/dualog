@@ -37,7 +37,7 @@ Parse $ARGUMENTS to determine:
 - **diff_target**: first arg if it matches `uncommitted`, `staged`, `branch`, or `commit:<sha>`. Default: `uncommitted`
 - **review_focus**: remaining text after diff_target (excluding any `rounds:N`, `effort:*`, or `model:*` tokens), if any (e.g. "security", "performance", "correctness")
 - **max_rounds**: if any argument matches `rounds:N` (integer), parse it and pass as `max_rounds`. Otherwise DO NOT pass `max_rounds` — let the server use its tuned default of 5. **Never invent or adjust this value on your own.** The default exists for a reason: it forces Codex to deliver complete feedback each round instead of drip-feeding. Only override when the user explicitly provided `rounds:N` in the command.
-- **reasoning_effort**: if any argument matches `effort:<level>` where level is one of `low`, `medium`, `high`, `xhigh`, parse it and pass as `reasoning_effort`. Otherwise DO NOT pass it — let Codex use its own configured default. Only override when the user explicitly provided `effort:<level>` in the command.
+- **reasoning_effort**: if any argument matches `effort:<level>` where level is one of `low`, `medium`, `high`, `xhigh`, parse it and pass as `reasoning_effort`. Otherwise DO NOT pass it — let the server default to `high`. Only override when the user explicitly provided `effort:<level>` in the command.
 - **model**: if any argument matches `model:<name>` where name is one of `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, parse it and pass as `model`. These are the ONLY valid model IDs — do not guess or abbreviate (e.g. `gpt-5.3` is NOT valid, use `gpt-5.3-codex`). Otherwise DO NOT pass it — let Codex use its default model.
 
 If $ARGUMENTS is empty, use `uncommitted` as the diff target with no specific focus.
@@ -50,7 +50,7 @@ Call `start_code_review` with:
 - `project_path`: the git project root
 - `diff_target`: parsed from arguments (default: `uncommitted`)
 - `max_rounds`: only if the user provided `rounds:N`. Otherwise omit the parameter entirely and let the server default to 5.
-- `reasoning_effort`: only if the user provided `effort:<level>`. Otherwise omit the parameter entirely and let Codex use its own configured default.
+- `reasoning_effort`: only if the user provided `effort:<level>`. Otherwise omit the parameter entirely and let the server default to `high`.
 - `model`: only if the user provided `model:<id>`. Otherwise omit the parameter entirely and let Codex use its default.
 - `review_focus`: Always prepend the adversarial review stance to whatever focus the user specified. The `review_focus` string should begin with the following, then append the user's focus (if any):
 
@@ -99,7 +99,7 @@ tail -F -n 0 "$HOME/.claude/dialogs/<SESSION_ID>/conversation.jsonl" 2>/dev/null
 
 When the notification arrives, call `check_messages` with `since_id: 0` (or `get_full_history`) to read the structured content — the notification itself just confirms a new message landed.
 
-**If the Monitor hits its timeout with no event**, call `check_partner_alive`. If the runner died, restart with a new `start_code_review`. Also inspect `~/.claude/dialogs/<SESSION_ID>/last_error.txt` if it exists.
+**If the Monitor hits its timeout with no event**, call `check_partner_alive`. Inspect `partner_terminal.activity` and `partner_terminal.capture.tail_text` to see Codex's compact live tmux status. If it shows useful progress, continue waiting; restart only if the runner died, `last_error` shows a real failure, or the pane shows an idle/stuck state that you decide cannot recover.
 
 Once you receive the initial review, read it carefully. The review uses a severity-ordered taxonomy:
 - **[CRITICAL]** — bugs, security issues, data loss risk (must address)
@@ -195,7 +195,7 @@ Call `end_dialog` to clean up the session.
 
 ## TROUBLESHOOTING
 
-- **Codex not responding:** Use `check_partner_alive` to check if the runner process is still running. Check `last_error` in the response.
+- **Codex not responding:** Use `check_partner_alive` to check the runner and inspect `partner_terminal.activity` plus `partner_terminal.capture.tail_text` from Codex's tmux pane. Check `last_error` in the response.
 - **Runner died:** Start a new review with `start_code_review`.
 - **Want to see everything:** Use `get_full_history` to get the complete conversation and diff metadata.
 - **Multiple reviews:** Use `list_sessions` to see all active/completed sessions.

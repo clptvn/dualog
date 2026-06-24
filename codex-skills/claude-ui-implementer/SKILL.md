@@ -18,18 +18,18 @@ Before starting, confirm the `codex-dialog` MCP tools are available. If `mcp__co
 Interpret the invocation text as the feature request plus optional controls:
 
 - `rounds:N`: optional soft round budget override
-- `model:<name>`: optional Claude model override
+- `model:<name>`: optional Claude model override. Accepted examples include `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-8[1m]`, `claude-opus-4-7[1m]`, and `claude-sonnet-4-6`. Claude Fable 5 has 1M context by default; do not add a `[1m]` suffix.
 - `effort:<level>`: optional Claude effort override
-- `timeout:<minutes>` or `timeout:<minutes>m`: optional partner invocation timeout override, in minutes
+- `timeout:<minutes>` or `timeout:<minutes>m`: optional wait hint for long partner turns, in minutes
 
 Defaults for this skill:
 
-- `model`: `claude-opus-4-7`
-- `reasoning_effort`: `xhigh`
+- `model`: `claude-opus-4-7[1m]`
+- `reasoning_effort`: `high`
 - `tool_profile`: `implementation`
 
 Only override the default model or effort if the user explicitly provided `model:*` or `effort:*`.
-Pass `partner_timeout_ms` only if the user explicitly provided `timeout:*`, or use `1800000` if the user explicitly provided `effort:max` without a timeout override.
+Pass `partner_timeout_ms` only if the user explicitly provided `timeout:*`, or use `1800000` if the user explicitly provided `effort:max` without a timeout override. This is a wait hint only; the server does not kill interactive tmux partner turns when a wait expires.
 
 ## Split the work
 
@@ -57,8 +57,8 @@ Call `mcp__codex-dialog__start_dialog` with:
 - `project_path`
 - `host_agent: "codex"`
 - `partner_agent: "claude"`
-- `model: "claude-opus-4-7"` unless overridden
-- `reasoning_effort: "xhigh"` unless overridden
+- `model: "claude-opus-4-7[1m]"` unless overridden
+- `reasoning_effort: "high"` unless overridden
 - `tool_profile: "implementation"`
 - `max_rounds` only if the user provided `rounds:N`
 - `partner_timeout_ms` if selected during invocation parsing
@@ -122,8 +122,10 @@ Prefer the MCP wait tool instead of repeated polling:
 If `wait_result` is `timeout_processing` or `timeout_idle`:
 
 1. Call `mcp__codex-dialog__check_partner_alive`.
-2. If the runner died, inspect `last_error` and report it honestly.
-3. Do not continue as if Claude completed the UI work.
+2. Inspect `partner_terminal.activity` and `partner_terminal.capture.tail_text` to see Claude's compact live tmux status.
+3. If the runner died or `last_error` is populated, report it honestly.
+4. If the runner and tmux session are alive and the pane shows useful progress, continue waiting.
+5. If the pane shows an idle prompt, repeated unchanged output, a stuck prompt, or malformed sidecar state, end the session or ask the user before restarting. Do not proceed as if Claude completed the UI work.
 
 ## Integration loop
 

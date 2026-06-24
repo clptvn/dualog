@@ -19,8 +19,8 @@ A bidirectional MCP server for [Claude Code](https://docs.anthropic.com/en/docs/
 1. The host agent calls `start_dialog`
 2. The server spawns a background runner for the configured partner agent
 3. The host sends messages with `send_message`
-4. The runner invokes the partner CLI and appends replies to `conversation.jsonl`
-5. The conversation continues until ended, idle timeout, or hard round cap
+4. The runner starts the real interactive partner CLI in a detached tmux session, pastes the prompt into the TUI, waits for sidecar completion files, and appends replies to `conversation.jsonl`
+5. The conversation continues until ended or the hard round cap is reached
 
 ### Code review mode
 1. The host agent calls `start_code_review`
@@ -36,10 +36,11 @@ Session data is stored under `~/.claude/dialogs/`.
 - [Node.js](https://nodejs.org/) >= 18
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) on your `PATH` if you want Claude-hosted commands or Claude as a review partner
 - [Codex CLI](https://github.com/openai/codex) on your `PATH` if you want Codex-hosted skills or Codex as a review partner
+- `tmux` on your `PATH` for partner sessions. The server uses detached tmux sessions and does not open terminal windows.
 
 For the full bidirectional install, both CLIs should be available.
 
-Native Windows, macOS/Linux, and WSL are supported. On Windows, PowerShell may block npm's `.ps1` shims under the current execution policy; the server and installer use Windows-compatible command resolution so the npm `.cmd` shims still work.
+macOS, Linux, and WSL are supported when `tmux` is installed. Native Windows can still run the installer wrappers, but partner sessions require a tmux-capable environment such as WSL.
 
 ## Install
 
@@ -137,9 +138,9 @@ Restart the relevant CLI after installation or uninstall so it reloads MCP confi
 |------|-------------|
 | `send_message` | Send a message from the host agent into an ongoing session |
 | `check_messages` | Read new partner messages, current runner status, and parsed `review_status` |
-| `wait_for_partner_response` | Long-poll until the partner replies, the session reaches a terminal condition, or the wait times out |
+| `wait_for_partner_response` | Long-poll until the partner replies, the session reaches a terminal condition, or this wait call times out |
 | `get_full_history` | Get the complete conversation history |
-| `check_partner_alive` | Check whether the partner runner process is still running |
+| `check_partner_alive` | Check runner status, inferred partner activity, and a compact tail of the live or saved tmux pane |
 | `end_dialog` | End the session and return the final conversation |
 | `list_sessions` | List all dialog and review sessions |
 
@@ -157,7 +158,7 @@ Use `wait_for_partner_response` instead of repeatedly polling while the backgrou
 
 - After `start_code_review`, call `wait_for_partner_response` with `since_id: 0` to wait for the initial review.
 - After `send_message`, call `wait_for_partner_response` with `since_id` set to the returned `message_id`.
-- The default wait timeout is 10 minutes. Explicit waits are clamped to the session's `partner_timeout_ms` minus 1 minute, with an absolute max of 60 minutes.
+- The default wait timeout is 10 minutes. Explicit waits only bound the MCP wait call; they do not kill the partner. If a wait returns `timeout_processing`, call `check_partner_alive` and inspect `partner_terminal.activity` plus `partner_terminal.capture.tail_text` to decide whether it is making progress, stuck, or should be ended.
 - The tool returns the same public payload as `check_messages`, plus `wait_result`, `waited_ms`, `timed_out`, and `next_since_id`.
 - `wait_result` is one of `message`, `error`, `runner_exited`, `ended`, `hard_cap`, `timeout_processing`, `timeout_idle`, or `cancelled`.
 
@@ -204,14 +205,28 @@ To invert the flow, set:
 Both `start_dialog` and `start_code_review` also accept:
 
 - `partner_command`
-- `model`: forwarded to the selected partner CLI. Claude examples: `claude-opus-4-8`, `claude-opus-4-8[1m]`, `claude-opus-4-7[1m]`, `claude-opus-4-6[1m]`, `claude-sonnet-4-6`.
-- `reasoning_effort`
+- `model`: forwarded to the selected partner CLI. Claude examples: `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-8[1m]`, `claude-opus-4-7[1m]`, `claude-opus-4-6[1m]`, `claude-sonnet-4-6`. Claude Fable 5 has 1M context by default; do not add a `[1m]` suffix.
+- `reasoning_effort`: defaults to `high` when omitted
 - `max_rounds`
-- `partner_timeout_ms`: maximum time for each partner CLI invocation. Defaults to `900000` (15 minutes) and accepts up to `3600000` (60 minutes). Use `1800000` for 30 minute max-effort Claude runs.
+- `partner_timeout_ms`: backward-compatible wait hint for clients that choose their own `wait_for_partner_response.timeout_ms`. Defaults to `900000` (15 minutes). It no longer kills partner CLI turns.
+
+Partner runtime details:
+
+- Claude partners run through the real interactive `claude` CLI in tmux. The server does not use `claude -p` or the Agent SDK. Claude partner sessions use an empty strict MCP config so nested partner turns do not recursively load the host's MCP servers.
+- Codex partners run through the real interactive `codex` CLI in tmux. The server does not use `codex exec` for partner turns. Codex partner turns use a per-session `CODEX_HOME` with copied auth and no user MCP config, so nested Codex does not recursively boot the host's MCP servers.
+- tmux sessions use the dedicated `codex-dialog` tmux socket by default, isolated from the user's normal tmux server and config. Override with `CODEX_DIALOG_TMUX_SOCKET` if needed.
+- Completion is delivered through per-turn sidecar files under `~/.claude/dialogs/<session_id>/turns/`.
+- `check_partner_alive` includes `partner_terminal.activity`, which summarizes whether the partner appears to be thinking, reading/searching files, running a command, writing, starting, idle, or unknown. When visible, it also extracts the model label, status verb, elapsed time, and token count from the CLI status line.
+- `check_partner_alive` returns only `partner_terminal.capture.tail_text` by default, capped to a few bottom pane lines to avoid filling the caller's context window. Pass `include_full_capture: true` only when you intentionally need the full bounded pane capture.
+- Active partner turns are not killed by wall-clock timeout. This is intentional: the host agent should inspect the pane and call `end_dialog` when a partner is actually stuck, rather than relying on a blind timer for large reviews.
+- Partner turns do detect clear liveness failures: unhandled startup prompts, swallowed prompt submission, an idle prompt without sidecar completion, and long-running panes with no recognizable activity are reported as errors instead of waiting forever.
+- Inactive runners with no active turn self-shutdown after `CODEX_DIALOG_IDLE_SHUTDOWN_MS` milliseconds, defaulting to 24 hours, so abandoned sessions do not poll forever.
+- Server and runner startup sweep stale `ccd-*` sessions on the dedicated tmux socket when their recorded runner is no longer alive. Manual cleanup, if needed: `tmux -L codex-dialog kill-server`.
+- During long turns the runner periodically saves pane captures, so a later partner crash can report the last observed terminal tail or full saved capture path instead of only saying the tmux session disappeared.
 
 `start_dialog` also accepts:
 
-- `tool_profile`: `read` by default. Use `implementation` only when the partner should edit files, such as the `/claude-ui-implementer` Codex skill.
+- `tool_profile`: `read` by default. Claude read-profile sessions disallow the known file-edit tools in addition to prompting for read-only behavior, but Bash remains available for inspection commands. Use `implementation` only when the partner should edit files, such as the `/claude-ui-implementer` Codex skill.
 - `subject_path`: optional path to a reviewed document, such as a plan or spec. The dialog runner rereads this file before every partner turn and includes the current contents as authoritative context.
 - `subject_kind`: optional label for `subject_path`: `plan`, `spec`, or `document`.
 

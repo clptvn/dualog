@@ -18,6 +18,16 @@ import {
   readStatus,
   computeReviewStatus,
 } from "./shared.mjs";
+import {
+  inspectPartnerTerminal,
+  readTerminalState,
+  sweepOrphanedPartnerTerminals,
+  terminateCurrentPartnerTerminal,
+} from "./tmux-runtime.mjs";
+import {
+  ALL_REASONING_EFFORTS,
+  normalizeReasoningEffortForAgent,
+} from "./runtime-defaults.mjs";
 
 const server = new McpServer({
   name: "codex-dialog",
@@ -26,17 +36,22 @@ const server = new McpServer({
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_PARTNER_TIMEOUT_MS = 15 * 60 * 1000;
-const MAX_PARTNER_TIMEOUT_MS = 60 * 60 * 1000;
 const MIN_PARTNER_TIMEOUT_MS = 60 * 1000;
-const PARTNER_TIMEOUT_WAIT_HEADROOM_MS = 60 * 1000;
-const MAX_WAIT_TIMEOUT_MS = MAX_PARTNER_TIMEOUT_MS;
 const MIN_WAIT_TIMEOUT_MS = 1000;
+const MAX_WAIT_TIMER_MS = 2_147_483_647;
 const WAIT_FALLBACK_INTERVAL_MS = 5000;
 const WAIT_PROGRESS_INTERVAL_MS = 30000;
+const END_DIALOG_GRACE_MS = 5500;
 const MODEL_OVERRIDE_DESCRIPTION =
-  "Optional partner model override. Model strings are forwarded to the selected partner CLI. Claude examples: claude-opus-4-8, claude-opus-4-8[1m], claude-opus-4-7[1m], claude-opus-4-6[1m], claude-sonnet-4-6. Codex examples: gpt-5.5, gpt-5.4, gpt-5.3-codex.";
+  "Optional partner model override. Model strings are forwarded to the selected partner CLI. Claude examples: claude-fable-5, claude-opus-4-8, claude-opus-4-8[1m], claude-opus-4-7[1m], claude-opus-4-6[1m], claude-sonnet-4-6. Claude Fable 5 has 1M context by default; do not add a [1m] suffix. Codex examples: gpt-5.5, gpt-5.4, gpt-5.3-codex.";
 const REASONING_EFFORT_DESCRIPTION =
-  "Optional partner-specific reasoning effort level. For Codex this is typically low|medium|high|xhigh; for Claude low|medium|high|xhigh|max.";
+  "Optional partner-specific reasoning effort level. Defaults to high. For Codex this is typically low|medium|high|xhigh; for Claude low|medium|high|xhigh|max.";
+
+sweepOrphanedPartnerTerminals(DIALOGS_DIR, {
+  log: (msg) => console.error(`[codex-dialog] ${msg}`),
+}).catch((err) => {
+  console.error(`[codex-dialog] Failed to sweep orphaned tmux sessions: ${err.message}`);
+});
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -92,6 +107,14 @@ function getProcessingPath(sessionDir) {
   const partnerPath = path.join(sessionDir, "partner_processing");
   if (fs.existsSync(partnerPath)) return partnerPath;
   return path.join(sessionDir, "codex_processing");
+}
+
+function unlinkProcessingMarkers(sessionDir) {
+  for (const marker of ["partner_processing", "codex_processing"]) {
+    try {
+      fs.unlinkSync(path.join(sessionDir, marker));
+    } catch {}
+  }
 }
 
 function writeFileAtomic(targetPath, content) {
@@ -204,29 +227,18 @@ function getWakeMessages(messages, status, sinceId, includeSystem) {
 
 function normalizePartnerTimeout(timeoutMs) {
   if (timeoutMs == null) return DEFAULT_PARTNER_TIMEOUT_MS;
-  return Math.min(
-    MAX_PARTNER_TIMEOUT_MS,
-    Math.max(MIN_PARTNER_TIMEOUT_MS, timeoutMs)
-  );
+  return Math.max(MIN_PARTNER_TIMEOUT_MS, timeoutMs);
 }
 
-function getWaitTimeoutLimit(status) {
-  const partnerTimeoutMs = normalizePartnerTimeout(status?.partner_timeout_ms);
-  return Math.max(
-    MIN_WAIT_TIMEOUT_MS,
-    Math.min(MAX_WAIT_TIMEOUT_MS, partnerTimeoutMs - PARTNER_TIMEOUT_WAIT_HEADROOM_MS)
-  );
+function normalizeReasoningEffort(reasoningEffort, partnerAgent) {
+  return normalizeReasoningEffortForAgent(reasoningEffort, partnerAgent);
 }
 
-function normalizeWaitTimeout(timeoutMs, status) {
-  const maxWaitTimeoutMs = getWaitTimeoutLimit(status);
+function normalizeWaitTimeout(timeoutMs) {
   if (timeoutMs == null) {
-    return Math.min(DEFAULT_WAIT_TIMEOUT_MS, maxWaitTimeoutMs);
+    return DEFAULT_WAIT_TIMEOUT_MS;
   }
-  return Math.min(
-    maxWaitTimeoutMs,
-    Math.max(MIN_WAIT_TIMEOUT_MS, timeoutMs)
-  );
+  return Math.min(MAX_WAIT_TIMER_MS, Math.max(MIN_WAIT_TIMEOUT_MS, timeoutMs));
 }
 
 function buildSessionSnapshot(sessionId, options = {}) {
@@ -254,6 +266,8 @@ function buildSessionSnapshot(sessionId, options = {}) {
     projectPath,
     partnerAgent
   );
+  const terminalState = readTerminalState(sessionDir);
+  const activeTerminal = terminalState.current;
 
   const payload = {
     new_messages: newMessages,
@@ -271,6 +285,24 @@ function buildSessionSnapshot(sessionId, options = {}) {
         }
       : {}),
     last_error: lastError,
+    partner_terminal: activeTerminal
+      ? {
+          active: true,
+          status: activeTerminal.status || "unknown",
+          session_name: activeTerminal.session_name,
+          pane_target: activeTerminal.pane_target,
+          agent: activeTerminal.agent || partnerAgent,
+          started_at: activeTerminal.started_at || null,
+          updated_at: activeTerminal.updated_at || null,
+          turn_dir: activeTerminal.turn_dir || null,
+        }
+      : {
+          active: false,
+          last_status: terminalState.last?.status || null,
+          last_session_name: terminalState.last?.session_name || null,
+          last_completed_at: terminalState.last?.completed_at || null,
+          last_capture_path: terminalState.last?.last_capture_path || null,
+        },
     budget,
     review_status: reviewStatus,
     referenced_files: referencedFiles,
@@ -357,7 +389,7 @@ function waitForSessionChange(sessionId, options, extra) {
   const includeSystem = options.includeSystem !== false;
   const startedAt = Date.now();
   const sessionDir = resolveSessionDir(sessionId);
-  const timeoutMs = normalizeWaitTimeout(options.timeoutMs, readStatus(sessionDir));
+  const timeoutMs = normalizeWaitTimeout(options.timeoutMs);
   const conversationPath = path.join(sessionDir, "conversation.jsonl");
   const errorPath = path.join(sessionDir, "last_error.txt");
   const endSignalPath = path.join(sessionDir, "end_signal");
@@ -478,7 +510,7 @@ server.tool(
         "Soft round budget (default: 5). The partner is asked to deliver all feedback within this many rounds. Hard cap = max_rounds + 5. Do not override unless the user explicitly requested a different budget."
       ),
     reasoning_effort: z
-      .string()
+      .enum(ALL_REASONING_EFFORTS)
       .optional()
       .describe(REASONING_EFFORT_DESCRIPTION),
     model: z
@@ -489,9 +521,8 @@ server.tool(
       .number()
       .int()
       .min(MIN_PARTNER_TIMEOUT_MS)
-      .max(MAX_PARTNER_TIMEOUT_MS)
       .optional()
-      .describe("Maximum time in milliseconds for each partner CLI invocation (default: 900000 = 15 minutes, max: 3600000 = 60 minutes). Use 1800000 for 30 minutes on slow max-effort Claude runs."),
+      .describe("Backward-compatible wait-time hint in milliseconds (default: 900000 = 15 minutes). Interactive tmux partner turns are not killed by this value."),
     tool_profile: z
       .enum(["read", "implementation"])
       .optional()
@@ -537,13 +568,25 @@ server.tool(
         ],
       };
     }
-    const sessionId = `dialog-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-    const sessionDir = resolveSessionDir(sessionId);
-    fs.mkdirSync(sessionDir, { recursive: true });
-
     const softCap = max_rounds || 5;
     const hardCap = softCap + 5;
     const partnerTimeoutMs = normalizePartnerTimeout(partner_timeout_ms);
+    let effectiveReasoningEffort;
+    try {
+      effectiveReasoningEffort = normalizeReasoningEffort(
+        reasoning_effort,
+        partnerAgent
+      );
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: ${err.message}`,
+          },
+        ],
+      };
+    }
     const partnerCommand = resolvePartnerCommandValue(
       partnerAgent,
       partner_command,
@@ -566,6 +609,10 @@ server.tool(
       };
     }
 
+    const sessionId = `dialog-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+    const sessionDir = resolveSessionDir(sessionId);
+    fs.mkdirSync(sessionDir, { recursive: true });
+
     // Write problem description
     fs.writeFileSync(path.join(sessionDir, "problem.md"), problem_description);
 
@@ -584,7 +631,7 @@ server.tool(
       ...(partnerAgent === "codex" ? { codex_command: partnerCommand } : {}),
       max_rounds: softCap,
       hard_cap: hardCap,
-      reasoning_effort: reasoning_effort || null,
+      reasoning_effort: effectiveReasoningEffort,
       model: model || null,
       partner_timeout_ms: partnerTimeoutMs,
       tool_profile: tool_profile || "read",
@@ -605,7 +652,7 @@ server.tool(
       project_path || process.cwd(),
       partnerCommand,
       String(softCap),
-      reasoning_effort || "",
+      effectiveReasoningEffort,
       model || "",
       hostAgent,
       partnerAgent,
@@ -646,14 +693,14 @@ server.tool(
               partner_command: partnerCommand,
               max_rounds: softCap,
               hard_cap: hardCap,
-              reasoning_effort: reasoning_effort || "partner default",
+              reasoning_effort: effectiveReasoningEffort,
               model: model || "default",
               partner_timeout_ms: partnerTimeoutMs,
               tool_profile: tool_profile || "read",
               subject_path: subjectPath,
               subject_kind: subjectPath ? (subject_kind || "document") : null,
               message:
-                `Dialog started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner timeout ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${model || "default"}, reasoning effort: ${reasoning_effort || "partner default"}, tool profile: ${tool_profile || "read"}. Send your first message with send_message, then wait for ${partnerDisplay}.`,
+                `Dialog started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${model || "default"}, reasoning effort: ${effectiveReasoningEffort}, tool profile: ${tool_profile || "read"}. Partner turns run in detached tmux and are not killed by the wait hint. Send your first message with send_message, then wait for ${partnerDisplay}.`,
             },
             null,
             2
@@ -723,7 +770,7 @@ server.tool(
         "Soft round budget (default: 5). The reviewer is asked to deliver all feedback within this many rounds. Hard cap = max_rounds + 5. Do not override unless the user explicitly requested a different budget."
       ),
     reasoning_effort: z
-      .string()
+      .enum(ALL_REASONING_EFFORTS)
       .optional()
       .describe(REASONING_EFFORT_DESCRIPTION),
     model: z
@@ -734,9 +781,8 @@ server.tool(
       .number()
       .int()
       .min(MIN_PARTNER_TIMEOUT_MS)
-      .max(MAX_PARTNER_TIMEOUT_MS)
       .optional()
-      .describe("Maximum time in milliseconds for each partner CLI invocation (default: 900000 = 15 minutes, max: 3600000 = 60 minutes). Use 1800000 for 30 minutes on slow max-effort Claude reviews."),
+      .describe("Backward-compatible wait-time hint in milliseconds (default: 900000 = 15 minutes). Interactive tmux partner turns are not killed by this value."),
   },
   async ({
     project_path,
@@ -775,6 +821,22 @@ server.tool(
     const softCap = max_rounds || 5;
     const hardCap = softCap + 5;
     const partnerTimeoutMs = normalizePartnerTimeout(partner_timeout_ms);
+    let effectiveReasoningEffort;
+    try {
+      effectiveReasoningEffort = normalizeReasoningEffort(
+        reasoning_effort,
+        partnerAgent
+      );
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: ${err.message}`,
+          },
+        ],
+      };
+    }
     const partnerCommand = resolvePartnerCommandValue(
       partnerAgent,
       partner_command,
@@ -925,7 +987,7 @@ server.tool(
       review_focus: review_focus || null,
       max_rounds: softCap,
       hard_cap: hardCap,
-      reasoning_effort: reasoning_effort || null,
+      reasoning_effort: effectiveReasoningEffort,
       model: model || null,
       partner_timeout_ms: partnerTimeoutMs,
       runner_pid: null,
@@ -943,7 +1005,7 @@ server.tool(
       project_path,
       partnerCommand,
       String(softCap),
-      reasoning_effort || "",
+      effectiveReasoningEffort,
       model || "",
       hostAgent,
       partnerAgent,
@@ -986,11 +1048,11 @@ server.tool(
               partner_command: partnerCommand,
               max_rounds: softCap,
               hard_cap: hardCap,
-              reasoning_effort: reasoning_effort || "partner default",
+              reasoning_effort: effectiveReasoningEffort,
               model: model || "default",
               partner_timeout_ms: partnerTimeoutMs,
               message:
-                `Code review started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner timeout ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${model || "default"}, reasoning effort: ${reasoning_effort || "partner default"}. ${partnerDisplay} is generating an initial review.`,
+                `Code review started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${model || "default"}, reasoning effort: ${effectiveReasoningEffort}. ${partnerDisplay} is generating an initial review in detached tmux and is not killed by the wait hint.`,
             },
             null,
             2
@@ -1205,7 +1267,7 @@ server.tool(
 
 server.tool(
   "wait_for_partner_response",
-  "Long-poll a dialog or review session until the configured partner replies, a terminal condition occurs, or the timeout expires. Defaults to a 10 minute wait and emits best-effort progress heartbeats when the MCP client supplies a progress token.",
+  "Long-poll a dialog or review session until the configured partner replies, a terminal condition occurs, or this wait call times out. A wait timeout does not kill the interactive tmux partner turn. Defaults to a 10 minute wait and emits best-effort progress heartbeats when the MCP client supplies a progress token.",
   {
     session_id: z.string().describe("The session ID (dialog or review)"),
     since_id: z
@@ -1218,9 +1280,8 @@ server.tool(
       .number()
       .int()
       .min(MIN_WAIT_TIMEOUT_MS)
-      .max(MAX_WAIT_TIMEOUT_MS)
       .optional()
-      .describe("Maximum wait time in milliseconds (default: 600000). The server clamps this to the session partner_timeout_ms minus 60000ms, with an absolute max of 3600000."),
+      .describe("Maximum time for this wait call in milliseconds (default: 600000). This only controls the wait call; it does not kill the partner tmux session."),
     include_system: z
       .boolean()
       .optional()
@@ -1318,11 +1379,22 @@ server.tool(
 
 server.tool(
   "check_partner_alive",
-  "Check if the partner runner process is still alive and get detailed status.",
+  "Check if the partner runner process and current interactive tmux partner turn are alive. Returns compact live tmux status, activity inference, and a small pane tail by default; full pane capture is opt-in.",
   {
     session_id: z.string().describe("The session ID (dialog or review)"),
+    tail_lines: z
+      .number()
+      .int()
+      .min(1)
+      .max(40)
+      .optional()
+      .describe("Number of bottom tmux pane lines to return in capture.tail_text (default: 6)."),
+    include_full_capture: z
+      .boolean()
+      .optional()
+      .describe("When true, include the full bounded pane capture in capture.full_text. Defaults to false to avoid filling context windows."),
   },
-  async ({ session_id }) => {
+  async ({ session_id, tail_lines, include_full_capture }) => {
     const sessionDir = resolveSessionDir(session_id);
     if (!fs.existsSync(sessionDir)) {
       return { content: [{ type: "text", text: "Error: Session not found" }] };
@@ -1365,6 +1437,10 @@ server.tool(
     const reviewStatus = computeReviewStatus(status, messages, {
       problem: readProblem(sessionDir),
     });
+    const partnerTerminal = await inspectPartnerTerminal(sessionDir, {
+      tailLines: tail_lines,
+      includeFullCapture: include_full_capture === true,
+    });
 
     return {
       content: [
@@ -1387,6 +1463,7 @@ server.tool(
                   }
                 : {}),
               last_error: lastError,
+              partner_terminal: partnerTerminal,
               started_at: status?.started_at,
               recent_log: logTail,
               budget,
@@ -1416,14 +1493,22 @@ server.tool(
     // Signal the runner to stop
     fs.writeFileSync(path.join(sessionDir, "end_signal"), "");
 
-    // Also try to kill the process directly
     const status = readStat(session_id);
+    const terminatedPartnerTerminal = await terminateCurrentPartnerTerminal(sessionDir);
+    unlinkProcessingMarkers(sessionDir);
+
     if (status?.runner_pid && isProcessAlive(status.runner_pid)) {
-      try {
-        process.kill(status.runner_pid, "SIGTERM");
-      } catch {
-        /* already dead */
+      await new Promise((resolve) => setTimeout(resolve, END_DIALOG_GRACE_MS));
+      if (isProcessAlive(status.runner_pid)) {
+        try {
+          process.kill(status.runner_pid, "SIGTERM");
+        } catch {
+          /* already dead */
+        }
       }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await terminateCurrentPartnerTerminal(sessionDir);
+      unlinkProcessingMarkers(sessionDir);
     }
 
     const messages = readConv(session_id);
@@ -1437,6 +1522,7 @@ server.tool(
           text: JSON.stringify(
             {
               ended: true,
+              terminated_partner_terminal: terminatedPartnerTerminal,
               session_type: status?.type || "unknown",
               total_messages: messages.length,
               review_status: reviewStatus,

@@ -81,6 +81,20 @@ function parseToolText(result) {
   return JSON.parse(text);
 }
 
+async function waitForFileMatching(filePath, patterns, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath, "utf-8");
+      if (patterns.every((pattern) => pattern.test(content))) {
+        return content;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for expected content in file: ${filePath}`);
+}
+
 async function callWait(client, args, options = {}) {
   const result = await client.callTool(
     {
@@ -131,13 +145,13 @@ async function main() {
       );
       const payload = parseToolText(result);
       assert.equal(payload.partner_timeout_ms, 30 * 60 * 1000);
+      assert.equal(payload.reasoning_effort, "high");
       if (payload.dialog_dir) createdDirs.push(payload.dialog_dir);
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      const runnerLog = fs.readFileSync(
-        path.join(payload.dialog_dir, "runner.log"),
-        "utf-8"
-      );
-      assert.match(runnerLog, /Partner timeout: 1800s/);
+      const runnerLogPath = path.join(payload.dialog_dir, "runner.log");
+      await waitForFileMatching(runnerLogPath, [
+        /Partner timeout hint: 1800s/,
+        /Reasoning effort: high/,
+      ]);
       await client.callTool(
         {
           name: "end_dialog",

@@ -12,22 +12,38 @@ import fs from "fs";
 import path from "path";
 import {
   appendMessage,
+  DIALOGS_DIR,
   getAgentDisplayName,
   normalizeAgent,
   readConversation,
   sleep,
 } from "./shared.mjs";
-import { runPartnerCommand } from "./partner-invocation.mjs";
+import {
+  isPartnerTurnCancelledError,
+  runPartnerCommand,
+} from "./partner-invocation.mjs";
+import {
+  sweepOrphanedPartnerTerminals,
+  terminateCurrentPartnerTerminal,
+} from "./tmux-runtime.mjs";
+import {
+  DEFAULT_REASONING_EFFORT,
+  normalizeReasoningEffortForAgent,
+} from "./runtime-defaults.mjs";
 
 const sessionDir = process.argv[2];
 const projectPath = process.argv[3] || process.cwd();
 const partnerCommand = process.argv[4] || "codex";
 const SOFT_CAP = parseInt(process.argv[5], 10) || 5;
 const HARD_CAP = SOFT_CAP + 5;
-const REASONING_EFFORT = process.argv[6] || null;
+const RAW_REASONING_EFFORT = process.argv[6] || DEFAULT_REASONING_EFFORT;
 const PARTNER_MODEL = process.argv[7] || null;
 const HOST_AGENT = normalizeAgent(process.argv[8], "claude");
 const PARTNER_AGENT = normalizeAgent(process.argv[9], "codex");
+const REASONING_EFFORT = normalizeReasoningEffortForAgent(
+  RAW_REASONING_EFFORT,
+  PARTNER_AGENT
+);
 const DEFAULT_PARTNER_TIMEOUT_MS = 15 * 60 * 1000;
 const PARTNER_TIMEOUT_MS =
   Math.max(1000, parseInt(process.argv[10], 10)) || DEFAULT_PARTNER_TIMEOUT_MS;
@@ -48,14 +64,52 @@ const LOG_PATH = path.join(sessionDir, "runner.log");
 
 const MAX_TURNS = HARD_CAP;
 const POLL_INTERVAL_MS = 5000;
-const MAX_IDLE_MS = 30 * 60 * 1000;
+const IDLE_SHUTDOWN_MS = parsePositiveInt(
+  process.env.CODEX_DIALOG_IDLE_SHUTDOWN_MS,
+  24 * 60 * 60 * 1000
+);
 const MAX_CONVERSATION_MESSAGES = 20;
 const MAX_DIFF_CHARS = 50000;
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 function log(msg) {
   const ts = new Date().toISOString();
   fs.appendFileSync(LOG_PATH, `[${ts}] ${msg}\n`);
 }
+
+let terminatingFromSignal = false;
+
+async function terminateFromSignal(signal) {
+  if (terminatingFromSignal) return;
+  terminatingFromSignal = true;
+  try {
+    log(`${signal} received, terminating active partner terminal before exit`);
+    try {
+      fs.writeFileSync(END_SIGNAL_PATH, "");
+    } catch {}
+    try {
+      await terminateCurrentPartnerTerminal(sessionDir);
+    } catch (err) {
+      log(`Failed to terminate partner terminal after ${signal}: ${err.message}`);
+    }
+    try {
+      fs.unlinkSync(PROCESSING_PATH);
+    } catch {}
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.once("SIGTERM", () => {
+  void terminateFromSignal("SIGTERM");
+});
+process.once("SIGINT", () => {
+  void terminateFromSignal("SIGINT");
+});
 
 function buildRoundBudgetBlock(partnerTurns, softCap, hardCap) {
   const currentRound = partnerTurns + 1;
@@ -235,9 +289,17 @@ async function main() {
   log(`Partner agent: ${PARTNER_DISPLAY}`);
   log(`Partner command: ${partnerCommand}`);
   log(`Review focus: ${meta.review_focus || "general"}`);
-  log(`Soft cap: ${SOFT_CAP} rounds, hard cap: ${HARD_CAP} rounds, Partner timeout: ${PARTNER_TIMEOUT_MS / 1000}s, Idle timeout: ${MAX_IDLE_MS / 1000}s`);
+  log(`Soft cap: ${SOFT_CAP} rounds, hard cap: ${HARD_CAP} rounds, Partner timeout hint: ${PARTNER_TIMEOUT_MS / 1000}s (interactive tmux turns are not killed by this value), Idle shutdown when no active turn: ${IDLE_SHUTDOWN_MS / 1000}s`);
   log(`Model: ${PARTNER_MODEL || "default"}`);
-  log(`Reasoning effort: ${REASONING_EFFORT || "partner default"}`);
+  log(`Reasoning effort: ${REASONING_EFFORT}`);
+  try {
+    const sweep = await sweepOrphanedPartnerTerminals(DIALOGS_DIR, { log });
+    if (sweep.terminated.length > 0) {
+      log(`Orphaned tmux sweep terminated ${sweep.terminated.length} stale session(s)`);
+    }
+  } catch (err) {
+    log(`Orphaned tmux sweep failed: ${err.message}`);
+  }
 
   log(`Generating initial review from diff with ${PARTNER_DISPLAY}...`);
   fs.writeFileSync(PROCESSING_PATH, new Date().toISOString());
@@ -258,6 +320,7 @@ async function main() {
       log,
       tempPrefix: `${PARTNER_AGENT}-review`,
       responseInstruction: "Respond with your review.",
+      sessionDir,
     });
 
     appendMessage(sessionDir, PARTNER_AGENT, response);
@@ -267,14 +330,18 @@ async function main() {
       `Initial review complete (${response.length} chars). Waiting for ${HOST_DISPLAY}...`
     );
   } catch (err) {
-    consecutiveErrors++;
-    log(`Error on initial review: ${err.message}`);
-    fs.writeFileSync(ERROR_PATH, err.message);
-    appendMessage(
-      sessionDir,
-      "system",
-      `Failed to generate initial review: ${err.message}. ${HOST_DISPLAY} can still send messages to retry.`
-    );
+    if (isPartnerTurnCancelledError(err) || fs.existsSync(END_SIGNAL_PATH)) {
+      log("Initial review cancelled by end_dialog");
+    } else {
+      consecutiveErrors++;
+      log(`Error on initial review: ${err.message}`);
+      fs.writeFileSync(ERROR_PATH, err.message);
+      appendMessage(
+        sessionDir,
+        "system",
+        `Failed to generate initial review: ${err.message}. ${HOST_DISPLAY} can still send messages to retry.`
+      );
+    }
   }
 
   try {
@@ -337,15 +404,25 @@ async function main() {
           log,
           tempPrefix: `${PARTNER_AGENT}-review`,
           responseInstruction: "Respond with your review.",
+          sessionDir,
         });
 
         appendMessage(sessionDir, PARTNER_AGENT, response);
         partnerTurns++;
+        lastActivityTime = Date.now();
         consecutiveErrors = 0;
         log(
           `Review turn ${partnerTurns} complete (${response.length} chars). Waiting for ${HOST_DISPLAY}...`
         );
       } catch (err) {
+        if (isPartnerTurnCancelledError(err) || fs.existsSync(END_SIGNAL_PATH)) {
+          log(`Review turn ${partnerTurns + 1} cancelled by end_dialog`);
+          try {
+            fs.unlinkSync(PROCESSING_PATH);
+          } catch {}
+          break;
+        }
+
         consecutiveErrors++;
         log(
           `Error on review turn: ${err.message} (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS})`
@@ -369,17 +446,14 @@ async function main() {
       try {
         fs.unlinkSync(PROCESSING_PATH);
       } catch {}
-    } else {
-      const idleMs = Date.now() - lastActivityTime;
-      if (idleMs > MAX_IDLE_MS) {
-        log(`Idle timeout reached (${(idleMs / 1000).toFixed(0)}s). Shutting down.`);
-        appendMessage(
-          sessionDir,
-          "system",
-          "Review runner shut down due to inactivity. Start a new review to continue."
-        );
-        break;
-      }
+    } else if (Date.now() - lastActivityTime > IDLE_SHUTDOWN_MS) {
+      log(`Idle shutdown reached (${((Date.now() - lastActivityTime) / 1000).toFixed(0)}s with no active turn).`);
+      appendMessage(
+        sessionDir,
+        "system",
+        "Review runner shut down due to inactivity while no partner turn was active. Start a new review to continue."
+      );
+      break;
     }
 
     await sleep(POLL_INTERVAL_MS);

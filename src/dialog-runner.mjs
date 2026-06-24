@@ -12,22 +12,38 @@ import fs from "fs";
 import path from "path";
 import {
   appendMessage,
+  DIALOGS_DIR,
   getAgentDisplayName,
   normalizeAgent,
   readConversation,
   sleep,
 } from "./shared.mjs";
-import { runPartnerCommand } from "./partner-invocation.mjs";
+import {
+  isPartnerTurnCancelledError,
+  runPartnerCommand,
+} from "./partner-invocation.mjs";
+import {
+  sweepOrphanedPartnerTerminals,
+  terminateCurrentPartnerTerminal,
+} from "./tmux-runtime.mjs";
+import {
+  DEFAULT_REASONING_EFFORT,
+  normalizeReasoningEffortForAgent,
+} from "./runtime-defaults.mjs";
 
 const sessionDir = process.argv[2];
 const projectPath = process.argv[3] || process.cwd();
 const partnerCommand = process.argv[4] || "codex";
 const SOFT_CAP = parseInt(process.argv[5], 10) || 5;
 const HARD_CAP = SOFT_CAP + 5;
-const REASONING_EFFORT = process.argv[6] || null;
+const RAW_REASONING_EFFORT = process.argv[6] || DEFAULT_REASONING_EFFORT;
 const PARTNER_MODEL = process.argv[7] || null;
 const HOST_AGENT = normalizeAgent(process.argv[8], "claude");
 const PARTNER_AGENT = normalizeAgent(process.argv[9], "codex");
+const REASONING_EFFORT = normalizeReasoningEffortForAgent(
+  RAW_REASONING_EFFORT,
+  PARTNER_AGENT
+);
 const TOOL_PROFILE = process.argv[10] === "implementation" ? "implementation" : "read";
 const DEFAULT_PARTNER_TIMEOUT_MS = 15 * 60 * 1000;
 const PARTNER_TIMEOUT_MS =
@@ -48,13 +64,51 @@ const LOG_PATH = path.join(sessionDir, "runner.log");
 
 const MAX_TURNS = HARD_CAP;
 const POLL_INTERVAL_MS = 3000;
-const MAX_IDLE_MS = 15 * 60 * 1000;
+const IDLE_SHUTDOWN_MS = parsePositiveInt(
+  process.env.CODEX_DIALOG_IDLE_SHUTDOWN_MS,
+  24 * 60 * 60 * 1000
+);
 const MAX_CONVERSATION_MESSAGES = 30;
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 function log(msg) {
   const ts = new Date().toISOString();
   fs.appendFileSync(LOG_PATH, `[${ts}] ${msg}\n`);
 }
+
+let terminatingFromSignal = false;
+
+async function terminateFromSignal(signal) {
+  if (terminatingFromSignal) return;
+  terminatingFromSignal = true;
+  try {
+    log(`${signal} received, terminating active partner terminal before exit`);
+    try {
+      fs.writeFileSync(END_SIGNAL_PATH, "");
+    } catch {}
+    try {
+      await terminateCurrentPartnerTerminal(sessionDir);
+    } catch (err) {
+      log(`Failed to terminate partner terminal after ${signal}: ${err.message}`);
+    }
+    try {
+      fs.unlinkSync(PROCESSING_PATH);
+    } catch {}
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.once("SIGTERM", () => {
+  void terminateFromSignal("SIGTERM");
+});
+process.once("SIGINT", () => {
+  void terminateFromSignal("SIGINT");
+});
 
 function readSessionStatus() {
   if (!fs.existsSync(STATUS_PATH)) return {};
@@ -225,7 +279,7 @@ async function main() {
 
   let lastProcessedId = 0;
   let partnerTurns = 0;
-  let lastHostMessageTime = Date.now();
+  let lastActivityTime = Date.now();
   let consecutiveErrors = 0;
   const MAX_CONSECUTIVE_ERRORS = 3;
 
@@ -235,14 +289,22 @@ async function main() {
   log(`Partner agent: ${PARTNER_DISPLAY}`);
   log(`Partner command: ${partnerCommand}`);
   log(`Soft cap: ${SOFT_CAP} rounds, hard cap: ${HARD_CAP} rounds`);
-  log(`Partner timeout: ${PARTNER_TIMEOUT_MS / 1000}s`);
+  log(`Partner timeout hint: ${PARTNER_TIMEOUT_MS / 1000}s (interactive tmux turns are not killed by this value)`);
   log(`Model: ${PARTNER_MODEL || "default"}`);
-  log(`Reasoning effort: ${REASONING_EFFORT || "partner default"}`);
+  log(`Reasoning effort: ${REASONING_EFFORT}`);
   log(`Tool profile: ${TOOL_PROFILE}`);
   if (status.subject_path) {
     log(`Subject: ${status.subject_kind || "document"} at ${status.subject_path}`);
   }
-  log(`Max idle: ${MAX_IDLE_MS / 1000}s`);
+  log(`Idle shutdown when no active turn: ${IDLE_SHUTDOWN_MS / 1000}s`);
+  try {
+    const sweep = await sweepOrphanedPartnerTerminals(DIALOGS_DIR, { log });
+    if (sweep.terminated.length > 0) {
+      log(`Orphaned tmux sweep terminated ${sweep.terminated.length} stale session(s)`);
+    }
+  } catch (err) {
+    log(`Orphaned tmux sweep failed: ${err.message}`);
+  }
 
   while (partnerTurns < MAX_TURNS) {
     if (fs.existsSync(END_SIGNAL_PATH)) {
@@ -256,7 +318,7 @@ async function main() {
     );
 
     if (newHostMessages.length > 0) {
-      lastHostMessageTime = Date.now();
+      lastActivityTime = Date.now();
       lastProcessedId = messages.reduce(
         (max, m) =>
           typeof m.id === "number" && Number.isSafeInteger(m.id) && m.id > max
@@ -288,15 +350,25 @@ async function main() {
           log,
           tempPrefix: `${PARTNER_AGENT}-dialog`,
           responseInstruction: "Respond with your analysis.",
+          sessionDir,
         });
 
         appendMessage(sessionDir, PARTNER_AGENT, response);
         partnerTurns++;
+        lastActivityTime = Date.now();
         consecutiveErrors = 0;
         log(
           `${PARTNER_DISPLAY} turn ${partnerTurns} complete (${response.length} chars). Waiting for ${HOST_DISPLAY}...`
         );
       } catch (err) {
+        if (isPartnerTurnCancelledError(err) || fs.existsSync(END_SIGNAL_PATH)) {
+          log(`${PARTNER_DISPLAY} turn cancelled by end_dialog`);
+          try {
+            fs.unlinkSync(PROCESSING_PATH);
+          } catch {}
+          break;
+        }
+
         consecutiveErrors++;
         log(
           `Error on ${PARTNER_DISPLAY} turn: ${err.message} (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS})`
@@ -320,17 +392,14 @@ async function main() {
       try {
         fs.unlinkSync(PROCESSING_PATH);
       } catch {}
-    } else {
-      const idleMs = Date.now() - lastHostMessageTime;
-      if (idleMs > MAX_IDLE_MS) {
-        log(`Idle timeout reached (${(idleMs / 1000).toFixed(0)}s). Shutting down.`);
-        appendMessage(
-          sessionDir,
-          "system",
-          "Dialog runner shut down due to inactivity. Start a new dialog to continue the discussion."
-        );
-        break;
-      }
+    } else if (Date.now() - lastActivityTime > IDLE_SHUTDOWN_MS) {
+      log(`Idle shutdown reached (${((Date.now() - lastActivityTime) / 1000).toFixed(0)}s with no active turn).`);
+      appendMessage(
+        sessionDir,
+        "system",
+        "Dialog runner shut down due to inactivity while no partner turn was active. Start a new dialog to continue the discussion."
+      );
+      break;
     }
 
     await sleep(POLL_INTERVAL_MS);

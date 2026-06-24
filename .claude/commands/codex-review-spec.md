@@ -30,7 +30,7 @@ Review spec: $ARGUMENTS
 
 Parse $ARGUMENTS:
 - Any argument of the form `rounds:N` (integer) → parse as `max_rounds`.
-- Any argument of the form `effort:<level>` where level is one of `low`, `medium`, `high`, `xhigh` → parse as `reasoning_effort`. Otherwise DO NOT pass it — let Codex use its own configured default.
+- Any argument of the form `effort:<level>` where level is one of `low`, `medium`, `high`, `xhigh` → parse as `reasoning_effort`. Otherwise DO NOT pass it — let the server default to `high`.
 - Any argument of the form `model:<name>` where name is one of `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` → parse as `model`. These are the ONLY valid model IDs — do not guess or abbreviate (e.g. `gpt-5.3` is NOT valid, use `gpt-5.3-codex`). Otherwise DO NOT pass it — let Codex use its default.
 - Remaining non-`rounds:*`/non-`effort:*`/non-`model:*` argument (if any) → treat as the spec path.
 
@@ -70,7 +70,7 @@ In both abort cases, report the problem and the path you tried, and stop. Do not
 Call `start_dialog` with:
 - `project_path`: the git project root
 - `max_rounds`: only if the user provided `rounds:N`. Otherwise OMIT this parameter and let the server default to 5. **Never invent or change this value on your own** — the 5-round default is tuned to force Codex to deliver complete feedback each round rather than drip-feed it.
-- `reasoning_effort`: only if the user provided `effort:<level>`. Otherwise omit the parameter entirely and let Codex use its own configured default.
+- `reasoning_effort`: only if the user provided `effort:<level>`. Otherwise omit the parameter entirely and let the server default to `high`.
 - `model`: only if the user provided `model:<id>`. Otherwise omit the parameter entirely and let Codex use its default.
 - `subject_path`: the resolved spec file path
 - `subject_kind`: `"spec"`
@@ -174,7 +174,7 @@ tail -F -n 0 "$HOME/.claude/dialogs/<SESSION_ID>/conversation.jsonl" 2>/dev/null
 
 When the notification arrives, call `check_messages` with `since_id: 0` (or `get_full_history`) to read the structured content — the notification itself just confirms a new message landed.
 
-**If the Monitor hits its timeout with no event**, call `check_partner_alive`. If the runner died, restart with a new `start_dialog`. Also inspect `~/.claude/dialogs/<SESSION_ID>/last_error.txt` if it exists.
+**If the Monitor hits its timeout with no event**, call `check_partner_alive`. Inspect `partner_terminal.activity` and `partner_terminal.capture.tail_text` to see Codex's compact live tmux status. If it shows useful progress, continue waiting; restart only if the runner died, `last_error` shows a real failure, or the pane shows an idle/stuck state that you decide cannot recover.
 
 Read the review carefully once it arrives.
 
@@ -263,7 +263,7 @@ Call `end_dialog` to clean up the session.
 
 ## TROUBLESHOOTING
 
-- **Codex not responding:** Use `check_partner_alive` to check if the runner is still running.
+- **Codex not responding:** Use `check_partner_alive` to check the runner and inspect `partner_terminal.activity` plus `partner_terminal.capture.tail_text` from Codex's tmux pane.
 - **Runner died:** Start a new dialog with `start_dialog`.
 - **Want full context:** Use `get_full_history` for the complete conversation.
 - **Multiple sessions:** Use `list_sessions` to see all active/completed sessions.
