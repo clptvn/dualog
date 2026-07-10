@@ -1,6 +1,6 @@
 ---
 description: Have Codex review your code changes via the codex-dialog MCP server
-argument-hint: [optional: diff_target (uncommitted|staged|branch|commit:<sha>)] [optional: review focus] [optional: rounds:N] [optional: effort:low|medium|high|xhigh] [optional: model:gpt-5.5|gpt-5.4|gpt-5.3-codex|gpt-5.4-mini|gpt-5.3-codex-spark]
+argument-hint: [optional: diff_target (uncommitted|staged|branch|commit:<sha>)] [optional: review focus] [optional: rounds:N] [optional: effort:low|medium|high|xhigh|max|ultra] [optional: model:gpt-5.6|gpt-5.6-sol|gpt-5.6-terra|gpt-5.6-luna|gpt-5.5|gpt-5.4|gpt-5.3-codex|gpt-5.4-mini|gpt-5.3-codex-spark]
 allowed-tools: mcp__codex-dialog__start_code_review, mcp__codex-dialog__check_messages, mcp__codex-dialog__send_message, mcp__codex-dialog__get_review_summary, mcp__codex-dialog__get_full_history, mcp__codex-dialog__check_partner_alive, mcp__codex-dialog__end_dialog, mcp__codex-dialog__list_sessions, Bash, Read, Glob, Grep, Edit, Write, AskUserQuestion, LSP, Monitor
 ---
 
@@ -37,8 +37,11 @@ Parse $ARGUMENTS to determine:
 - **diff_target**: first arg if it matches `uncommitted`, `staged`, `branch`, or `commit:<sha>`. Default: `uncommitted`
 - **review_focus**: remaining text after diff_target (excluding any `rounds:N`, `effort:*`, or `model:*` tokens), if any (e.g. "security", "performance", "correctness")
 - **max_rounds**: if any argument matches `rounds:N` (integer), parse it and pass as `max_rounds`. Otherwise DO NOT pass `max_rounds` — let the server use its tuned default of 5. **Never invent or adjust this value on your own.** The default exists for a reason: it forces Codex to deliver complete feedback each round instead of drip-feeding. Only override when the user explicitly provided `rounds:N` in the command.
-- **reasoning_effort**: if any argument matches `effort:<level>` where level is one of `low`, `medium`, `high`, `xhigh`, parse it and pass as `reasoning_effort`. Otherwise DO NOT pass it — let the server default to `high`. Only override when the user explicitly provided `effort:<level>` in the command.
-- **model**: if any argument matches `model:<name>` where name is one of `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, parse it and pass as `model`. These are the ONLY valid model IDs — do not guess or abbreviate (e.g. `gpt-5.3` is NOT valid, use `gpt-5.3-codex`). Otherwise DO NOT pass it — let Codex use its default model.
+- **reasoning_effort**: if any argument matches `effort:<level>` where level is one of `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, parse it and pass as `reasoning_effort`. `max` is valid only with an explicitly selected GPT-5.6 family model; `ultra` is valid only with GPT-5.6 Sol or Terra. Otherwise DO NOT pass it — let the server default to `high`. Only override when the user explicitly provided `effort:<level>` in the command.
+- **model**: if any argument matches `model:<name>` where name is one of `gpt-5.6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, parse it and pass as `model`. `gpt-5.6` is the alias for `gpt-5.6-sol`. These are the ONLY valid model IDs — do not guess or abbreviate (e.g. `gpt-5.3` is NOT valid, use `gpt-5.3-codex`). Otherwise DO NOT pass it — let Codex use its default model.
+
+If `effort:max` is paired with no explicit model or with a non-GPT-5.6 model, stop and explain that `max` requires `model:gpt-5.6`, `model:gpt-5.6-sol`, `model:gpt-5.6-terra`, or `model:gpt-5.6-luna`.
+If `effort:ultra` is paired with no explicit model or with any model other than GPT-5.6 Sol or Terra, stop and explain that `ultra` requires `model:gpt-5.6`, `model:gpt-5.6-sol`, or `model:gpt-5.6-terra`.
 
 If $ARGUMENTS is empty, use `uncommitted` as the diff target with no specific focus.
 

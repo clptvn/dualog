@@ -1,6 +1,6 @@
 ---
 description: Have Codex audit files or directories for bugs, architecture issues, and correctness
-argument-hint: <file or directory paths> [optional: focus area] [optional: rounds:N] [optional: effort:low|medium|high|xhigh] [optional: model:gpt-5.5|gpt-5.4|gpt-5.3-codex|gpt-5.4-mini|gpt-5.3-codex-spark]
+argument-hint: <file or directory paths> [optional: focus area] [optional: rounds:N] [optional: effort:low|medium|high|xhigh|max|ultra] [optional: model:gpt-5.6|gpt-5.6-sol|gpt-5.6-terra|gpt-5.6-luna|gpt-5.5|gpt-5.4|gpt-5.3-codex|gpt-5.4-mini|gpt-5.3-codex-spark]
 allowed-tools: mcp__codex-dialog__start_dialog, mcp__codex-dialog__check_messages, mcp__codex-dialog__send_message, mcp__codex-dialog__get_full_history, mcp__codex-dialog__check_partner_alive, mcp__codex-dialog__end_dialog, mcp__codex-dialog__list_sessions, Bash, Read, Glob, Grep, Edit, Write, AskUserQuestion, LSP, Monitor
 ---
 
@@ -39,8 +39,11 @@ Parse $ARGUMENTS to determine:
 - **targets**: file paths, directory paths, or glob patterns to audit. Can be multiple, space-separated.
 - **focus**: after stripping any `rounds:*`, `effort:*`, and `model:*` tokens, if the last argument(s) look like a focus area rather than a path (e.g. "security", "error handling", "concurrency"), treat it as the review focus.
 - **max_rounds**: if any argument is `rounds:N` (integer), parse and pass it to `start_dialog` as `max_rounds`. Otherwise OMIT the parameter — the server will default to 5. **Never invent or adjust this value on your own.** The 5-round default is tuned to make Codex deliver complete feedback each round instead of drip-feeding. Only override when the user explicitly provided `rounds:N`.
-- **reasoning_effort**: if any argument matches `effort:<level>` where level is one of `low`, `medium`, `high`, `xhigh`, parse it and pass as `reasoning_effort`. Otherwise DO NOT pass it — let the server default to `high`.
-- **model**: if any argument matches `model:<name>` where name is one of `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, parse it and pass as `model`. These are the ONLY valid model IDs — do not guess or abbreviate (e.g. `gpt-5.3` is NOT valid, use `gpt-5.3-codex`). Otherwise DO NOT pass it — let Codex use its default.
+- **reasoning_effort**: if any argument matches `effort:<level>` where level is one of `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, parse it and pass as `reasoning_effort`. `max` is valid only with an explicitly selected GPT-5.6 family model; `ultra` is valid only with GPT-5.6 Sol or Terra. Otherwise DO NOT pass it — let the server default to `high`.
+- **model**: if any argument matches `model:<name>` where name is one of `gpt-5.6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, parse it and pass as `model`. `gpt-5.6` is the alias for `gpt-5.6-sol`. These are the ONLY valid model IDs — do not guess or abbreviate (e.g. `gpt-5.3` is NOT valid, use `gpt-5.3-codex`). Otherwise DO NOT pass it — let Codex use its default.
+
+If `effort:max` is paired with no explicit model or with a non-GPT-5.6 model, stop and explain that `max` requires `model:gpt-5.6`, `model:gpt-5.6-sol`, `model:gpt-5.6-terra`, or `model:gpt-5.6-luna`.
+If `effort:ultra` is paired with no explicit model or with any model other than GPT-5.6 Sol or Terra, stop and explain that `ultra` requires `model:gpt-5.6`, `model:gpt-5.6-sol`, or `model:gpt-5.6-terra`.
 
 Examples:
 - `src/` — audit all source files in src/

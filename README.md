@@ -205,8 +205,8 @@ To invert the flow, set:
 Both `start_dialog` and `start_code_review` also accept:
 
 - `partner_command`
-- `model`: forwarded to the selected partner CLI. Claude examples: `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-8[1m]`, `claude-opus-4-7[1m]`, `claude-opus-4-6[1m]`, `claude-sonnet-4-6`. Claude Fable 5 has 1M context by default; do not add a `[1m]` suffix.
-- `reasoning_effort`: defaults to `high` when omitted
+- `model`: forwarded to the selected partner CLI. Codex examples: `gpt-5.6` (the Sol alias), `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`. Claude examples: `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-8[1m]`, `claude-opus-4-7[1m]`, `claude-opus-4-6[1m]`, `claude-sonnet-4-6`. Claude Fable 5 has 1M context by default; do not add a `[1m]` suffix.
+- `reasoning_effort`: defaults to `high` when omitted. Codex accepts `low`, `medium`, `high`, `xhigh`, GPT-5.6's `max` effort, and the Codex-only `ultra` mode for GPT-5.6 Sol and Terra.
 - `max_rounds`
 - `partner_timeout_ms`: backward-compatible wait hint for clients that choose their own `wait_for_partner_response.timeout_ms`. Defaults to `900000` (15 minutes). It no longer kills partner CLI turns.
 
@@ -214,6 +214,7 @@ Partner runtime details:
 
 - Claude partners run through the real interactive `claude` CLI in tmux. The server does not use `claude -p` or the Agent SDK. Claude partner sessions use an empty strict MCP config so nested partner turns do not recursively load the host's MCP servers.
 - Codex partners run through the real interactive `codex` CLI in tmux. The server does not use `codex exec` for partner turns. Codex partner turns use a per-session `CODEX_HOME` with copied auth and no user MCP config, so nested Codex does not recursively boot the host's MCP servers.
+- GPT-5.6 is currently a limited preview in Codex and the API, and is not yet available in ChatGPT. Selecting a GPT-5.6 model requires a provisioned Codex workspace and a Codex CLI version whose model catalog includes it.
 - tmux sessions use the dedicated `codex-dialog` tmux socket by default, isolated from the user's normal tmux server and config. Override with `CODEX_DIALOG_TMUX_SOCKET` if needed.
 - Completion is delivered through per-turn sidecar files under `~/.claude/dialogs/<session_id>/turns/`.
 - `check_partner_alive` includes `partner_terminal.activity`, which summarizes whether the partner appears to be thinking, reading/searching files, running a command, writing, starting, idle, or unknown. When visible, it also extracts the model label, status verb, elapsed time, and token count from the CLI status line.

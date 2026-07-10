@@ -1,6 +1,13 @@
 export const DEFAULT_REASONING_EFFORT = "high";
 
-export const CODEX_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"];
+export const CODEX_REASONING_EFFORTS = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+];
 export const CLAUDE_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 export const ALL_REASONING_EFFORTS = [
   ...new Set([...CODEX_REASONING_EFFORTS, ...CLAUDE_REASONING_EFFORTS]),

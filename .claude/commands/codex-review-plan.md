@@ -1,6 +1,6 @@
 ---
 description: Have Codex review an implementation plan via the codex-dialog MCP server
-argument-hint: [optional: path/to/plan.md] [optional: rounds:N] [optional: effort:low|medium|high|xhigh] [optional: model:gpt-5.5|gpt-5.4|gpt-5.3-codex|gpt-5.4-mini|gpt-5.3-codex-spark]
+argument-hint: [optional: path/to/plan.md] [optional: rounds:N] [optional: effort:low|medium|high|xhigh|max|ultra] [optional: model:gpt-5.6|gpt-5.6-sol|gpt-5.6-terra|gpt-5.6-luna|gpt-5.5|gpt-5.4|gpt-5.3-codex|gpt-5.4-mini|gpt-5.3-codex-spark]
 allowed-tools: mcp__codex-dialog__start_dialog, mcp__codex-dialog__check_messages, mcp__codex-dialog__send_message, mcp__codex-dialog__get_full_history, mcp__codex-dialog__check_partner_alive, mcp__codex-dialog__end_dialog, mcp__codex-dialog__list_sessions, Bash, Read, Glob, Grep, Edit, Write, AskUserQuestion, LSP, Monitor
 ---
 
@@ -30,9 +30,12 @@ Review plan: $ARGUMENTS
 
 Parse $ARGUMENTS:
 - Any argument of the form `rounds:N` (integer) → parse as `max_rounds`.
-- Any argument of the form `effort:<level>` where level is one of `low`, `medium`, `high`, `xhigh` → parse as `reasoning_effort`. Otherwise DO NOT pass it — let the server default to `high`.
-- Any argument of the form `model:<name>` where name is one of `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` → parse as `model`. These are the ONLY valid model IDs — do not guess or abbreviate (e.g. `gpt-5.3` is NOT valid, use `gpt-5.3-codex`). Otherwise DO NOT pass it — let Codex use its default.
+- Any argument of the form `effort:<level>` where level is one of `low`, `medium`, `high`, `xhigh`, `max`, `ultra` → parse as `reasoning_effort`. `max` is valid only with an explicitly selected GPT-5.6 family model; `ultra` is valid only with GPT-5.6 Sol or Terra. Otherwise DO NOT pass it — let the server default to `high`.
+- Any argument of the form `model:<name>` where name is one of `gpt-5.6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` → parse as `model`. `gpt-5.6` is the alias for `gpt-5.6-sol`. These are the ONLY valid model IDs — do not guess or abbreviate (e.g. `gpt-5.3` is NOT valid, use `gpt-5.3-codex`). Otherwise DO NOT pass it — let Codex use its default.
 - Remaining non-`rounds:*`/non-`effort:*`/non-`model:*` argument (if any) → treat as the plan path.
+
+If `effort:max` is paired with no explicit model or with a non-GPT-5.6 model, stop and explain that `max` requires `model:gpt-5.6`, `model:gpt-5.6-sol`, `model:gpt-5.6-terra`, or `model:gpt-5.6-luna`.
+If `effort:ultra` is paired with no explicit model or with any model other than GPT-5.6 Sol or Terra, stop and explain that `ultra` requires `model:gpt-5.6`, `model:gpt-5.6-sol`, or `model:gpt-5.6-terra`.
 
 **If a plan path is provided**, use it directly.
 

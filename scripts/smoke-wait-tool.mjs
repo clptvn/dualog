@@ -129,6 +129,32 @@ async function main() {
     await client.connect(transport);
 
     {
+      const { tools } = await client.listTools();
+      const expectedModels = [
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+      ];
+      for (const toolName of ["start_dialog", "start_code_review"]) {
+        const tool = tools.find((candidate) => candidate.name === toolName);
+        assert.ok(tool, `${toolName} was not exposed by the MCP server`);
+        const modelDescription = tool.inputSchema.properties.model.description;
+        for (const model of expectedModels) {
+          assert.match(modelDescription, new RegExp(`\\b${model.replaceAll(".", "\\.")}\\b`));
+        }
+        assert.deepEqual(tool.inputSchema.properties.reasoning_effort.enum, [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultra",
+        ]);
+      }
+    }
+
+    {
       const result = await client.callTool(
         {
           name: "start_dialog",
@@ -182,6 +208,41 @@ async function main() {
       assert.equal(result.partner_timeout_ms, 15 * 60 * 1000);
       assert.equal(result.next_since_id, 1);
       assert.equal(result.new_messages.length, 1);
+    }
+
+    {
+      const result = await client.callTool(
+        {
+          name: "start_dialog",
+          arguments: {
+            problem_description: "GPT-5.6 model support smoke",
+            project_path: repoRoot,
+            host_agent: "claude",
+            partner_agent: "codex",
+            model: "gpt-5.6-sol",
+            reasoning_effort: "ultra",
+          },
+        },
+        undefined,
+        { timeout: 10000 }
+      );
+      const payload = parseToolText(result);
+      assert.equal(payload.model, "gpt-5.6-sol");
+      assert.equal(payload.reasoning_effort, "ultra");
+      if (payload.dialog_dir) createdDirs.push(payload.dialog_dir);
+      const runnerLogPath = path.join(payload.dialog_dir, "runner.log");
+      await waitForFileMatching(runnerLogPath, [
+        /Model: gpt-5\.6-sol/,
+        /Reasoning effort: ultra/,
+      ]);
+      await client.callTool(
+        {
+          name: "end_dialog",
+          arguments: { session_id: payload.session_id },
+        },
+        undefined,
+        { timeout: 10000 }
+      );
     }
 
     {
