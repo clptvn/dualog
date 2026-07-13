@@ -5,6 +5,7 @@
   "description": "Bidirectional MCP server enabling back-and-forth discussions between Claude Code and Codex CLI",
   "scripts": {
     "start": "node src/dialog-server.mjs",
+    "test": "node --test tests/*.test.mjs",
     "smoke:wait-tool": "node scripts/smoke-wait-tool.mjs",
     "setup": "node scripts/install.mjs",
     "uninstall": "node scripts/uninstall.mjs"

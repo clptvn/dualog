@@ -4,7 +4,7 @@
  *
  * Similar to dialog-runner.mjs but specialized for code review:
  * - Auto-starts: the partner generates an initial review from the diff
- * - Longer timeouts to account for both sides investigating code
+ * - Unbounded partner turns for large investigations
  * - Review-specific prompts with diff context and structured feedback categories
  */
 
@@ -12,7 +12,6 @@ import fs from "fs";
 import path from "path";
 import {
   appendMessage,
-  DIALOGS_DIR,
   getAgentDisplayName,
   normalizeAgent,
   readConversation,
@@ -22,10 +21,6 @@ import {
   isPartnerTurnCancelledError,
   runPartnerCommand,
 } from "./partner-invocation.mjs";
-import {
-  sweepOrphanedPartnerTerminals,
-  terminateCurrentPartnerTerminal,
-} from "./tmux-runtime.mjs";
 import {
   DEFAULT_REASONING_EFFORT,
   normalizeReasoningEffortForAgent,
@@ -83,32 +78,21 @@ function log(msg) {
 
 let terminatingFromSignal = false;
 
-async function terminateFromSignal(signal) {
+function exitFromSignal(signal) {
   if (terminatingFromSignal) return;
   terminatingFromSignal = true;
+  log(`${signal} received; exiting runner without terminating the active partner terminal`);
   try {
-    log(`${signal} received, terminating active partner terminal before exit`);
-    try {
-      fs.writeFileSync(END_SIGNAL_PATH, "");
-    } catch {}
-    try {
-      await terminateCurrentPartnerTerminal(sessionDir);
-    } catch (err) {
-      log(`Failed to terminate partner terminal after ${signal}: ${err.message}`);
-    }
-    try {
-      fs.unlinkSync(PROCESSING_PATH);
-    } catch {}
-  } finally {
-    process.exit(0);
-  }
+    fs.unlinkSync(PROCESSING_PATH);
+  } catch {}
+  process.exit(0);
 }
 
 process.once("SIGTERM", () => {
-  void terminateFromSignal("SIGTERM");
+  exitFromSignal("SIGTERM");
 });
 process.once("SIGINT", () => {
-  void terminateFromSignal("SIGINT");
+  exitFromSignal("SIGINT");
 });
 
 function buildRoundBudgetBlock(partnerTurns, softCap, hardCap) {
@@ -292,15 +276,6 @@ async function main() {
   log(`Soft cap: ${SOFT_CAP} rounds, hard cap: ${HARD_CAP} rounds, Partner timeout hint: ${PARTNER_TIMEOUT_MS / 1000}s (interactive tmux turns are not killed by this value), Idle shutdown when no active turn: ${IDLE_SHUTDOWN_MS / 1000}s`);
   log(`Model: ${PARTNER_MODEL || "default"}`);
   log(`Reasoning effort: ${REASONING_EFFORT}`);
-  try {
-    const sweep = await sweepOrphanedPartnerTerminals(DIALOGS_DIR, { log });
-    if (sweep.terminated.length > 0) {
-      log(`Orphaned tmux sweep terminated ${sweep.terminated.length} stale session(s)`);
-    }
-  } catch (err) {
-    log(`Orphaned tmux sweep failed: ${err.message}`);
-  }
-
   log(`Generating initial review from diff with ${PARTNER_DISPLAY}...`);
   fs.writeFileSync(PROCESSING_PATH, new Date().toISOString());
   try {

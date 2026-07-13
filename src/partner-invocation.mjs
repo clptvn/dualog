@@ -27,14 +27,8 @@ const CLAUDE_READ_TOOLS = "Read,Grep,Glob,Bash,LSP";
 const CLAUDE_IMPLEMENTATION_TOOLS =
   "Read,Grep,Glob,Bash,LSP,Edit,MultiEdit,Write";
 const CLAUDE_READ_DISALLOWED_TOOLS = "Edit,MultiEdit,Write,NotebookEdit";
-const DONE_WITHOUT_RESULT_GRACE_MS = 10000;
 const POST_SUBMIT_VERIFY_MS = 30000;
 const POST_SUBMIT_RETRY_MS = 15000;
-const IDLE_PROMPT_STALL_MS = 2 * 60 * 1000;
-const UNKNOWN_STALL_MS = parsePositiveInt(
-  process.env.CODEX_DIALOG_STALLED_PANE_MS,
-  15 * 60 * 1000
-);
 
 export class PartnerTurnCancelledError extends Error {
   constructor(message) {
@@ -46,11 +40,6 @@ export class PartnerTurnCancelledError extends Error {
 
 export function isPartnerTurnCancelledError(err) {
   return Boolean(err?.cancelledByEndDialog);
-}
-
-function parsePositiveInt(value, fallback) {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function normalizeToolProfile(toolProfile) {
@@ -356,7 +345,8 @@ export async function runPartnerCommand({
     if (!finalCapturePath && fs.existsSync(capturePath)) {
       finalCapturePath = capturePath;
     }
-    if (handle) {
+    const cancelled = isPartnerTurnCancelledError(err);
+    if (handle && cancelled) {
       try {
         await terminateTmuxSession(handle);
       } catch (cleanupErr) {
@@ -366,18 +356,24 @@ export async function runPartnerCommand({
     const { last } = readTerminalState(sessionDir);
     const alreadyTerminated =
       last?.session_name === state.session_name && last.status === "terminated";
-    const cancelled = isPartnerTurnCancelledError(err);
+    const terminalStillAlive = handle
+      ? await isTmuxSessionAlive(handle.sessionName).catch(() => false)
+      : false;
     if (!alreadyTerminated) {
       writeTerminalState(
         sessionDir,
         {
           ...state,
-          status: cancelled ? "cancelled" : "failed",
-          completed_at: new Date().toISOString(),
+          status: cancelled
+            ? "cancelled"
+            : terminalStillAlive
+              ? "error_waiting_for_end"
+              : "failed",
+          ...(terminalStillAlive ? {} : { completed_at: new Date().toISOString() }),
           last_capture_path: finalCapturePath,
           ...(cancelled ? {} : { error: err.message }),
         },
-        { active: false }
+        { active: terminalStillAlive }
       );
     }
     throw err;
@@ -542,9 +538,9 @@ async function waitForPromptSubmission({
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 
-  throw new Error(
-    `${partnerDisplay} did not begin processing after prompt submission` +
-      (lastSnapshot ? `; terminal: ${lastSnapshot.slice(-1000)}` : "")
+  log(
+    `${partnerDisplay} activity could not be confirmed after prompt submission; continuing to wait for explicit completion or end_dialog` +
+      (lastSnapshot ? ` (last capture: ${lastSnapshot.slice(-500)})` : "")
   );
 }
 
@@ -561,10 +557,6 @@ async function waitForSidecarCompletion({
 }) {
   const endSignalPath = path.join(sessionDir, "end_signal");
   let lastProgressLog = 0;
-  let idlePromptSince = null;
-  let unknownSince = null;
-  let lastActivityFingerprint = null;
-  let lastActivityChangedAt = Date.now();
 
   while (true) {
     if (fs.existsSync(endSignalPath)) {
@@ -599,45 +591,9 @@ async function waitForSidecarCompletion({
       const activity = analyzeTerminalActivity(capture?.text || "", agent, {
         alive: true,
       });
-      const activityFingerprint = [
-        activity.state,
-        activity.status_line || "",
-        activity.tokens ?? "",
-        activity.elapsed || "",
-      ].join("|");
-      if (activityFingerprint !== lastActivityFingerprint) {
-        lastActivityFingerprint = activityFingerprint;
-        lastActivityChangedAt = Date.now();
-      }
-
-      if (
-        activity.state === "idle_prompt" ||
-        (
-          activity.idle_prompt_visible &&
-          Date.now() - lastActivityChangedAt > IDLE_PROMPT_STALL_MS
-        )
-      ) {
-        idlePromptSince ||= Date.now();
-        if (Date.now() - idlePromptSince > IDLE_PROMPT_STALL_MS) {
-          throw new Error(
-            `${partnerDisplay} appears idle in tmux without writing completion sidecars: ${activity.summary}`
-          );
-        }
-      } else {
-        idlePromptSince = null;
-      }
-
-      if (activity.state === "unknown") {
-        unknownSince ||= Date.now();
-        if (Date.now() - unknownSince > UNKNOWN_STALL_MS) {
-          throw new Error(
-            `${partnerDisplay} tmux pane did not show recognizable activity for ${Math.round(UNKNOWN_STALL_MS / 1000)}s`
-          );
-        }
-      } else {
-        unknownSince = null;
-      }
-      log(`${partnerDisplay} interactive turn is still running in tmux session "${handle.sessionName}"`);
+      log(
+        `${partnerDisplay} interactive turn is still running in tmux session "${handle.sessionName}": ${activity.summary}`
+      );
     }
 
     await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -645,9 +601,8 @@ async function waitForSidecarCompletion({
 }
 
 function readCompletion({ turnDir, resultPath, donePath }) {
-  let doneStat;
   try {
-    doneStat = fs.statSync(donePath);
+    fs.statSync(donePath);
   } catch (err) {
     if (isTransientFsError(err)) return null;
     throw err;
@@ -678,14 +633,6 @@ function readCompletion({ turnDir, resultPath, donePath }) {
         status,
         result: "",
         error: typeof done?.error === "string" ? done.error : "Partner reported an error before writing a result file",
-      };
-    }
-    const doneAgeMs = Date.now() - doneStat.mtimeMs;
-    if (doneAgeMs > DONE_WITHOUT_RESULT_GRACE_MS) {
-      return {
-        status: "error",
-        result: "",
-        error: `Partner wrote done.json with status ok but result file is missing: ${resolvedResultPath}`,
       };
     }
     return null;

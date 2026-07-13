@@ -4,15 +4,13 @@
  *
  * Polls for new host-agent messages. When one appears, invokes the configured
  * partner CLI with the full conversation history and writes the response back
- * to the shared conversation file. Handles timeouts, crashes, and graceful
- * shutdown.
+ * to the shared conversation file. Handles crashes and graceful shutdown.
  */
 
 import fs from "fs";
 import path from "path";
 import {
   appendMessage,
-  DIALOGS_DIR,
   getAgentDisplayName,
   normalizeAgent,
   readConversation,
@@ -22,10 +20,6 @@ import {
   isPartnerTurnCancelledError,
   runPartnerCommand,
 } from "./partner-invocation.mjs";
-import {
-  sweepOrphanedPartnerTerminals,
-  terminateCurrentPartnerTerminal,
-} from "./tmux-runtime.mjs";
 import {
   DEFAULT_REASONING_EFFORT,
   normalizeReasoningEffortForAgent,
@@ -82,32 +76,21 @@ function log(msg) {
 
 let terminatingFromSignal = false;
 
-async function terminateFromSignal(signal) {
+function exitFromSignal(signal) {
   if (terminatingFromSignal) return;
   terminatingFromSignal = true;
+  log(`${signal} received; exiting runner without terminating the active partner terminal`);
   try {
-    log(`${signal} received, terminating active partner terminal before exit`);
-    try {
-      fs.writeFileSync(END_SIGNAL_PATH, "");
-    } catch {}
-    try {
-      await terminateCurrentPartnerTerminal(sessionDir);
-    } catch (err) {
-      log(`Failed to terminate partner terminal after ${signal}: ${err.message}`);
-    }
-    try {
-      fs.unlinkSync(PROCESSING_PATH);
-    } catch {}
-  } finally {
-    process.exit(0);
-  }
+    fs.unlinkSync(PROCESSING_PATH);
+  } catch {}
+  process.exit(0);
 }
 
 process.once("SIGTERM", () => {
-  void terminateFromSignal("SIGTERM");
+  exitFromSignal("SIGTERM");
 });
 process.once("SIGINT", () => {
-  void terminateFromSignal("SIGINT");
+  exitFromSignal("SIGINT");
 });
 
 function readSessionStatus() {
@@ -297,15 +280,6 @@ async function main() {
     log(`Subject: ${status.subject_kind || "document"} at ${status.subject_path}`);
   }
   log(`Idle shutdown when no active turn: ${IDLE_SHUTDOWN_MS / 1000}s`);
-  try {
-    const sweep = await sweepOrphanedPartnerTerminals(DIALOGS_DIR, { log });
-    if (sweep.terminated.length > 0) {
-      log(`Orphaned tmux sweep terminated ${sweep.terminated.length} stale session(s)`);
-    }
-  } catch (err) {
-    log(`Orphaned tmux sweep failed: ${err.message}`);
-  }
-
   while (partnerTurns < MAX_TURNS) {
     if (fs.existsSync(END_SIGNAL_PATH)) {
       log("End signal detected, shutting down gracefully");

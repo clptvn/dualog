@@ -220,9 +220,9 @@ Partner runtime details:
 - `check_partner_alive` includes `partner_terminal.activity`, which summarizes whether the partner appears to be thinking, reading/searching files, running a command, writing, starting, idle, or unknown. When visible, it also extracts the model label, status verb, elapsed time, and token count from the CLI status line.
 - `check_partner_alive` returns only `partner_terminal.capture.tail_text` by default, capped to a few bottom pane lines to avoid filling the caller's context window. Pass `include_full_capture: true` only when you intentionally need the full bounded pane capture.
 - Active partner turns are not killed by wall-clock timeout. This is intentional: the host agent should inspect the pane and call `end_dialog` when a partner is actually stuck, rather than relying on a blind timer for large reviews.
-- Partner turns do detect clear liveness failures: unhandled startup prompts, swallowed prompt submission, an idle prompt without sidecar completion, and long-running panes with no recognizable activity are reported as errors instead of waiting forever.
+- Once a partner turn starts, pane activity classification is diagnostic only. Idle, unknown, or unchanged activity never times out or terminates the tmux session; the turn waits for explicit completion, partner-process exit, or `end_dialog`.
 - Inactive runners with no active turn self-shutdown after `CODEX_DIALOG_IDLE_SHUTDOWN_MS` milliseconds, defaulting to 24 hours, so abandoned sessions do not poll forever.
-- Server and runner startup sweep stale `ccd-*` sessions on the dedicated tmux socket when their recorded runner is no longer alive. Manual cleanup, if needed: `tmux -L codex-dialog kill-server`.
+- Runner shutdown and server restart do not sweep or terminate active `ccd-*` sessions. The `end_dialog` tool is the explicit cleanup path; manual emergency cleanup remains available with `tmux -L codex-dialog kill-server`.
 - During long turns the runner periodically saves pane captures, so a later partner crash can report the last observed terminal tail or full saved capture path instead of only saying the tmux session disappeared.
 
 `start_dialog` also accepts:

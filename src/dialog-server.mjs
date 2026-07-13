@@ -21,7 +21,6 @@ import {
 import {
   inspectPartnerTerminal,
   readTerminalState,
-  sweepOrphanedPartnerTerminals,
   terminateCurrentPartnerTerminal,
 } from "./tmux-runtime.mjs";
 import {
@@ -46,12 +45,6 @@ const MODEL_OVERRIDE_DESCRIPTION =
   "Optional partner model override. Model strings are forwarded to the selected partner CLI. Claude examples: claude-fable-5, claude-opus-4-8, claude-opus-4-8[1m], claude-opus-4-7[1m], claude-opus-4-6[1m], claude-sonnet-4-6. Claude Fable 5 has 1M context by default; do not add a [1m] suffix. Codex examples: gpt-5.6 (alias for Sol), gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.3-codex.";
 const REASONING_EFFORT_DESCRIPTION =
   "Optional partner-specific reasoning effort level. Defaults to high. For Codex this is low|medium|high|xhigh|max|ultra; max is available with the GPT-5.6 family, while ultra is available with GPT-5.6 Sol and Terra. For Claude this is low|medium|high|xhigh|max.";
-
-sweepOrphanedPartnerTerminals(DIALOGS_DIR, {
-  log: (msg) => console.error(`[codex-dialog] ${msg}`),
-}).catch((err) => {
-  console.error(`[codex-dialog] Failed to sweep orphaned tmux sessions: ${err.message}`);
-});
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
