@@ -2,7 +2,7 @@
 user-invocable: true
 description: Have Codex review a feature/product spec via the codex-dialog MCP server
 argument-hint: [optional: path/to/spec.md] [optional: rounds:N] [optional: effort:low|medium|high|xhigh|max|ultra] [optional: model:gpt-5.6|gpt-5.6-sol|gpt-5.6-terra|gpt-5.6-luna|gpt-5.5|gpt-5.4|gpt-5.3-codex|gpt-5.4-mini|gpt-5.3-codex-spark]
-allowed-tools: codex-dialog__start_dialog, codex-dialog__wait_for_partner_response, codex-dialog__check_messages, codex-dialog__send_message, codex-dialog__get_full_history, codex-dialog__check_partner_alive, codex-dialog__end_dialog, codex-dialog__list_sessions, Bash, Read, Glob, Grep, Edit, Write, ask_user_question
+allowed-tools: codex-dialog__start_dialog, codex-dialog__wait_for_partner_response, codex-dialog__check_messages, codex-dialog__send_message, codex-dialog__get_full_history, codex-dialog__check_partner_alive, codex-dialog__end_dialog, codex-dialog__list_sessions, run_terminal_command, read_file, grep, list_dir, search_replace
 ---
 
 # /codex-review-spec - Feature Spec Review via Codex Dialog MCP Server
@@ -160,27 +160,15 @@ Then use `send_message` to ask Codex to review the current spec snapshot as your
 
 ---
 
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
-
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
-
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
-
 ```bash
-tail -F -n 0 "$HOME/.claude/dialogs/<SESSION_ID>/conversation.jsonl" 2>/dev/null | \
   grep -m 1 --line-buffered -E '"from":"(codex|system)"'
 ```
 
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
-
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
 - `description`: `codex spec review response in <SESSION_ID>`
 - `timeout_ms`: `600000` (10 min — spec reviews are usually faster than audits)
 - `persistent`: `false`
 
 When the notification arrives, call `check_messages` with `since_id: 0` (or `get_full_history`) to read the structured content — the notification itself just confirms a new message landed.
-
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
 
 Read the review carefully once it arrives.
 
@@ -226,10 +214,6 @@ Use `send_message` to send ONE consolidated response per round covering every fi
 **If the previous Codex message hinted at drip-feeding** (e.g. "I'll look at X next round," thin coverage for a dense spec), add: *"Please include any remaining concerns in your next message — we have a limited round budget and I want to make sure I hear everything."*
 
 If findings warrant spec changes, update the spec file and mention what changed in your response.
-
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
-
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
 
 Codex will:
 - Accept or push back on your responses
@@ -279,10 +263,20 @@ Call `end_dialog` to clean up the session.
 ## KEY PRINCIPLES
 
 1. **Use the MCP tools** — all communication goes through the codex-dialog server
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
 3. **Respect the round budget** — default 5 soft / 10 hard. Watch `budget` in server responses. Consolidate into single messages; push back on drip-feeding. Never change `max_rounds` unless the user explicitly asked.
 4. **Evidence-based** — verify every finding against actual spec text and/or codebase before agreeing or disagreeing
 5. **Update the spec** — if findings are valid, actually fix the spec file
 6. **Prefer the passed path** — if you (Claude) just wrote the spec in this session, pass the path as an argument rather than relying on auto-detection
 7. **User is arbiter** — when you and Codex can't agree, ask the user
 8. **Honest over agreeable** — if Codex is wrong, say so with evidence. If Codex is right, update the spec properly. Never make a superficial spec edit just to resolve a finding.
+
+## WAITING FOR THE PARTNER (Grok host)
+
+Use **`codex-dialog__wait_for_partner_response` only** — never sleep-poll, never Claude Monitor.
+
+1. After `start_code_review` / first partner turn: `wait_for_partner_response(session_id, since_id: 0)`.
+2. After each `send_message`: use the returned `message_id` as `since_id`.
+3. On `timeout_processing`, call wait again. On `timeout_idle`, call `check_partner_alive`.
+4. Branch on `wait_result` / `review_status`; do not invent a second wait mechanism.
+
+Tool names are `codex-dialog__*` (Grok). Do **not** use `mcp__codex-dialog__*`.

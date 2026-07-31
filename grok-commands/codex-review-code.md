@@ -2,7 +2,7 @@
 user-invocable: true
 description: Have Codex review your code changes via the codex-dialog MCP server
 argument-hint: [optional: diff_target (uncommitted|staged|branch|commit:<sha>)] [optional: review focus] [optional: rounds:N] [optional: effort:low|medium|high|xhigh|max|ultra] [optional: model:gpt-5.6|gpt-5.6-sol|gpt-5.6-terra|gpt-5.6-luna|gpt-5.5|gpt-5.4|gpt-5.3-codex|gpt-5.4-mini|gpt-5.3-codex-spark]
-allowed-tools: codex-dialog__start_code_review, codex-dialog__wait_for_partner_response, codex-dialog__check_messages, codex-dialog__send_message, codex-dialog__get_review_summary, codex-dialog__get_full_history, codex-dialog__check_partner_alive, codex-dialog__end_dialog, codex-dialog__list_sessions, Bash, Read, Glob, Grep, Edit, Write, ask_user_question
+allowed-tools: codex-dialog__start_code_review, codex-dialog__wait_for_partner_response, codex-dialog__check_messages, codex-dialog__send_message, codex-dialog__get_review_summary, codex-dialog__get_full_history, codex-dialog__check_partner_alive, codex-dialog__end_dialog, codex-dialog__list_sessions, run_terminal_command, read_file, grep, list_dir, search_replace
 ---
 
 # /codex-review-code - Code Review via Codex Dialog MCP Server
@@ -70,8 +70,6 @@ FEEDBACK FRAMING: When you report findings, frame them as interesting observatio
 
 Save the returned `session_id` — you need it for all subsequent calls. Note the returned `max_rounds` and `hard_cap` values — you'll want to keep an eye on the budget as the review progresses.
 
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
-
 ### Round Budget (Important)
 
 The server enforces a **soft round budget** (default: 5 rounds). Codex is prompted to deliver COMPLETE feedback in each message — no drip-feeding across rounds. A hard cap of `soft + 5` rounds stops the session entirely if the conversation overruns.
@@ -85,27 +83,15 @@ Use the budget as a cue, not a stopwatch:
 
 ---
 
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
-
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
-
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
-
 ```bash
-tail -F -n 0 "$HOME/.claude/dialogs/<SESSION_ID>/conversation.jsonl" 2>/dev/null | \
   grep -m 1 --line-buffered -E '"from":"(codex|system)"'
 ```
 
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
-
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
 - `description`: `codex review response in <SESSION_ID>`
 - `timeout_ms`: `900000` (15 min — large diffs can run long)
 - `persistent`: `false`
 
 When the notification arrives, call `check_messages` with `since_id: 0` (or `get_full_history`) to read the structured content — the notification itself just confirms a new message landed.
-
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
 
 Once you receive the initial review, read it carefully. The review uses a severity-ordered taxonomy:
 - **[CRITICAL]** — bugs, security issues, data loss risk (must address)
@@ -160,10 +146,6 @@ Use `send_message` to send ONE consolidated response covering everything you did
 
 **If the previous Codex message hinted at drip-feeding** (e.g. "I'll look at X next round," thin coverage for a large diff), add an explicit line: *"Please include any remaining findings in your next message — we have a limited round budget and I want to make sure I hear everything."*
 
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
-
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
-
 Codex will:
 - Verify your fixes look correct
 - Accept or push back on disagreements
@@ -211,9 +193,19 @@ Call `end_dialog` to clean up the session.
 ## KEY PRINCIPLES
 
 1. **Use the MCP tools** — all communication goes through the codex-dialog server
-Use `wait_for_partner_response` (not sleep-polling) to await partner turns.
 3. **Respect the round budget** — default 5 soft / 10 hard. Watch `budget` in server responses. Consolidate into single messages; push back on drip-feeding. Never change `max_rounds` unless the user explicitly asked.
 4. **Fix in code, explain in message** — make actual fixes, then tell Codex what you did
 5. **Evidence-based** — back up agreements AND disagreements with actual code
 6. **User is arbiter** — when you and Codex can't agree, ask the user
 7. **Honest over agreeable** — if Codex is wrong, say so with evidence. If Codex is right, fix it properly. Never patch something superficially just to resolve a finding.
+
+## WAITING FOR THE PARTNER (Grok host)
+
+Use **`codex-dialog__wait_for_partner_response` only** — never sleep-poll, never Claude Monitor.
+
+1. After `start_code_review` / first partner turn: `wait_for_partner_response(session_id, since_id: 0)`.
+2. After each `send_message`: use the returned `message_id` as `since_id`.
+3. On `timeout_processing`, call wait again. On `timeout_idle`, call `check_partner_alive`.
+4. Branch on `wait_result` / `review_status`; do not invent a second wait mechanism.
+
+Tool names are `codex-dialog__*` (Grok). Do **not** use `mcp__codex-dialog__*`.
