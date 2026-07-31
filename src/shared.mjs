@@ -37,7 +37,6 @@ export function normalizeHostAgent(agent, fallback = "claude") {
   return KNOWN_HOST_AGENTS.includes(name) ? name : fallback;
 }
 
-/** Partners are only Claude or Codex CLIs in v1. */
 export function normalizePartnerAgent(agent, fallback = "codex") {
   const name = canonicalizeAgentName(agent);
   return KNOWN_PARTNER_AGENTS.includes(name) ? name : fallback;
@@ -49,6 +48,55 @@ export function getSessionHostAgent(status) {
 
 export function getSessionPartnerAgent(status) {
   return normalizePartnerAgent(status?.partner_agent, "codex");
+}
+
+/** All partner agents for binary or group sessions. */
+export function getSessionPartnerAgents(status) {
+  if (Array.isArray(status?.partner_agents) && status.partner_agents.length) {
+    return status.partner_agents
+      .map((a) => normalizePartnerAgent(a, null))
+      .filter(Boolean);
+  }
+  const single = status?.partner_agent;
+  if (single) return [normalizePartnerAgent(single, "codex")];
+  return ["codex"];
+}
+
+export function isGroupSession(status) {
+  return (
+    status?.type === "group_dialog" ||
+    status?.type === "group_review" ||
+    (Array.isArray(status?.partner_agents) && status.partner_agents.length > 1)
+  );
+}
+
+export function resolveGroupTargets(status, hostMessage) {
+  const partners = getSessionPartnerAgents(status);
+  const mode = status?.mode || "addressable";
+  const to = hostMessage?.to;
+
+  if (to === "all" || (Array.isArray(to) && to.includes("all"))) {
+    return [...partners];
+  }
+  if (typeof to === "string" && partners.includes(to)) {
+    return [to];
+  }
+  if (Array.isArray(to) && to.length) {
+    return to
+      .map((a) => normalizePartnerAgent(a, null))
+      .filter((a) => a && partners.includes(a));
+  }
+
+  if (mode === "fan_out" || mode === "review") {
+    return [...partners];
+  }
+  if (mode === "round_robin") {
+    const idx = Number(status?.turn_state?.rr_index) || 0;
+    if (!partners.length) return [];
+    return [partners[idx % partners.length]];
+  }
+  // addressable without `to` → empty (caller should error)
+  return [];
 }
 
 export function getAgentDisplayName(agent) {
@@ -355,7 +403,7 @@ function withConvLock(convPath, fn) {
   throw new Error("Failed to acquire conversation lock after retries");
 }
 
-export function appendMessage(sessionDir, from, content) {
+export function appendMessage(sessionDir, from, content, options = {}) {
   const convPath = resolveConvPath(sessionDir);
   return withConvLock(convPath, () => {
     const messages = readConversation(sessionDir);
@@ -365,6 +413,8 @@ export function appendMessage(sessionDir, from, content) {
     }, 0);
     const id = maxId + 1;
     const msg = { id, from, content, timestamp: new Date().toISOString() };
+    if (options.to != null) msg.to = options.to;
+    if (options.meta != null) msg.meta = options.meta;
     fs.appendFileSync(convPath, JSON.stringify(msg) + "\n");
     return msg;
   });

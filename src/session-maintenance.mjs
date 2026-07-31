@@ -126,7 +126,12 @@ export function listSessionIds(root = dialogsDir()) {
   if (!fs.existsSync(root)) return [];
   return fs
     .readdirSync(root)
-    .filter((d) => d.startsWith("dialog-") || d.startsWith("review-"));
+    .filter(
+      (d) =>
+        d.startsWith("dialog-") ||
+        d.startsWith("review-") ||
+        d.startsWith("group-")
+    );
 }
 
 export function countActiveSessions(root = dialogsDir()) {

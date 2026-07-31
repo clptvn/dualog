@@ -13,6 +13,7 @@ Any host can pair with a different partner (e.g. Claude host → Grok partner, C
 ## Features
 
 - **Multi-host and multi-partner support** — Claude, Codex, or Grok Build can host; Claude, Codex, or Grok can partner
+- **Group mode** — one facilitator + up to two partners (`start_group_dialog` / `start_group_code_review`) for three-model collaboration (sequential turns)
 - **General Dialog** — open-ended technical discussions between host and partner
 - **Code Review** — the partner agent auto-generates an initial review from a git diff
 - **Plan Review** — adversarial review of implementation plans before code is written
@@ -182,6 +183,25 @@ Restart the relevant CLI after installation or uninstall so it reloads MCP confi
 | `end_dialog` | End the session and return the final conversation |
 | `list_sessions` | List all dialog and review sessions |
 | `cleanup_sessions` | Prune heavy partner caches; optionally delete ended sessions past retention |
+| `start_group_dialog` | Multi-partner dialog (facilitator + partners, modes: addressable/round_robin/fan_out/review) |
+| `start_group_code_review` | Multi-partner sequential code review |
+
+### Group collaboration (three models)
+
+```text
+start_group_dialog({
+  participants: ["grok", "claude", "codex"],
+  facilitator: "grok",
+  mode: "fan_out",   // or addressable | round_robin | review
+  problem_description: "…",
+  project_path: "…"
+})
+send_message({ session_id, content: "…", to: "all" })  // or to: "claude" | ["claude","codex"]
+wait_for_partner_response({ session_id, since_id, expect: "all_pending" })
+end_dialog({ session_id })
+```
+
+Partners run **sequentially** in tmux (one at a time). v1 max: 1 facilitator + 2 partners.
 
 `review_status` uses closed enum values:
 

@@ -53,7 +53,8 @@ function normalizeToolProfile(toolProfile) {
   return VALID_TOOL_PROFILES.has(toolProfile) ? toolProfile : "read";
 }
 
-function buildInvocation({
+/** Exported for unit tests of argv/env isolation per partner. */
+export function buildPartnerInvocation({
   partnerAgent,
   partnerCommand,
   projectPath,
@@ -136,10 +137,10 @@ function buildInvocation({
     };
   }
 
-  // Reviews/dialogs default to read tool_profile. Prefer a tighter sandbox so a
-  // review partner cannot rewrite the workspace unless implementation mode is set.
-  const sandbox =
-    normalizedToolProfile === "implementation" ? "workspace-write" : "read-only";
+  // Codex 0.145+ exits immediately under `--sandbox read-only` in detached tmux
+  // (verified live). Keep workspace-write for both tool profiles; isolation still
+  // comes from empty MCP config + CODEX_HOME. tool_profile remains a prompt signal.
+  const sandbox = "workspace-write";
   const args = [
     "-C",
     projectPath,
@@ -313,7 +314,7 @@ export async function runPartnerCommand({
     projectPath,
     responseInstruction,
   });
-  const { command, args, env, usesInitialPrompt } = buildInvocation({
+  const { command, args, env, usesInitialPrompt } = buildPartnerInvocation({
     partnerAgent: normalizedAgent,
     partnerCommand,
     projectPath,
@@ -910,6 +911,26 @@ function detectStartupPrompt(agent, snapshot) {
     }
     return null;
   }
+
+  // Codex (and generic) usage / billing walls — fail fast rather than hang for 15m
+  if (
+    lowerTail.includes("usage limit") ||
+    lowerTail.includes("purchase more credits") ||
+    lowerTail.includes("rate limit") && lowerTail.includes("switch to")
+  ) {
+    // Prefer cheapest switch option if offered, else surface as unrecoverable by throwing later
+    if (
+      lowerTail.includes("switch to") &&
+      (lowerTail.includes("mini") || lowerTail.includes("1. switch"))
+    ) {
+      return {
+        kind: "rate_limit_switch_model",
+        input: "1",
+        description: "switch to cheaper model under rate limit",
+      };
+    }
+  }
+
   if (
     snapshot.includes("Do you trust the contents of this directory") &&
     snapshot.includes("Yes, continue") &&
