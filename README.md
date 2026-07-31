@@ -6,13 +6,13 @@ An MCP server for multi-agent review dialogs. Supported **hosts** (the client th
 - [Codex CLI](https://github.com/openai/codex)
 - [Grok Build](https://x.ai/cli)
 
-Supported **partners** (spawned in detached `tmux` for background turns): Claude and Codex CLIs.
+Supported **partners** (spawned in detached `tmux` for background turns): Claude, Codex, and Grok Build CLIs.
 
-Either Claude or Codex can host while the other reviews; **Grok Build can host** and use Codex (default) or Claude as the partner. Grok-as-partner is not implemented yet.
+Any host can pair with a different partner (e.g. Claude host → Grok partner, Codex host → Claude partner, Grok host → Codex partner). `host_agent` and `partner_agent` must differ.
 
 ## Features
 
-- **Multi-host support** — Claude, Codex, or Grok Build can host; Claude/Codex act as review partners
+- **Multi-host and multi-partner support** — Claude, Codex, or Grok Build can host; Claude, Codex, or Grok can partner
 - **General Dialog** — open-ended technical discussions between host and partner
 - **Code Review** — the partner agent auto-generates an initial review from a git diff
 - **Plan Review** — adversarial review of implementation plans before code is written
@@ -103,6 +103,15 @@ This registers `codex-dialog` in `~/.grok/config.toml` (user scope), installs:
 - commands: `~/.grok/commands/codex-{review-code,review-plan,review-spec,audit}.md`
 
 Grok tool names are `codex-dialog__*` (not Claude’s `mcp__codex-dialog__*`). When starting a session from Grok, pass `host_agent: "grok"` so metadata is labeled correctly. Partner default remains Codex.
+
+To use **Grok as the partner** (Claude or Codex host reviews via Grok in tmux):
+
+```text
+start_code_review(..., host_agent: "claude", partner_agent: "grok")
+start_dialog(..., host_agent: "codex", partner_agent: "grok")
+```
+
+Partner turns use an isolated `GROK_HOME` under the session dir (auth copied, MCP empty) so nested Grok sessions do not re-load this dialog server.
 
 Restart Grok (or refresh `/mcps`) after install.
 

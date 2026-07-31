@@ -8,7 +8,7 @@ fs.mkdirSync(DIALOGS_DIR, { recursive: true });
 /** Hosts that can drive the MCP tools (the client calling the server). */
 export const KNOWN_HOST_AGENTS = ["claude", "codex", "grok"];
 /** Partners that can be spawned in tmux by the runner. */
-export const KNOWN_PARTNER_AGENTS = ["claude", "codex"];
+export const KNOWN_PARTNER_AGENTS = ["claude", "codex", "grok"];
 /** Union used for display/normalization aliases. */
 export const KNOWN_AGENTS = ["claude", "codex", "grok"];
 

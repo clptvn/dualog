@@ -39,7 +39,7 @@ try {
   const statusPath = path.join(dialogSessionDir(sessionId), "status.json");
   if (fs.existsSync(statusPath)) {
     const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
-    if (status?.partner_agent === "claude" || status?.partner_agent === "codex") {
+    if (status?.partner_agent === "claude" || status?.partner_agent === "codex" || status?.partner_agent === "grok") {
       partnerAgent = status.partner_agent;
     }
   }

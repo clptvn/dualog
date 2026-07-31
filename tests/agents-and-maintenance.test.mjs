@@ -34,9 +34,10 @@ describe("agent normalization", () => {
     assert.ok(KNOWN_HOST_AGENTS.includes("grok"));
   });
 
-  it("does not accept grok as a partner", () => {
-    assert.equal(normalizePartnerAgent("grok", "codex"), "codex");
-    assert.deepEqual(KNOWN_PARTNER_AGENTS, ["claude", "codex"]);
+  it("accepts grok as a partner (and host)", () => {
+    assert.equal(normalizePartnerAgent("grok", "codex"), "grok");
+    assert.equal(normalizePartnerAgent("grok-build", "codex"), "grok");
+    assert.ok(KNOWN_PARTNER_AGENTS.includes("grok"));
   });
 
   it("display names cover all hosts", () => {
@@ -71,15 +72,22 @@ describe("diff capping", () => {
 });
 
 describe("session heavy artifact prune", () => {
-  it("removes codex-home caches while keeping conversation", () => {
+  it("removes codex-home and grok-home caches while keeping conversation", () => {
     const sessionDir = path.join(TMP, "dialogs", "dialog-1-deadbeef");
     fs.mkdirSync(path.join(sessionDir, "codex-home", "plugins", "cache"), {
       recursive: true,
     });
     fs.mkdirSync(path.join(sessionDir, "codex-home", ".tmp"), { recursive: true });
+    fs.mkdirSync(path.join(sessionDir, "grok-home", "sessions"), {
+      recursive: true,
+    });
     fs.writeFileSync(
       path.join(sessionDir, "codex-home", "plugins", "cache", "blob.bin"),
       Buffer.alloc(1024)
+    );
+    fs.writeFileSync(
+      path.join(sessionDir, "grok-home", "sessions", "x.json"),
+      "{}"
     );
     fs.writeFileSync(path.join(sessionDir, "conversation.jsonl"), '{"id":1}\n');
     fs.writeFileSync(path.join(sessionDir, "status.json"), "{}");
@@ -88,6 +96,7 @@ describe("session heavy artifact prune", () => {
     assert.ok(result.pruned.length > 0);
     assert.ok(fs.existsSync(path.join(sessionDir, "conversation.jsonl")));
     assert.ok(!fs.existsSync(path.join(sessionDir, "codex-home", "plugins")));
+    assert.ok(!fs.existsSync(path.join(sessionDir, "grok-home")));
   });
 });
 

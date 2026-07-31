@@ -40,11 +40,15 @@ export function pruneSessionHeavyArtifacts(sessionDir, { aggressive = false } = 
     path.join(sessionDir, "codex-home", "logs_2.sqlite-shm"),
     path.join(sessionDir, "codex-home", "memories_1.sqlite-wal"),
     path.join(sessionDir, "codex-home", "memories_1.sqlite-shm"),
+    path.join(sessionDir, "grok-home", "sessions"),
+    path.join(sessionDir, "grok-home", "logs"),
+    path.join(sessionDir, "grok-home", "marketplace-cache"),
   ];
 
   if (aggressive) {
-    // Full partner home except auth — only after end_dialog.
+    // Full partner homes — only after end_dialog (conversation kept).
     targets.push(path.join(sessionDir, "codex-home"));
+    targets.push(path.join(sessionDir, "grok-home"));
   }
 
   const pruned = [];

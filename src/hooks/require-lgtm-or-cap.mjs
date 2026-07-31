@@ -42,9 +42,9 @@ const statusPath = path.join(sessionDir, "status.json");
 if (fs.existsSync(statusPath)) {
   try {
     status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
-    if (status?.partner_agent === "claude" || status?.partner_agent === "codex") {
+    if (status?.partner_agent === "claude" || status?.partner_agent === "codex" || status?.partner_agent === "grok") {
       partnerAgent = status.partner_agent;
-      partnerDisplay = partnerAgent === "claude" ? "Claude" : "Codex";
+      partnerDisplay = partnerAgent === "claude" ? "Claude" : partnerAgent === "grok" ? "Grok" : "Codex";
     }
     hardCap = status?.hard_cap || (status?.max_rounds || 5) + 5;
     runnerPid = status?.runner_pid || null;

@@ -36,7 +36,7 @@ import {
 } from "./session-maintenance.mjs";
 
 const HOST_AGENT_ENUM = z.enum(["claude", "codex", "grok"]);
-const PARTNER_AGENT_ENUM = z.enum(["claude", "codex"]);
+const PARTNER_AGENT_ENUM = z.enum(["claude", "codex", "grok"]);
 
 const server = new McpServer({
   name: "codex-dialog",
@@ -52,9 +52,9 @@ const WAIT_FALLBACK_INTERVAL_MS = 5000;
 const WAIT_PROGRESS_INTERVAL_MS = 30000;
 const END_DIALOG_GRACE_MS = 5500;
 const MODEL_OVERRIDE_DESCRIPTION =
-  "Optional partner model override. Model strings are forwarded to the selected partner CLI. Claude examples: claude-fable-5, claude-opus-4-8, claude-opus-4-8[1m], claude-opus-4-7[1m], claude-opus-4-6[1m], claude-sonnet-4-6. Claude Fable 5 has 1M context by default; do not add a [1m] suffix. Codex examples: gpt-5.6 (alias for Sol), gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.3-codex.";
+  "Optional partner model override. Model strings are forwarded to the selected partner CLI. Claude examples: claude-fable-5, claude-opus-4-8, claude-opus-4-8[1m], claude-opus-4-7[1m], claude-opus-4-6[1m], claude-sonnet-4-6. Claude Fable 5 has 1M context by default; do not add a [1m] suffix. Codex examples: gpt-5.6 (alias for Sol), gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.3-codex. Grok examples: grok-4.5, grok-build.";
 const REASONING_EFFORT_DESCRIPTION =
-  "Optional partner-specific reasoning effort level. Defaults to high. For Codex this is low|medium|high|xhigh|max|ultra; max is available with the GPT-5.6 family, while ultra is available with GPT-5.6 Sol and Terra. For Claude this is low|medium|high|xhigh|max.";
+  "Optional partner-specific reasoning effort level. Defaults to high. For Codex this is low|medium|high|xhigh|max|ultra; max is available with the GPT-5.6 family, while ultra is available with GPT-5.6 Sol and Terra. For Claude and Grok this is low|medium|high|xhigh|max.";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -99,10 +99,12 @@ function resolvePartnerCommandValue(
   partnerAgent,
   partnerCommand,
   codexCommand,
-  claudeCommand
+  claudeCommand,
+  grokCommand
 ) {
   if (partnerCommand) return partnerCommand;
   if (partnerAgent === "claude") return claudeCommand || "claude";
+  if (partnerAgent === "grok") return grokCommand || "grok";
   return codexCommand || "codex";
 }
 
@@ -490,7 +492,9 @@ server.tool(
       ),
     partner_agent: PARTNER_AGENT_ENUM
       .optional()
-      .describe("Which agent should respond in the background runner (default: 'codex')"),
+      .describe(
+        "Which agent should respond in the background runner (default: 'codex'). Use 'grok' to spawn Grok Build in tmux."
+      ),
     partner_command: z
       .string()
       .optional()
@@ -503,6 +507,10 @@ server.tool(
       .string()
       .optional()
       .describe("Alias for partner_command when partner_agent='claude'"),
+    grok_command: z
+      .string()
+      .optional()
+      .describe("Alias for partner_command when partner_agent='grok'"),
     max_rounds: z
       .number()
       .int()
@@ -551,6 +559,7 @@ server.tool(
     partner_command,
     codex_command,
     claude_command,
+    grok_command,
     max_rounds,
     reasoning_effort,
     model,
@@ -602,7 +611,8 @@ server.tool(
       partnerAgent,
       partner_command,
       codex_command,
-      claude_command
+      claude_command,
+      grok_command
     );
     const partnerDisplay = getAgentDisplayName(partnerAgent);
     const resolvedProjectPath = project_path || process.cwd();
@@ -758,7 +768,9 @@ server.tool(
       ),
     partner_agent: PARTNER_AGENT_ENUM
       .optional()
-      .describe("Which agent should review in the background (default: 'codex')"),
+      .describe(
+        "Which agent should review in the background (default: 'codex'). Use 'grok' to spawn Grok Build in tmux."
+      ),
     partner_command: z
       .string()
       .optional()
@@ -771,6 +783,10 @@ server.tool(
       .string()
       .optional()
       .describe("Alias for partner_command when partner_agent='claude'"),
+    grok_command: z
+      .string()
+      .optional()
+      .describe("Alias for partner_command when partner_agent='grok'"),
     max_rounds: z
       .number()
       .int()
@@ -806,6 +822,7 @@ server.tool(
     partner_command,
     codex_command,
     claude_command,
+    grok_command,
     max_rounds,
     reasoning_effort,
     model,
@@ -860,7 +877,8 @@ server.tool(
       partnerAgent,
       partner_command,
       codex_command,
-      claude_command
+      claude_command,
+      grok_command
     );
     const partnerDisplay = getAgentDisplayName(partnerAgent);
     const execOpts = { cwd: project_path, timeout: 30000, maxBuffer: 10 * 1024 * 1024 };
