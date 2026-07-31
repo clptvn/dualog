@@ -13,7 +13,8 @@ import path from "path";
 import {
   appendMessage,
   getAgentDisplayName,
-  normalizeAgent,
+  normalizeHostAgent,
+  normalizePartnerAgent,
   readConversation,
   sleep,
 } from "./shared.mjs";
@@ -33,8 +34,8 @@ const SOFT_CAP = parseInt(process.argv[5], 10) || 5;
 const HARD_CAP = SOFT_CAP + 5;
 const RAW_REASONING_EFFORT = process.argv[6] || DEFAULT_REASONING_EFFORT;
 const PARTNER_MODEL = process.argv[7] || null;
-const HOST_AGENT = normalizeAgent(process.argv[8], "claude");
-const PARTNER_AGENT = normalizeAgent(process.argv[9], "codex");
+const HOST_AGENT = normalizeHostAgent(process.argv[8], "claude");
+const PARTNER_AGENT = normalizePartnerAgent(process.argv[9], "codex");
 const REASONING_EFFORT = normalizeReasoningEffortForAgent(
   RAW_REASONING_EFFORT,
   PARTNER_AGENT

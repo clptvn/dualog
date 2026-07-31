@@ -11,7 +11,8 @@ import {
   getAgentDisplayName,
   getSessionHostAgent,
   getSessionPartnerAgent,
-  normalizeAgent,
+  normalizeHostAgent,
+  normalizePartnerAgent,
   readConversation,
   appendMessage,
   isProcessAlive,
@@ -27,6 +28,15 @@ import {
   ALL_REASONING_EFFORTS,
   normalizeReasoningEffortForAgent,
 } from "./runtime-defaults.mjs";
+import {
+  assertUnderActiveSessionLimit,
+  capDiffText,
+  pruneExpiredSessions,
+  pruneSessionHeavyArtifacts,
+} from "./session-maintenance.mjs";
+
+const HOST_AGENT_ENUM = z.enum(["claude", "codex", "grok"]);
+const PARTNER_AGENT_ENUM = z.enum(["claude", "codex"]);
 
 const server = new McpServer({
   name: "codex-dialog",
@@ -473,12 +483,12 @@ server.tool(
       .string()
       .optional()
       .describe("Path to the project directory for context"),
-    host_agent: z
-      .enum(["claude", "codex"])
+    host_agent: HOST_AGENT_ENUM
       .optional()
-      .describe("Which agent is orchestrating the session (default: 'claude')"),
-    partner_agent: z
-      .enum(["claude", "codex"])
+      .describe(
+        "Which agent is orchestrating the session (default: 'claude'). Use 'grok' when Grok Build is the host."
+      ),
+    partner_agent: PARTNER_AGENT_ENUM
       .optional()
       .describe("Which agent should respond in the background runner (default: 'codex')"),
     partner_command: z
@@ -549,8 +559,8 @@ server.tool(
     subject_path,
     subject_kind,
   }) => {
-    const hostAgent = normalizeAgent(host_agent, "claude");
-    const partnerAgent = normalizeAgent(partner_agent, "codex");
+    const hostAgent = normalizeHostAgent(host_agent, "claude");
+    const partnerAgent = normalizePartnerAgent(partner_agent, "codex");
     if (hostAgent === partnerAgent) {
       return {
         content: [
@@ -559,6 +569,14 @@ server.tool(
             text: "Error: host_agent and partner_agent must be different",
           },
         ],
+      };
+    }
+    try {
+      pruneExpiredSessions();
+      assertUnderActiveSessionLimit();
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err.message}` }],
       };
     }
     const softCap = max_rounds || 5;
@@ -733,12 +751,12 @@ server.tool(
       .describe(
         "Optional focus area for the review, e.g. 'security', 'performance', 'correctness'"
       ),
-    host_agent: z
-      .enum(["claude", "codex"])
+    host_agent: HOST_AGENT_ENUM
       .optional()
-      .describe("Which agent is orchestrating the review (default: 'claude')"),
-    partner_agent: z
-      .enum(["claude", "codex"])
+      .describe(
+        "Which agent is orchestrating the review (default: 'claude'). Use 'grok' when Grok Build is the host."
+      ),
+    partner_agent: PARTNER_AGENT_ENUM
       .optional()
       .describe("Which agent should review in the background (default: 'codex')"),
     partner_command: z
@@ -793,8 +811,8 @@ server.tool(
     model,
     partner_timeout_ms,
   }) => {
-    const hostAgent = normalizeAgent(host_agent, "claude");
-    const partnerAgent = normalizeAgent(partner_agent, "codex");
+    const hostAgent = normalizeHostAgent(host_agent, "claude");
+    const partnerAgent = normalizePartnerAgent(partner_agent, "codex");
     if (hostAgent === partnerAgent) {
       return {
         content: [
@@ -803,6 +821,14 @@ server.tool(
             text: "Error: host_agent and partner_agent must be different",
           },
         ],
+      };
+    }
+    try {
+      pruneExpiredSessions();
+      assertUnderActiveSessionLimit();
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err.message}` }],
       };
     }
     const target = diff_target || "uncommitted";
@@ -930,6 +956,9 @@ server.tool(
       };
     }
 
+    const capped = capDiffText(diff);
+    diff = capped.diff;
+
     // Create session
     const sessionId = `review-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
     const sessionDir = resolveSessionDir(sessionId);
@@ -937,6 +966,20 @@ server.tool(
 
     // Write review artifacts
     fs.writeFileSync(path.join(sessionDir, "diff.patch"), diff);
+    if (capped.truncated) {
+      fs.writeFileSync(
+        path.join(sessionDir, "diff_truncated.json"),
+        JSON.stringify(
+          {
+            truncated: true,
+            original_bytes: capped.original_bytes,
+            max_bytes: capped.max_bytes,
+          },
+          null,
+          2
+        )
+      );
+    }
 
     const headBranchForMeta = target === "branch" ? (branch || currentBranch) : currentBranch;
     const baseBranchForMeta = target === "branch" ? (base_branch || "main") : "HEAD";
@@ -1508,6 +1551,8 @@ server.tool(
     const reviewStatus = computeReviewStatus(status, messages, {
       problem: readProblem(sessionDir),
     });
+    // Reclaim partner plugin/tmp bulk after the session ends (conversation kept).
+    const cleanup = pruneSessionHeavyArtifacts(sessionDir, { aggressive: true });
     return {
       content: [
         {
@@ -1519,6 +1564,7 @@ server.tool(
               session_type: status?.type || "unknown",
               total_messages: messages.length,
               review_status: reviewStatus,
+              cleanup,
               messages,
             },
             null,
@@ -1535,6 +1581,8 @@ server.tool(
   "List all dialog and review sessions (active and completed).",
   {},
   async () => {
+    // Side-effect: reclaim disk from expired/ended sessions (never active ones).
+    pruneExpiredSessions();
     if (!fs.existsSync(DIALOGS_DIR)) {
       return { content: [{ type: "text", text: "[]" }] };
     }
@@ -1552,16 +1600,18 @@ server.tool(
           : false;
         const budget = computeBudget(status, messages);
         results.push({
-        session_id: sessionId,
-        type: sessionId.startsWith("review-") ? "review" : "dialog",
-        started_at: status?.started_at,
-        host_agent: getSessionHostAgent(status),
-        partner_agent: getSessionPartnerAgent(status),
-        partner_timeout_ms: normalizePartnerTimeout(status?.partner_timeout_ms),
-        message_count: messages.length,
+          session_id: sessionId,
+          type: sessionId.startsWith("review-") ? "review" : "dialog",
+          started_at: status?.started_at,
+          host_agent: getSessionHostAgent(status),
+          partner_agent: getSessionPartnerAgent(status),
+          partner_timeout_ms: normalizePartnerTimeout(status?.partner_timeout_ms),
+          message_count: messages.length,
           runner_alive: alive,
           budget,
-          ...(status?.branch ? { branch: status.branch, base_branch: status.base_branch } : {}),
+          ...(status?.branch
+            ? { branch: status.branch, base_branch: status.base_branch }
+            : {}),
         });
       } catch {
         results.push({ session_id: sessionId, error: "failed to read session" });
@@ -1570,6 +1620,62 @@ server.tool(
 
     return {
       content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+    };
+  }
+);
+
+server.tool(
+  "cleanup_sessions",
+  "Prune heavy partner artifacts (codex-home caches/plugins/tmp) and optionally delete ended sessions older than retention. Never deletes active runners.",
+  {
+    delete_expired: z
+      .boolean()
+      .optional()
+      .describe(
+        "When true, delete ended sessions older than CODEX_DIALOG_RETENTION_DAYS (default 14). Default false only prunes heavy artifacts."
+      ),
+    aggressive: z
+      .boolean()
+      .optional()
+      .describe(
+        "When true, remove the entire codex-home tree for ended sessions (keeps conversation.jsonl/status)."
+      ),
+  },
+  async ({ delete_expired, aggressive }) => {
+    const root = DIALOGS_DIR;
+    const pruned = [];
+    if (!fs.existsSync(root)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ pruned, retention: null }, null, 2),
+          },
+        ],
+      };
+    }
+    for (const id of fs.readdirSync(root)) {
+      if (!id.startsWith("dialog-") && !id.startsWith("review-")) continue;
+      const dir = path.join(root, id);
+      const status = readStatus(dir);
+      if (status?.runner_pid && isProcessAlive(status.runner_pid)) continue;
+      if (fs.existsSync(path.join(dir, "end_signal")) || !status?.runner_pid) {
+        const result = pruneSessionHeavyArtifacts(dir, {
+          aggressive: Boolean(aggressive),
+        });
+        if (result.pruned.length) pruned.push({ session_id: id, ...result });
+      }
+    }
+    const retention = delete_expired
+      ? pruneExpiredSessions(root)
+      : { deleted: [], note: "delete_expired not set" };
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ pruned, retention }, null, 2),
+        },
+      ],
     };
   }
 );

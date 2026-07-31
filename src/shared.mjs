@@ -4,25 +4,58 @@ import { dialogsDir } from "./platform.mjs";
 
 export const DIALOGS_DIR = dialogsDir();
 fs.mkdirSync(DIALOGS_DIR, { recursive: true });
-export const KNOWN_AGENTS = ["claude", "codex"];
+
+/** Hosts that can drive the MCP tools (the client calling the server). */
+export const KNOWN_HOST_AGENTS = ["claude", "codex", "grok"];
+/** Partners that can be spawned in tmux by the runner. */
+export const KNOWN_PARTNER_AGENTS = ["claude", "codex"];
+/** Union used for display/normalization aliases. */
+export const KNOWN_AGENTS = ["claude", "codex", "grok"];
+
 const BLOCKING_FINDING_RE =
   /\[(CRITICAL|CORRECTNESS|ARCHITECTURE|SECURITY|ROBUSTNESS|GAP|AMBIGUITY|SCOPE|FEASIBILITY|UX|TESTABILITY)\]/i;
 const REVIEW_STATUS_SCHEMA_VERSION = 1;
 
+function canonicalizeAgentName(agent) {
+  const raw = String(agent || "")
+    .toLowerCase()
+    .trim();
+  if (raw === "grok-build" || raw === "grok_build" || raw === "grokbuild") {
+    return "grok";
+  }
+  return raw;
+}
+
 export function normalizeAgent(agent, fallback = "codex") {
-  return KNOWN_AGENTS.includes(agent) ? agent : fallback;
+  const name = canonicalizeAgentName(agent);
+  return KNOWN_AGENTS.includes(name) ? name : fallback;
+}
+
+/** Host agents include Grok Build; unknown values fall back to Claude (legacy default). */
+export function normalizeHostAgent(agent, fallback = "claude") {
+  const name = canonicalizeAgentName(agent);
+  return KNOWN_HOST_AGENTS.includes(name) ? name : fallback;
+}
+
+/** Partners are only Claude or Codex CLIs in v1. */
+export function normalizePartnerAgent(agent, fallback = "codex") {
+  const name = canonicalizeAgentName(agent);
+  return KNOWN_PARTNER_AGENTS.includes(name) ? name : fallback;
 }
 
 export function getSessionHostAgent(status) {
-  return normalizeAgent(status?.host_agent, "claude");
+  return normalizeHostAgent(status?.host_agent, "claude");
 }
 
 export function getSessionPartnerAgent(status) {
-  return normalizeAgent(status?.partner_agent, "codex");
+  return normalizePartnerAgent(status?.partner_agent, "codex");
 }
 
 export function getAgentDisplayName(agent) {
-  return normalizeAgent(agent, "codex") === "claude" ? "Claude" : "Codex";
+  const name = normalizeAgent(agent, "codex");
+  if (name === "claude") return "Claude";
+  if (name === "grok") return "Grok";
+  return "Codex";
 }
 
 export function isReviewApprovalDialog(problem) {
