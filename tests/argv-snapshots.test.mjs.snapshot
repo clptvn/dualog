@@ -1,0 +1,409 @@
+exports[`argv: claude / effort valid for codex but not claude is dropped 1`] = `
+{
+  "command": "claude",
+  "args": [
+    "--permission-mode",
+    "bypassPermissions",
+    "--allowedTools",
+    "Read,Grep,Glob,Bash,LSP",
+    "--mcp-config",
+    "<SESSION_DIR>/claude-empty-mcp.json",
+    "--strict-mcp-config",
+    "--add-dir",
+    "/fixture/project",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--name",
+    "ccd-dialog-1700000000000-abcd1234-turn",
+    "--disallowedTools",
+    "Edit,MultiEdit,Write,NotebookEdit"
+  ],
+  "env": {
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;
+
+exports[`argv: claude / implementation profile 1`] = `
+{
+  "command": "claude",
+  "args": [
+    "--permission-mode",
+    "bypassPermissions",
+    "--allowedTools",
+    "Read,Grep,Glob,Bash,LSP,Edit,MultiEdit,Write",
+    "--mcp-config",
+    "<SESSION_DIR>/claude-empty-mcp.json",
+    "--strict-mcp-config",
+    "--add-dir",
+    "/fixture/project",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--name",
+    "ccd-dialog-1700000000000-abcd1234-turn"
+  ],
+  "env": {
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;
+
+exports[`argv: claude / model and effort together 1`] = `
+{
+  "command": "claude",
+  "args": [
+    "--permission-mode",
+    "bypassPermissions",
+    "--allowedTools",
+    "Read,Grep,Glob,Bash,LSP,Edit,MultiEdit,Write",
+    "--mcp-config",
+    "<SESSION_DIR>/claude-empty-mcp.json",
+    "--strict-mcp-config",
+    "--add-dir",
+    "/fixture/project",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--name",
+    "ccd-dialog-1700000000000-abcd1234-turn",
+    "--model",
+    "claude-fable-5",
+    "--effort",
+    "high"
+  ],
+  "env": {
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;
+
+exports[`argv: claude / model only 1`] = `
+{
+  "command": "claude",
+  "args": [
+    "--permission-mode",
+    "bypassPermissions",
+    "--allowedTools",
+    "Read,Grep,Glob,Bash,LSP",
+    "--mcp-config",
+    "<SESSION_DIR>/claude-empty-mcp.json",
+    "--strict-mcp-config",
+    "--add-dir",
+    "/fixture/project",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--name",
+    "ccd-dialog-1700000000000-abcd1234-turn",
+    "--disallowedTools",
+    "Edit,MultiEdit,Write,NotebookEdit",
+    "--model",
+    "claude-opus-4-8[1m]"
+  ],
+  "env": {
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;
+
+exports[`argv: claude / read profile / no model / no effort 1`] = `
+{
+  "command": "claude",
+  "args": [
+    "--permission-mode",
+    "bypassPermissions",
+    "--allowedTools",
+    "Read,Grep,Glob,Bash,LSP",
+    "--mcp-config",
+    "<SESSION_DIR>/claude-empty-mcp.json",
+    "--strict-mcp-config",
+    "--add-dir",
+    "/fixture/project",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--name",
+    "ccd-dialog-1700000000000-abcd1234-turn",
+    "--disallowedTools",
+    "Edit,MultiEdit,Write,NotebookEdit"
+  ],
+  "env": {
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;
+
+exports[`argv: claude / unknown tool profile falls back to read 1`] = `
+{
+  "command": "claude",
+  "args": [
+    "--permission-mode",
+    "bypassPermissions",
+    "--allowedTools",
+    "Read,Grep,Glob,Bash,LSP",
+    "--mcp-config",
+    "<SESSION_DIR>/claude-empty-mcp.json",
+    "--strict-mcp-config",
+    "--add-dir",
+    "/fixture/project",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--name",
+    "ccd-dialog-1700000000000-abcd1234-turn",
+    "--disallowedTools",
+    "Edit,MultiEdit,Write,NotebookEdit"
+  ],
+  "env": {
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;
+
+exports[`argv: claude / valid effort 1`] = `
+{
+  "command": "claude",
+  "args": [
+    "--permission-mode",
+    "bypassPermissions",
+    "--allowedTools",
+    "Read,Grep,Glob,Bash,LSP",
+    "--mcp-config",
+    "<SESSION_DIR>/claude-empty-mcp.json",
+    "--strict-mcp-config",
+    "--add-dir",
+    "/fixture/project",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--name",
+    "ccd-dialog-1700000000000-abcd1234-turn",
+    "--disallowedTools",
+    "Edit,MultiEdit,Write,NotebookEdit",
+    "--effort",
+    "xhigh"
+  ],
+  "env": {
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;
+
+exports[`argv: codex / effort not in the codex set is dropped 1`] = `
+{
+  "command": "codex",
+  "args": [
+    "-C",
+    "/fixture/project",
+    "--sandbox",
+    "workspace-write",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--ask-for-approval",
+    "never",
+    "--no-alt-screen",
+    "-c",
+    "approval_policy=\\"never\\""
+  ],
+  "env": {
+    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;
+
+exports[`argv: codex / implementation profile does not change argv 1`] = `
+{
+  "command": "codex",
+  "args": [
+    "-C",
+    "/fixture/project",
+    "--sandbox",
+    "workspace-write",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--ask-for-approval",
+    "never",
+    "--no-alt-screen",
+    "-c",
+    "approval_policy=\\"never\\""
+  ],
+  "env": {
+    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;
+
+exports[`argv: codex / initial prompt is appended as a positional 1`] = `
+{
+  "command": "codex",
+  "args": [
+    "-C",
+    "/fixture/project",
+    "--sandbox",
+    "workspace-write",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--ask-for-approval",
+    "never",
+    "--no-alt-screen",
+    "-c",
+    "approval_policy=\\"never\\"",
+    "Read the prompt file at:\\n/fixture/session/turns/t1/prompt.md"
+  ],
+  "env": {
+    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": true
+}
+`;
+
+exports[`argv: codex / model only 1`] = `
+{
+  "command": "codex",
+  "args": [
+    "-C",
+    "/fixture/project",
+    "--sandbox",
+    "workspace-write",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--ask-for-approval",
+    "never",
+    "--no-alt-screen",
+    "-c",
+    "approval_policy=\\"never\\"",
+    "--model",
+    "gpt-5.6-sol"
+  ],
+  "env": {
+    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;
+
+exports[`argv: codex / model, effort, and initial prompt together 1`] = `
+{
+  "command": "codex",
+  "args": [
+    "-C",
+    "/fixture/project",
+    "--sandbox",
+    "workspace-write",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--ask-for-approval",
+    "never",
+    "--no-alt-screen",
+    "-c",
+    "approval_policy=\\"never\\"",
+    "--model",
+    "gpt-5.6-terra",
+    "-c",
+    "model_reasoning_effort=\\"max\\"",
+    "Read the prompt file at:\\n/fixture/session/turns/t1/prompt.md"
+  ],
+  "env": {
+    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": true
+}
+`;
+
+exports[`argv: codex / read profile / no model / no effort 1`] = `
+{
+  "command": "codex",
+  "args": [
+    "-C",
+    "/fixture/project",
+    "--sandbox",
+    "workspace-write",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--ask-for-approval",
+    "never",
+    "--no-alt-screen",
+    "-c",
+    "approval_policy=\\"never\\""
+  ],
+  "env": {
+    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;
+
+exports[`argv: codex / valid effort 1`] = `
+{
+  "command": "codex",
+  "args": [
+    "-C",
+    "/fixture/project",
+    "--sandbox",
+    "workspace-write",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--ask-for-approval",
+    "never",
+    "--no-alt-screen",
+    "-c",
+    "approval_policy=\\"never\\"",
+    "-c",
+    "model_reasoning_effort=\\"ultra\\""
+  ],
+  "env": {
+    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;
+
+exports[`argv: unknown agent normalizes to codex 1`] = `
+{
+  "command": "codex",
+  "args": [
+    "-C",
+    "/fixture/project",
+    "--sandbox",
+    "workspace-write",
+    "--add-dir",
+    "<SESSION_DIR>",
+    "--ask-for-approval",
+    "never",
+    "--no-alt-screen",
+    "-c",
+    "approval_policy=\\"never\\""
+  ],
+  "env": {
+    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "DUALOG_ROLE": "partner",
+    "DUALOG_DEPTH": "1"
+  },
+  "usesInitialPrompt": false
+}
+`;

@@ -1,0 +1,295 @@
+{
+  "openai": {
+    "id": "openai",
+    "name": "OpenAI",
+    "models": {
+      "gpt-5.6-sol": {
+        "id": "gpt-5.6-sol",
+        "name": "GPT-5.6 Sol",
+        "reasoning": true,
+        "tool_call": true,
+        "limit": {
+          "context": 1050000,
+          "input": 922000,
+          "output": 128000
+        },
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "none",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ]
+          }
+        ]
+      },
+      "gpt-5.6": {
+        "id": "gpt-5.6",
+        "name": "GPT-5.6",
+        "reasoning": true,
+        "tool_call": true,
+        "limit": {
+          "context": 1050000,
+          "input": 922000,
+          "output": 128000
+        },
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "none",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ]
+          }
+        ]
+      },
+      "gpt-5.3-codex": {
+        "id": "gpt-5.3-codex",
+        "name": "GPT-5.3 Codex",
+        "reasoning": true,
+        "tool_call": true,
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        },
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "none",
+              "low",
+              "medium",
+              "high",
+              "xhigh"
+            ]
+          }
+        ]
+      },
+      "gpt-4.1-nano": {
+        "id": "gpt-4.1-nano",
+        "name": "GPT-4.1 nano",
+        "reasoning": false,
+        "tool_call": true,
+        "limit": {
+          "context": 1047576,
+          "output": 32768
+        },
+        "status": "deprecated"
+      }
+    }
+  },
+  "anthropic": {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "models": {
+      "claude-sonnet-4-6": {
+        "id": "claude-sonnet-4-6",
+        "name": "Claude Sonnet 4.6",
+        "reasoning": true,
+        "tool_call": true,
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        },
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "low",
+              "medium",
+              "high",
+              "max"
+            ]
+          },
+          {
+            "type": "budget_tokens",
+            "min": 1024
+          }
+        ]
+      },
+      "claude-opus-4-6": {
+        "id": "claude-opus-4-6",
+        "name": "Claude Opus 4.6",
+        "reasoning": true,
+        "tool_call": true,
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        },
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "low",
+              "medium",
+              "high",
+              "max"
+            ]
+          },
+          {
+            "type": "budget_tokens",
+            "min": 1024
+          }
+        ]
+      }
+    }
+  },
+  "llmgateway": {
+    "id": "llmgateway",
+    "name": "LLM Gateway",
+    "models": {
+      "claude-sonnet-4-6": {
+        "id": "claude-sonnet-4-6",
+        "name": "Claude Sonnet 4.6",
+        "reasoning": true,
+        "tool_call": true,
+        "limit": {
+          "context": 1000000,
+          "output": 64000
+        },
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ]
+          },
+          {
+            "type": "budget_tokens",
+            "min": 1024,
+            "max": 63999
+          }
+        ]
+      }
+    }
+  },
+  "xai": {
+    "id": "xai",
+    "name": "xAI",
+    "models": {
+      "grok-4.5": {
+        "id": "grok-4.5",
+        "name": "Grok 4.5",
+        "reasoning": true,
+        "tool_call": true,
+        "limit": {
+          "context": 500000,
+          "output": 500000
+        },
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "low",
+              "medium",
+              "high"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "anyapi": {
+    "id": "anyapi",
+    "name": "AnyAPI",
+    "models": {
+      "cohere/command-r-plus-08-2024": {
+        "id": "cohere/command-r-plus-08-2024",
+        "name": "Command R+",
+        "reasoning": false,
+        "tool_call": true,
+        "limit": {
+          "context": 128000,
+          "output": 4000
+        }
+      }
+    }
+  },
+  "abacus": {
+    "id": "abacus",
+    "name": "Abacus",
+    "models": {
+      "claude-sonnet-4-6": {
+        "id": "claude-sonnet-4-6",
+        "name": "Claude Sonnet 4.6",
+        "reasoning": true,
+        "tool_call": true,
+        "limit": {
+          "context": 1000000,
+          "output": 64000
+        },
+        "reasoning_options": []
+      }
+    }
+  },
+  "302ai": {
+    "id": "302ai",
+    "name": "302.AI",
+    "models": {
+      "claude-sonnet-4-6": {
+        "id": "claude-sonnet-4-6",
+        "name": "claude-sonnet-4-6",
+        "reasoning": true,
+        "tool_call": true,
+        "limit": {
+          "context": 1000000,
+          "output": 64000
+        },
+        "reasoning_options": [
+          {
+            "type": "toggle"
+          },
+          {
+            "type": "budget_tokens",
+            "min": 1024,
+            "max": 63999
+          }
+        ]
+      }
+    }
+  },
+  "opencode": {
+    "id": "opencode",
+    "name": "OpenCode Zen",
+    "models": {
+      "claude-sonnet-4-6": {
+        "id": "claude-sonnet-4-6",
+        "name": "Claude Sonnet 4.6",
+        "reasoning": true,
+        "tool_call": true,
+        "limit": {
+          "context": 1000000,
+          "output": 64000
+        },
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "low",
+              "medium",
+              "high",
+              "max"
+            ]
+          },
+          {
+            "type": "budget_tokens",
+            "min": 1024
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "pentester:latest",
+      "object": "model",
+      "created": 1773622021,
+      "owned_by": "library"
+    },
+    {
+      "id": "qwen3:32b",
+      "object": "model",
+      "created": 1773621720,
+      "owned_by": "library"
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "id": "goose",
+  "displayName": "Goose",
+  "binary": {
+    "default": "goose",
+    "versionArgs": ["--version"],
+    "installHint": "https://block.github.io/goose/docs/getting-started/installation"
+  },
+  "engines": { "default": "headless", "allowed": ["headless"] },
+  "capabilities": {
+    "modelFlag": true,
+    "reasoningEffort": true,
+    "toolProfiles": "prompt-only",
+    "addDir": false,
+    "writesFiles": true,
+    "tuiDrivable": "risky"
+  },
+  "reasoningEfforts": ["off", "low", "medium", "high", "max"],
+  "effortAliases": { "xhigh": "max" },
+  "effortDelivery": "env",
+  "models": [],
+  "discovery": {
+    "strategy": "http-openai",
+    "baseUrlEnv": ["OPENAI_HOST", "OLLAMA_HOST"],
+    "apiKeyEnv": ["OPENAI_API_KEY"],
+    "capabilityProbe": "ollama-show"
+  },
+  "defaultToolProfile": "read",
+  "toolProfiles": {},
+  "mcp": { "strategy": "flag" },
+  "configIsolation": {
+    "env": "GOOSE_PATH_ROOT",
+    "dir": "{{sessionDir}}/goose-root",
+    "extraEnv": { "GOOSE_DISABLE_KEYRING": "1" }
+  },
+  "env": { "GOOSE_MODE": "auto", "GOOSE_THINKING_EFFORT": "{{reasoningEffort}}" },
+  "promptDelivery": { "headless": "argv" },
+  "argv": {
+    "headless": [
+      { "args": ["run", "--no-session", "--no-profile", "--with-builtin", "developer", "-q"] },
+      { "when": { "set": "model" }, "args": ["--model", "{{model}}"] },
+      { "args": ["-t", "{{initialPrompt}}"] }
+    ]
+  },
+  "completion": { "sidecar": "always", "stdoutTrustworthy": false }
+}

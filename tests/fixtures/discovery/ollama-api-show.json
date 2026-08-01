@@ -1,0 +1,30 @@
+{
+  "details": {
+    "parent_model": "",
+    "format": "gguf",
+    "family": "qwen3",
+    "families": [
+      "qwen3"
+    ],
+    "parameter_size": "32.8B",
+    "quantization_level": "Q4_K_M"
+  },
+  "model_info": {
+    "general.architecture": "qwen3",
+    "general.basename": "Qwen3",
+    "general.file_type": 15,
+    "general.parameter_count": 32762123264,
+    "general.quantization_version": 2,
+    "general.size_label": "32B",
+    "general.type": "model",
+    "qwen3.block_count": 64,
+    "qwen3.context_length": 40960,
+    "qwen3.embedding_length": 5120
+  },
+  "capabilities": [
+    "completion",
+    "tools",
+    "thinking"
+  ],
+  "modified_at": "2026-03-15T17:42:00.475542098-07:00"
+}

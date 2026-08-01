@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -13,6 +14,7 @@ const repoRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const serverPath = path.join(repoRoot, "src", "dialog-server.mjs");
 const dialogsDir = path.join(os.homedir(), ".claude", "dialogs");
 const createdDirs = [];
+const fixtureRunners = [];
 
 function nowIso() {
   return new Date().toISOString();
@@ -32,6 +34,26 @@ function createSession(options = {}) {
       (messages.length ? "\n" : "")
   );
   fs.writeFileSync(path.join(sessionDir, "problem.md"), "wait tool smoke test");
+  const runnerToken = crypto.randomBytes(16).toString("hex");
+  let runnerPid = options.runnerPid;
+  if (runnerPid == null) {
+    const fixture = spawn(
+      process.execPath,
+      [
+        "-e",
+        "setInterval(() => {}, 1000)",
+        path.join(repoRoot, "src", "dialog-runner.mjs"),
+        sessionDir,
+        `--runner-token=${runnerToken}`,
+      ],
+      {
+        stdio: "ignore",
+        windowsHide: true,
+      }
+    );
+    fixtureRunners.push(fixture);
+    runnerPid = fixture.pid;
+  }
   fs.writeFileSync(
     path.join(sessionDir, "status.json"),
     JSON.stringify(
@@ -51,7 +73,9 @@ function createSession(options = {}) {
         tool_profile: "read",
         subject_path: null,
         subject_kind: null,
-        runner_pid: options.runnerPid ?? process.pid,
+        runner_pid: runnerPid,
+        runner_token: runnerToken,
+        runner_state: "running",
       },
       null,
       2
@@ -143,14 +167,26 @@ async function main() {
         for (const model of expectedModels) {
           assert.match(modelDescription, new RegExp(`\\b${model.replaceAll(".", "\\.")}\\b`));
         }
-        assert.deepEqual(tool.inputSchema.properties.reasoning_effort.enum, [
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max",
-          "ultra",
-        ]);
+        // The effort enum is the union across every registered adapter, so it
+        // grows as adapters are added. Assert containment, not equality --
+        // otherwise this fails every time a new agent ships.
+        const efforts = tool.inputSchema.properties.reasoning_effort.enum;
+        for (const effort of ["low", "medium", "high", "xhigh", "max", "ultra"]) {
+          assert.ok(
+            efforts.includes(effort),
+            `reasoning_effort enum lost "${effort}": ${efforts.join(", ")}`
+          );
+        }
+
+        // Agent choice must be registry-driven, not the historical pair.
+        const agents = tool.inputSchema.properties.partner_agent.enum;
+        for (const agent of ["claude", "codex"]) {
+          assert.ok(agents.includes(agent), `partner_agent enum lost "${agent}"`);
+        }
+        assert.ok(
+          agents.length > 2,
+          `partner_agent enum is still limited to the original pair: ${agents.join(", ")}`
+        );
       }
     }
 
@@ -311,6 +347,11 @@ async function main() {
     console.log("wait_for_partner_response smoke checks passed");
   } finally {
     await transport.close().catch(() => {});
+    for (const runner of fixtureRunners) {
+      if (runner.exitCode == null && runner.signalCode == null) {
+        runner.kill("SIGTERM");
+      }
+    }
     for (const dir of createdDirs) {
       fs.rmSync(dir, { recursive: true, force: true });
     }

@@ -14,8 +14,8 @@ const CLAUDE_DIR = path.join(HOME_DIR, ".claude");
 const CLAUDE_JSON = path.join(HOME_DIR, ".claude.json");
 const CLAUDE_COMMANDS_DIR = path.join(CLAUDE_DIR, "commands");
 const CLAUDE_HOOKS_ROOT = path.join(CLAUDE_DIR, "hooks");
-const CLAUDE_HOOKS_DIR = path.join(CLAUDE_HOOKS_ROOT, "codex-dialog");
-const CLAUDE_HOOKS_PLATFORM = path.join(CLAUDE_HOOKS_ROOT, "codex-dialog-platform.mjs");
+const CLAUDE_HOOKS_DIR = path.join(CLAUDE_HOOKS_ROOT, "dualog");
+const CLAUDE_HOOKS_PLATFORM = path.join(CLAUDE_HOOKS_ROOT, "dualog-platform.mjs");
 const CLAUDE_HOOKS_LEGACY_PLATFORM = path.join(CLAUDE_HOOKS_ROOT, "platform.mjs");
 const CLAUDE_SETTINGS_JSON = path.join(CLAUDE_DIR, "settings.json");
 const CODEX_DIR = path.join(HOME_DIR, ".codex");
@@ -24,11 +24,22 @@ const CODEX_CONFIG_TOML = path.join(CODEX_DIR, "config.toml");
 const SERVER_PATH = path.join(REPO_ROOT, "src", "dialog-server.mjs");
 
 const CLAUDE_COMMANDS = [
+  "dualog-review-code",
+  "dualog-review-plan",
+  "dualog-review-spec",
+  "dualog-audit",
+];
+
+// Pre-rename artifacts. Removed on install, so a stale command file cannot keep
+// calling a tool namespace the server no longer serves.
+const LEGACY_CLAUDE_COMMANDS = [
   "codex-review-code",
   "codex-review-plan",
   "codex-review-spec",
   "codex-audit",
 ];
+const LEGACY_MCP_KEY = "codex-dialog";
+const LEGACY_HOOKS_DIR_NAME = "codex-dialog";
 
 const HOOK_FILES = [
   "mark-needs-investigation.mjs",
@@ -39,6 +50,14 @@ const HOOK_FILES = [
 ];
 
 const CODEX_SKILLS = [
+  "dualog-review-code",
+  "dualog-review-plan",
+  "dualog-review-spec",
+  "dualog-audit",
+  "dualog-ui-implementer",
+];
+
+const LEGACY_CODEX_SKILLS = [
   "claude-review-code",
   "claude-review-plan",
   "claude-review-spec",
@@ -76,7 +95,8 @@ function modeLabel({ installClaude, installCodex }) {
 }
 
 function plannedStepCount({ installClaude, installCodex }) {
-  return 3 + (installClaude ? 2 : 0) + (installCodex ? 2 : 0);
+  // +1 for the legacy-migration step.
+  return 4 + (installClaude ? 2 : 0) + (installCodex ? 2 : 0);
 }
 
 function createStepLogger(totalSteps) {
@@ -84,6 +104,104 @@ function createStepLogger(totalSteps) {
   return (label) => {
     console.log(`[${currentStep++}/${totalSteps}] ${label}`);
   };
+}
+
+/**
+ * Remove pre-rename artifacts.
+ *
+ * The tool namespace moved from mcp__codex-dialog__* to mcp__dualog__*, so a
+ * leftover command file or hook matcher does not merely look untidy -- it calls
+ * tools that no longer exist. Clearing them is part of installing, not an
+ * optional tidy-up.
+ */
+function removeLegacyInstall() {
+  let removed = 0;
+
+  for (const name of LEGACY_CLAUDE_COMMANDS) {
+    const file = path.join(CLAUDE_COMMANDS_DIR, `${name}.md`);
+    if (fs.existsSync(file)) {
+      fs.rmSync(file, { force: true });
+      console.log(`  removed legacy command ${name}`);
+      removed++;
+    }
+  }
+
+  for (const name of LEGACY_CODEX_SKILLS) {
+    const dir = path.join(CODEX_SKILLS_DIR, name);
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      console.log(`  removed legacy skill ${name}`);
+      removed++;
+    }
+  }
+
+  const legacyHooks = path.join(CLAUDE_HOOKS_ROOT, LEGACY_HOOKS_DIR_NAME);
+  if (fs.existsSync(legacyHooks)) {
+    fs.rmSync(legacyHooks, { recursive: true, force: true });
+    console.log(`  removed legacy hooks directory ${LEGACY_HOOKS_DIR_NAME}`);
+    removed++;
+  }
+  const legacyPlatform = path.join(CLAUDE_HOOKS_ROOT, "codex-dialog-platform.mjs");
+  if (fs.existsSync(legacyPlatform)) {
+    fs.rmSync(legacyPlatform, { force: true });
+    removed++;
+  }
+
+  // Claude MCP registration
+  try {
+    if (fs.existsSync(CLAUDE_JSON)) {
+      const config = JSON.parse(fs.readFileSync(CLAUDE_JSON, "utf-8"));
+      if (config?.mcpServers?.[LEGACY_MCP_KEY]) {
+        delete config.mcpServers[LEGACY_MCP_KEY];
+        fs.writeFileSync(CLAUDE_JSON, JSON.stringify(config, null, 2) + "\n");
+        console.log(`  removed legacy MCP registration "${LEGACY_MCP_KEY}" from ~/.claude.json`);
+        removed++;
+      }
+    }
+  } catch (err) {
+    console.log(`  warning: could not clean ~/.claude.json: ${err.message}`);
+  }
+
+  // Codex MCP registration
+  try {
+    if (fs.existsSync(CODEX_CONFIG_TOML)) {
+      const toml = fs.readFileSync(CODEX_CONFIG_TOML, "utf-8");
+      const stripped = toml.replace(
+        /\n?\[mcp_servers\.codex-dialog\]\n(?:.*\n)*?(?=\n\[|$)/g,
+        ""
+      );
+      if (stripped !== toml) {
+        fs.writeFileSync(CODEX_CONFIG_TOML, stripped);
+        console.log(`  removed legacy [mcp_servers.${LEGACY_MCP_KEY}] from ~/.codex/config.toml`);
+        removed++;
+      }
+    }
+  } catch (err) {
+    console.log(`  warning: could not clean ~/.codex/config.toml: ${err.message}`);
+  }
+
+  // Hook matchers referencing the old tool namespace.
+  try {
+    if (fs.existsSync(CLAUDE_SETTINGS_JSON)) {
+      const raw = fs.readFileSync(CLAUDE_SETTINGS_JSON, "utf-8");
+      if (raw.includes("mcp__codex-dialog__") || raw.includes("hooks/codex-dialog/")) {
+        fs.writeFileSync(
+          CLAUDE_SETTINGS_JSON,
+          raw
+            .replaceAll("mcp__codex-dialog__", "mcp__dualog__")
+            .replaceAll("hooks/codex-dialog/", "hooks/dualog/")
+            .replaceAll("codex-dialog-platform.mjs", "dualog-platform.mjs")
+        );
+        console.log("  rewrote legacy hook matchers in ~/.claude/settings.json");
+        removed++;
+      }
+    }
+  } catch (err) {
+    console.log(`  warning: could not clean settings.json: ${err.message}`);
+  }
+
+  if (removed === 0) console.log("  no pre-rename artifacts found OK");
+  return removed;
 }
 
 function checkNode() {
@@ -189,7 +307,7 @@ function removeOwnedPlatformHelper(filePath) {
   if (!fs.existsSync(filePath)) return;
   try {
     const content = fs.readFileSync(filePath, "utf-8");
-    if (content.includes("claude-codex-dialog platform helpers")) {
+    if (content.includes("dualog platform helpers")) {
       fs.rmSync(filePath, { force: true });
     }
   } catch {}
@@ -200,7 +318,7 @@ function installHookFile(fileName) {
   const targetPath = path.join(CLAUDE_HOOKS_DIR, fileName);
   const content = fs
     .readFileSync(sourcePath, "utf-8")
-    .replaceAll("../platform.mjs", "../codex-dialog-platform.mjs");
+    .replaceAll("../platform.mjs", "../dualog-platform.mjs");
   fs.writeFileSync(targetPath, content);
 }
 
@@ -209,7 +327,7 @@ function installSharedFile() {
   const targetPath = path.join(CLAUDE_HOOKS_DIR, "shared.mjs");
   const content = fs
     .readFileSync(sourcePath, "utf-8")
-    .replaceAll("./platform.mjs", "../codex-dialog-platform.mjs");
+    .replaceAll("./platform.mjs", "../dualog-platform.mjs");
   fs.writeFileSync(targetPath, content);
 }
 
@@ -218,7 +336,7 @@ function registerClaudeMcp(spawn, hasClaude, logStep) {
   logStep("Registering MCP server for Claude...");
 
   if (hasClaude) {
-    runCli(spawn, "claude", ["mcp", "remove", "codex-dialog", "-s", "user"], {
+    runCli(spawn, "claude", ["mcp", "remove", "dualog", "-s", "user"], {
       allowFailure: true,
     });
     runCli(spawn, "claude", [
@@ -226,7 +344,7 @@ function registerClaudeMcp(spawn, hasClaude, logStep) {
       "add",
       "-s",
       "user",
-      "codex-dialog",
+      "dualog",
       "--",
       "node",
       SERVER_PATH,
@@ -237,7 +355,7 @@ function registerClaudeMcp(spawn, hasClaude, logStep) {
 
   const config = readJsonConfig(CLAUDE_JSON);
   if (!config.mcpServers) config.mcpServers = {};
-  config.mcpServers["codex-dialog"] = {
+  config.mcpServers["dualog"] = {
     command: "node",
     args: [SERVER_PATH],
   };
@@ -283,14 +401,14 @@ function installClaudeCommandsAndHooks(logStep) {
   const preHooks = config.hooks.PreToolUse;
   const preEntries = [
     {
-      matcher: "mcp__codex-dialog__send_message",
+      matcher: "mcp__dualog__send_message",
       hooks: [
         { type: "command", command: hookCommand("enforce-investigation.mjs") },
         { type: "command", command: hookCommand("enforce-resolution.mjs") },
       ],
     },
     {
-      matcher: "mcp__codex-dialog__end_dialog",
+      matcher: "mcp__dualog__end_dialog",
       hooks: [{ type: "command", command: hookCommand("require-lgtm-or-cap.mjs") }],
     },
   ];
@@ -305,9 +423,9 @@ function installClaudeCommandsAndHooks(logStep) {
   const postHooks = config.hooks.PostToolUse;
 
   for (const matcher of [
-    "mcp__codex-dialog__check_messages",
-    "mcp__codex-dialog__wait_for_partner_response",
-    "mcp__codex-dialog__get_full_history",
+    "mcp__dualog__check_messages",
+    "mcp__dualog__wait_for_partner_response",
+    "mcp__dualog__get_full_history",
   ]) {
     const entry = {
       matcher,
@@ -345,7 +463,7 @@ function installClaudeCommandsAndHooks(logStep) {
 
 function removeCodexMcpSection(content) {
   return content
-    .replace(/\n?\[mcp_servers\.codex-dialog\]\n(?:.*\n)*?(?=\n\[|$)/g, "\n")
+    .replace(/\n?\[mcp_servers\.dualog\]\n(?:.*\n)*?(?=\n\[|$)/g, "\n")
     .trimEnd();
 }
 
@@ -354,10 +472,10 @@ function registerCodexMcp(spawn, hasCodex, logStep) {
   logStep("Registering MCP server for Codex...");
 
   if (hasCodex) {
-    runCli(spawn, "codex", ["mcp", "remove", "codex-dialog"], {
+    runCli(spawn, "codex", ["mcp", "remove", "dualog"], {
       allowFailure: true,
     });
-    runCli(spawn, "codex", ["mcp", "add", "codex-dialog", "--", "node", SERVER_PATH]);
+    runCli(spawn, "codex", ["mcp", "add", "dualog", "--", "node", SERVER_PATH]);
     console.log("  MCP server registered with Codex CLI OK");
     return;
   }
@@ -370,7 +488,7 @@ function registerCodexMcp(spawn, hasCodex, logStep) {
   }
 
   const section = [
-    "[mcp_servers.codex-dialog]",
+    "[mcp_servers.dualog]",
     'command = "node"',
     `args = [${JSON.stringify(SERVER_PATH)}]`,
     "",
@@ -387,7 +505,7 @@ function installCodexSkills(logStep) {
   for (const skill of CODEX_SKILLS) {
     const target = path.join(CODEX_SKILLS_DIR, skill);
     fs.rmSync(target, { recursive: true, force: true });
-    fs.cpSync(path.join(REPO_ROOT, "codex-skills", skill), target, {
+    fs.cpSync(path.join(REPO_ROOT, "dualog-skills", skill), target, {
       recursive: true,
     });
     console.log(`  /${skill} OK`);
@@ -400,11 +518,11 @@ function printSummary(mode, cliStatus) {
   console.log("");
   console.log(` MCP server: ${SERVER_PATH}`);
   if (mode.installClaude) {
-    console.log(` Claude:     ${path.join(CLAUDE_COMMANDS_DIR, "codex-{review-code,review-plan,review-spec,audit}.md")}`);
+    console.log(` Claude:     ${path.join(CLAUDE_COMMANDS_DIR, "dualog-{review-code,review-plan,review-spec,audit}.md")}`);
     console.log(` Hooks:      ${CLAUDE_HOOKS_DIR}`);
   }
   if (mode.installCodex) {
-    console.log(` Codex:      ${path.join(CODEX_SKILLS_DIR, "{claude-review-code,claude-review-plan,claude-review-spec,claude-audit,claude-ui-implementer}")}`);
+    console.log(` Codex:      ${path.join(CODEX_SKILLS_DIR, "dualog-{review-code,review-plan,review-spec,audit,ui-implementer}")}`);
   }
   console.log("");
   if (mode.installClaude) console.log(" Restart Claude Code to pick up updated MCP configuration and commands.");
@@ -425,26 +543,24 @@ function printSummary(mode, cliStatus) {
   }
   console.log("");
   console.log(" Usage:");
-  if (mode.installClaude) {
-    console.log("   /codex-review-code          Review uncommitted code changes with Codex");
-    console.log("   /codex-review-plan          Review an implementation plan with Codex");
-    console.log("   /codex-review-spec          Review a product/feature spec with Codex");
-    console.log("   /codex-audit src/           Audit files with Codex");
-  }
+  // Both hosts get the same partner-agnostic command set, so list it once.
+  console.log("   /dualog-review-code         Review uncommitted code changes");
+  console.log("   /dualog-review-plan         Review an implementation plan");
+  console.log("   /dualog-review-spec         Review a product/feature spec");
+  console.log("   /dualog-audit src/          Audit files");
   if (mode.installCodex) {
-    console.log("   /claude-review-code         Review uncommitted code changes with Claude");
-    console.log("   /claude-review-plan         Review an implementation plan with Claude");
-    console.log("   /claude-review-spec         Review a product/feature spec with Claude");
-    console.log("   /claude-audit src/          Audit files with Claude");
-    console.log("   /claude-ui-implementer      Collaborate with Claude Opus 4.7 on frontend/UI work");
+    console.log("   /dualog-ui-implementer      Delegate frontend/UI implementation");
   }
+  console.log("");
+  console.log("   Add partner:<agent-id> to choose the reviewer.");
+  console.log("   Run list_adapters to see which agent CLIs are installed.");
   console.log("");
 }
 
 async function main() {
   const mode = parseMode(process.argv.slice(2));
 
-  console.log("claude-codex-dialog installer");
+  console.log("dualog installer");
   console.log("");
   console.log(` Mode: ${modeLabel(mode)}`);
   console.log("");
@@ -453,6 +569,10 @@ async function main() {
 
   logStep("Checking prerequisites...");
   checkNode();
+
+  console.log("");
+  logStep("Migrating any pre-rename install...");
+  removeLegacyInstall();
 
   console.log("");
   logStep("Installing dependencies...");

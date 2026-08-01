@@ -1,0 +1,46 @@
+{
+  "id": "qwen",
+  "displayName": "Qwen Code",
+  "binary": {
+    "default": "qwen",
+    "versionArgs": ["--version"],
+    "installHint": "npm install -g @qwen-code/qwen-code"
+  },
+  "engines": { "default": "headless", "allowed": ["headless"] },
+  "capabilities": {
+    "modelFlag": true,
+    "reasoningEffort": true,
+    "toolProfiles": "prompt-only",
+    "addDir": false,
+    "writesFiles": true,
+    "tuiDrivable": "risky"
+  },
+  "reasoningEfforts": ["low", "medium", "high", "xhigh", "max"],
+  "effortDelivery": "settings-file",
+  "models": ["qwen3-coder-plus", "qwen3-coder-flash"],
+  "discovery": {
+    "strategy": "http-openai",
+    "baseUrlEnv": ["OPENAI_BASE_URL"],
+    "apiKeyEnv": ["OPENAI_API_KEY"],
+    "capabilityProbe": "ollama-show"
+  },
+  "defaultToolProfile": "read",
+  "toolProfiles": {},
+  "mcp": { "strategy": "flag" },
+  "configIsolation": {
+    "env": "QWEN_HOME",
+    "dir": "{{sessionDir}}/qwen-home",
+    "seedFromEnv": "QWEN_HOME",
+    "seedFromFallback": "{{home}}/.qwen",
+    "copyIfExists": ["oauth_creds.json"]
+  },
+  "promptDelivery": { "headless": "argv" },
+  "argv": {
+    "headless": [
+      { "args": ["--approval-mode", "yolo", "--allowed-mcp-server-names", ""] },
+      { "when": { "set": "model" }, "args": ["-m", "{{model}}"] },
+      { "args": ["-p", "{{initialPrompt}}"] }
+    ]
+  },
+  "completion": { "sidecar": "always", "stdoutTrustworthy": false }
+}

@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import fs from "fs";
 import path from "path";
@@ -8,13 +9,14 @@ import crypto from "crypto";
 import { fileURLToPath } from "url";
 import {
   DIALOGS_DIR,
+  LEGACY_DIALOGS_DIR,
+  resolveExistingSessionDir,
   getAgentDisplayName,
   getSessionHostAgent,
   getSessionPartnerAgent,
   normalizeAgent,
   readConversation,
   appendMessage,
-  isProcessAlive,
   readStatus,
   computeReviewStatus,
 } from "./shared.mjs";
@@ -25,13 +27,76 @@ import {
 } from "./tmux-runtime.mjs";
 import {
   ALL_REASONING_EFFORTS,
-  normalizeReasoningEffortForAgent,
+  MAX_REVIEW_DIFF_CHARS,
+  requestedReasoningEffortForAdapter,
 } from "./runtime-defaults.mjs";
+import {
+  buildRunnerTokenArg,
+  isSessionRunnerAlive,
+  markSessionRunnerStarted,
+  watchRunnerExit,
+} from "./runner-lifecycle.mjs";
+import {
+  adapterIds,
+  getAdapter,
+  listAdapters,
+  tryGetAdapter,
+} from "./adapters/registry.mjs";
+import { describeAdapter, negotiate } from "./adapters/negotiate.mjs";
+import { isEnumerable, modelIds } from "./adapters/schema.mjs";
+import { resolveDiscovery } from "./adapters/discovery.mjs";
+import { resolveDiscoveryForValidation } from "./adapters/resolve-for-validation.mjs";
+import { ENGINES, resolveEngine } from "./engines/index.mjs";
+import { reapOrphanedHeadlessChildren } from "./engines/headless.mjs";
 
 const server = new McpServer({
-  name: "codex-dialog",
-  version: "1.0.0",
+  name: "dualog",
+  version: "2.0.0",
 });
+
+// ── Recursion guard ──────────────────────────────────────────────────────────
+// A partner CLI spawned by this server inherits our environment. If that CLI is
+// itself an MCP client configured with this same server, it would boot a nested
+// copy and recurse. Per-CLI "disable MCP" switches do not cover this: several
+// partner CLIs have no reliable zero-MCP flag, and some read MCP config from
+// homedir() regardless of their config-dir override.
+//
+// This env sentinel is the one defense that works for every partner CLI without
+// needing its cooperation. Env inherits transitively, so it also catches the
+// A -> B -> C case. Set in partner-invocation.mjs on every spawned partner.
+const MAX_PARTNER_DEPTH = (() => {
+  const parsed = Number.parseInt(process.env.DUALOG_MAX_DEPTH, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 1;
+})();
+const PARTNER_DEPTH = (() => {
+  const parsed = Number.parseInt(process.env.DUALOG_DEPTH ?? "0", 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
+})();
+const RECURSION_BLOCKED =
+  process.env.DUALOG_ROLE === "partner" || PARTNER_DEPTH >= MAX_PARTNER_DEPTH;
+
+if (RECURSION_BLOCKED) {
+  // Serve an empty tool list rather than exiting: the partner CLI connects
+  // cleanly and simply sees no tools, instead of reporting a failed MCP server.
+  //
+  // Suppressing registration alone is not enough. The SDK only wires up the
+  // tools/list handler and advertises the tools capability when the first tool
+  // is registered, so a server with zero tools answers tools/list with
+  // "Method not found" -- which reads as a broken server, not an empty one.
+  // Register the capability and an empty handler explicitly.
+  server.tool = () => {};
+  server.server.registerCapabilities({ tools: {} });
+  server.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+}
+
+// Agent choices come from the adapter registry, so adding a CLI is a manifest
+// drop-in rather than a source edit. Still a closed enum, so MCP clients get
+// completions and a typo fails at the tool boundary rather than at spawn time.
+const AGENT_IDS = adapterIds();
+const AGENT_CHOICE_DESCRIPTION =
+  "Which agent responds in the background runner (default: 'codex'). " +
+  "Call list_adapters first to see which of these are actually installed: " +
+  AGENT_IDS.join(", ") + ".";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_PARTNER_TIMEOUT_MS = 15 * 60 * 1000;
@@ -42,9 +107,37 @@ const WAIT_FALLBACK_INTERVAL_MS = 5000;
 const WAIT_PROGRESS_INTERVAL_MS = 30000;
 const END_DIALOG_GRACE_MS = 5500;
 const MODEL_OVERRIDE_DESCRIPTION =
-  "Optional partner model override. Model strings are forwarded to the selected partner CLI. Claude examples: claude-fable-5, claude-opus-4-8, claude-opus-4-8[1m], claude-opus-4-7[1m], claude-opus-4-6[1m], claude-sonnet-4-6. Claude Fable 5 has 1M context by default; do not add a [1m] suffix. Codex examples: gpt-5.6 (alias for Sol), gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.3-codex.";
+  "Optional partner model override, forwarded verbatim to the selected partner CLI. " +
+  "An id absent from a LIVE catalog is rejected; where no live catalog can be " +
+  "fetched it is passed through with a warning instead, because a declared list " +
+  "is a hand-maintained snapshot and vendors ship new ids continuously. Set " +
+  "allow_unknown_model to start anyway. Known ids by agent: " +
+  listAdapters()
+    // modelIds, not `models`: an entry may be an object carrying that model's
+    // own effort set, and interpolating those directly renders "[object
+    // Object]" into the tool description every MCP client sees.
+    .map((adapter) => [adapter.id, modelIds(adapter)])
+    .filter(([, ids]) => ids.length)
+    .map(([id, ids]) => `${id}: ${ids.join(", ")}`)
+    .join(" | ") +
+  ".";
 const REASONING_EFFORT_DESCRIPTION =
-  "Optional partner-specific reasoning effort level. Defaults to high. For Codex this is low|medium|high|xhigh|max|ultra; max is available with the GPT-5.6 family, while ultra is available with GPT-5.6 Sol and Terra. For Claude this is low|medium|high|xhigh|max.";
+  "Optional reasoning effort. Omit it to use the model's own default, which is " +
+  "the right choice unless you specifically need another level; omitting falls " +
+  "back to high only for models that declare no default of their own. Validated " +
+  "per MODEL, not just per agent: a level the chosen model does not accept is an " +
+  "ERROR that refuses the call, because a silently dropped effort would leave you " +
+  "reasoning about a setting that never applied. The lists below are each agent's " +
+  "union across all its models -- call list_models for one model's actual set. " +
+  "Accepted values by agent: " +
+  listAdapters()
+    .filter((a) => a.reasoningEfforts.length)
+    .map((a) => `${a.id}: ${a.reasoningEfforts.join("|")}`)
+    .join(" | ") +
+  ". Agents not listed do not expose reasoning effort.";
+const ALL_EFFORTS = [
+  ...new Set([...ALL_REASONING_EFFORTS, ...listAdapters().flatMap((a) => a.reasoningEfforts)]),
+];
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -52,7 +145,9 @@ function resolveSessionDir(sessionId) {
   if (!/^(dialog|review)-\d+-[0-9a-f]+$/.test(sessionId)) {
     throw new Error(`Invalid session ID format: ${sessionId}`);
   }
-  return path.join(DIALOGS_DIR, sessionId);
+  // New sessions land under the current root; sessions created before the
+  // rename are still readable in place rather than orphaned.
+  return resolveExistingSessionDir(sessionId);
 }
 
 function readConv(sessionId) {
@@ -92,8 +187,14 @@ function resolvePartnerCommandValue(
   claudeCommand
 ) {
   if (partnerCommand) return partnerCommand;
-  if (partnerAgent === "claude") return claudeCommand || "claude";
-  return codexCommand || "codex";
+  // Legacy per-agent aliases, kept working for existing callers.
+  if (partnerAgent === "claude" && claudeCommand) return claudeCommand;
+  if (partnerAgent === "codex" && codexCommand) return codexCommand;
+  try {
+    return getAdapter(partnerAgent).binary.default;
+  } catch {
+    return partnerAgent;
+  }
 }
 
 function getProcessingPath(sessionDir) {
@@ -223,8 +324,100 @@ function normalizePartnerTimeout(timeoutMs) {
   return Math.max(MIN_PARTNER_TIMEOUT_MS, timeoutMs);
 }
 
-function normalizeReasoningEffort(reasoningEffort, partnerAgent) {
-  return normalizeReasoningEffortForAgent(reasoningEffort, partnerAgent);
+/**
+ * The single preflight both start tools run before a session exists.
+ *
+ * Every option-level check (model known, effort accepted by the adapter AND by
+ * the specific model, alias translation, tool profile) comes from the same
+ * resolveContext() the argv builder uses, so the answer here cannot disagree
+ * with what the spawned turn would actually do.
+ *
+ * Returns { ok, effort, model, errorText, warnings }. On !ok the caller must
+ * not create a session: an error-severity finding means the turn would run with
+ * something the caller asked for silently missing.
+ */
+async function preflightPartner(partnerAgent, {
+  partnerCommand,
+  model,
+  reasoningEffort,
+  toolProfile,
+  projectPath,
+  allowUnknownModel = false,
+}) {
+  const adapter = tryGetAdapter(partnerAgent);
+  if (!adapter) {
+    return {
+      ok: false,
+      errorText: `Unknown partner_agent "${partnerAgent}". Known adapters: ${adapterIds().join(", ")}`,
+    };
+  }
+
+  let engine;
+  try {
+    engine = resolveEngine(adapter);
+  } catch (err) {
+    return { ok: false, errorText: err.message };
+  }
+
+  const requestedEffort = requestedReasoningEffortForAdapter(reasoningEffort);
+
+  // Discovery is what turns "this id is not in the manifest" into a rejection
+  // rather than a shrug, and it is the only thing that knows whether a locally
+  // served model can call tools at all. It never throws and never blocks for
+  // long: `none`/`static` short-circuit without I/O, results are cached, and
+  // any failure degrades to the static list.
+  const discoveredModels = await resolveDiscoveryForValidation(adapter, {
+    model,
+    projectPath,
+  });
+
+  let result;
+  try {
+    result = negotiate(adapter, {
+      engine,
+      partnerCommand,
+      toolProfile: toolProfile || "read",
+      model: model || null,
+      reasoningEffort: requestedEffort,
+      projectPath: projectPath || process.cwd(),
+      sessionDir: projectPath || process.cwd(),
+      discoveredModels,
+      allowUnknownModel,
+    });
+  } catch (err) {
+    return { ok: false, errorText: err.message };
+  }
+
+  if (result.errors.length) {
+    const lines = result.errors.map((e) => `  - [${e.code}] ${e.message}`);
+    return {
+      ok: false,
+      errorText:
+        `Cannot start a ${adapter.displayName} session as requested:\n${lines.join("\n")}\n\n` +
+        `Call list_models for "${partnerAgent}" to see what this model accepts.`,
+      warnings: result.warnings,
+    };
+  }
+
+  return {
+    ok: true,
+    // What the turn will actually run as, which is not always what was asked
+    // for -- an alias may have been translated, or the CLI's own default used.
+    //
+    // A deliberate null must survive. `?? requestedEffort` looked like a
+    // harmless fallback but inverted the meaning of the one answer that matters:
+    // resolveContext() returns null precisely when it DROPPED the effort (Cursor
+    // exposes no effort control), and coalescing put the dropped value back, so
+    // status and the tool response both claimed an effort the turn would never
+    // apply. Only fall back when resolveContext did not run at all.
+    effort: result.resolution ? result.resolution.reasoningEffort : requestedEffort ?? null,
+    // What the CLI will actually run at, including its own default when we pass
+    // no flag -- reported separately because "we sent nothing" and "it will run
+    // at nothing" are different facts.
+    effectiveEffort: result.resolution?.effectiveEffort ?? null,
+    model: result.resolution ? result.resolution.model : model ?? null,
+    warnings: result.warnings ?? [],
+  };
 }
 
 function normalizeWaitTimeout(timeoutMs) {
@@ -242,9 +435,7 @@ function buildSessionSnapshot(sessionId, options = {}) {
   const status = readStatus(sessionDir);
   const hostAgent = getSessionHostAgent(status);
   const partnerAgent = getSessionPartnerAgent(status);
-  const runnerAlive = status?.runner_pid
-    ? isProcessAlive(status.runner_pid)
-    : false;
+  const runnerAlive = isSessionRunnerAlive(status, sessionDir);
   const processingPath = getProcessingPath(sessionDir);
   const partnerProcessing = fs.existsSync(processingPath);
   const errorPath = path.join(sessionDir, "last_error.txt");
@@ -474,13 +665,13 @@ server.tool(
       .optional()
       .describe("Path to the project directory for context"),
     host_agent: z
-      .enum(["claude", "codex"])
+      .enum(AGENT_IDS)
       .optional()
       .describe("Which agent is orchestrating the session (default: 'claude')"),
     partner_agent: z
-      .enum(["claude", "codex"])
+      .enum(AGENT_IDS)
       .optional()
-      .describe("Which agent should respond in the background runner (default: 'codex')"),
+      .describe(AGENT_CHOICE_DESCRIPTION),
     partner_command: z
       .string()
       .optional()
@@ -503,7 +694,7 @@ server.tool(
         "Soft round budget (default: 5). The partner is asked to deliver all feedback within this many rounds. Hard cap = max_rounds + 5. Do not override unless the user explicitly requested a different budget."
       ),
     reasoning_effort: z
-      .enum(ALL_REASONING_EFFORTS)
+      .enum(ALL_EFFORTS)
       .optional()
       .describe(REASONING_EFFORT_DESCRIPTION),
     model: z
@@ -532,6 +723,12 @@ server.tool(
       .enum(["plan", "spec", "document"])
       .optional()
       .describe("Kind of reviewed document at subject_path. Used only for prompt labels."),
+    allow_unknown_model: z
+      .boolean()
+      .optional()
+      .describe(
+        "Start with a model this server's catalog does not list. Only has an effect when a live catalog was consulted -- without one an unrecognized model is already just a warning."
+      ),
   },
   async ({
     problem_description,
@@ -548,6 +745,7 @@ server.tool(
     tool_profile,
     subject_path,
     subject_kind,
+    allow_unknown_model,
   }) => {
     const hostAgent = normalizeAgent(host_agent, "claude");
     const partnerAgent = normalizeAgent(partner_agent, "codex");
@@ -564,22 +762,6 @@ server.tool(
     const softCap = max_rounds || 5;
     const hardCap = softCap + 5;
     const partnerTimeoutMs = normalizePartnerTimeout(partner_timeout_ms);
-    let effectiveReasoningEffort;
-    try {
-      effectiveReasoningEffort = normalizeReasoningEffort(
-        reasoning_effort,
-        partnerAgent
-      );
-    } catch (err) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${err.message}`,
-          },
-        ],
-      };
-    }
     const partnerCommand = resolvePartnerCommandValue(
       partnerAgent,
       partner_command,
@@ -588,6 +770,27 @@ server.tool(
     );
     const partnerDisplay = getAgentDisplayName(partnerAgent);
     const resolvedProjectPath = project_path || process.cwd();
+
+    // Validate against the selected adapter before a session directory exists.
+    // Reaching the runner with an effort the model rejects used to produce a
+    // live session that reported the requested effort and ran without it.
+    const preflight = await preflightPartner(partnerAgent, {
+      partnerCommand,
+      model,
+      reasoningEffort: reasoning_effort,
+      toolProfile: tool_profile,
+      projectPath: resolvedProjectPath,
+      allowUnknownModel: allow_unknown_model === true,
+    });
+    if (!preflight.ok) {
+      return { content: [{ type: "text", text: `Error: ${preflight.errorText}` }] };
+    }
+    const effectiveReasoningEffort = preflight.effort;
+    // Degradations the caller must see. These are warnings rather than errors --
+    // per negotiate()'s rule, a change to how WELL the partner works is loud, a
+    // change to what it is ALLOWED to do is fatal -- but "loud" only counts if
+    // it reaches the host, and the runner log does not.
+    const preflightWarnings = preflight.warnings ?? [];
     let subjectPath = null;
     try {
       subjectPath = resolveSubjectPath(subject_path, resolvedProjectPath);
@@ -613,6 +816,7 @@ server.tool(
     fs.writeFileSync(path.join(sessionDir, "conversation.jsonl"), "");
 
     // Write initial status
+    const runnerToken = crypto.randomBytes(16).toString("hex");
     const status = {
       session_id: sessionId,
       type: "dialog",
@@ -628,9 +832,12 @@ server.tool(
       model: model || null,
       partner_timeout_ms: partnerTimeoutMs,
       tool_profile: tool_profile || "read",
+      allow_unknown_model: allow_unknown_model === true,
       subject_path: subjectPath,
       subject_kind: subjectPath ? (subject_kind || "document") : null,
       runner_pid: null,
+      runner_token: runnerToken,
+      runner_state: "starting",
     };
     fs.writeFileSync(
       path.join(sessionDir, "status.json"),
@@ -645,12 +852,20 @@ server.tool(
       project_path || process.cwd(),
       partnerCommand,
       String(softCap),
-      effectiveReasoningEffort,
+      // Absent must serialize as empty, not as null. spawn() stringifies a null
+      // argv entry to the literal "null", which the runner then reads as an
+      // explicitly requested effort named "null" before dropping it again.
+      effectiveReasoningEffort || "",
       model || "",
       hostAgent,
       partnerAgent,
       tool_profile || "read",
       String(partnerTimeoutMs),
+      buildRunnerTokenArg(runnerToken),
+      // Appended as a flag rather than a positional: the runners read their
+      // options by index, and the preflight's answer has to survive into the
+      // turn or the two validate the same id differently.
+      ...(allow_unknown_model === true ? ["--allow-unknown-model"] : []),
     ];
     const runner = spawn(
       process.execPath,
@@ -665,12 +880,19 @@ server.tool(
     runner.on("error", () => {});
     runner.unref();
 
-    // Update status with PID
+    // Record the PID without clobbering an exit the runner may already have
+    // written; keep the in-memory copy in step for the response below.
     status.runner_pid = runner.pid;
-    fs.writeFileSync(
-      path.join(sessionDir, "status.json"),
-      JSON.stringify(status, null, 2)
-    );
+    status.runner_state = "running";
+    markSessionRunnerStarted(sessionDir, {
+      runnerToken,
+      pid: runner.pid,
+    });
+    // Closes the remaining start-vs-exit race. The write above and the runner's
+    // own exit record are two whole-file writes with no ordering between them;
+    // the exit EVENT has an unambiguous order, so use it to re-assert the truth
+    // if our "running" landed on top of a newer "exited".
+    watchRunnerExit(runner, sessionDir, { runnerToken });
 
     return {
       content: [
@@ -687,6 +909,8 @@ server.tool(
               max_rounds: softCap,
               hard_cap: hardCap,
               reasoning_effort: effectiveReasoningEffort,
+              effective_reasoning_effort: preflight.effectiveEffort,
+              warnings: preflightWarnings,
               model: model || "default",
               partner_timeout_ms: partnerTimeoutMs,
               tool_profile: tool_profile || "read",
@@ -734,13 +958,13 @@ server.tool(
         "Optional focus area for the review, e.g. 'security', 'performance', 'correctness'"
       ),
     host_agent: z
-      .enum(["claude", "codex"])
+      .enum(AGENT_IDS)
       .optional()
       .describe("Which agent is orchestrating the review (default: 'claude')"),
     partner_agent: z
-      .enum(["claude", "codex"])
+      .enum(AGENT_IDS)
       .optional()
-      .describe("Which agent should review in the background (default: 'codex')"),
+      .describe(AGENT_CHOICE_DESCRIPTION),
     partner_command: z
       .string()
       .optional()
@@ -763,7 +987,7 @@ server.tool(
         "Soft round budget (default: 5). The reviewer is asked to deliver all feedback within this many rounds. Hard cap = max_rounds + 5. Do not override unless the user explicitly requested a different budget."
       ),
     reasoning_effort: z
-      .enum(ALL_REASONING_EFFORTS)
+      .enum(ALL_EFFORTS)
       .optional()
       .describe(REASONING_EFFORT_DESCRIPTION),
     model: z
@@ -776,6 +1000,12 @@ server.tool(
       .min(MIN_PARTNER_TIMEOUT_MS)
       .optional()
       .describe("Backward-compatible wait-time hint in milliseconds (default: 900000 = 15 minutes). Interactive tmux partner turns are not killed by this value."),
+    allow_unknown_model: z
+      .boolean()
+      .optional()
+      .describe(
+        "Start with a model this server's catalog does not list. Only has an effect when a live catalog was consulted -- without one an unrecognized model is already just a warning."
+      ),
   },
   async ({
     project_path,
@@ -792,6 +1022,7 @@ server.tool(
     reasoning_effort,
     model,
     partner_timeout_ms,
+    allow_unknown_model,
   }) => {
     const hostAgent = normalizeAgent(host_agent, "claude");
     const partnerAgent = normalizeAgent(partner_agent, "codex");
@@ -814,22 +1045,6 @@ server.tool(
     const softCap = max_rounds || 5;
     const hardCap = softCap + 5;
     const partnerTimeoutMs = normalizePartnerTimeout(partner_timeout_ms);
-    let effectiveReasoningEffort;
-    try {
-      effectiveReasoningEffort = normalizeReasoningEffort(
-        reasoning_effort,
-        partnerAgent
-      );
-    } catch (err) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${err.message}`,
-          },
-        ],
-      };
-    }
     const partnerCommand = resolvePartnerCommandValue(
       partnerAgent,
       partner_command,
@@ -837,6 +1052,27 @@ server.tool(
       claude_command
     );
     const partnerDisplay = getAgentDisplayName(partnerAgent);
+
+    // Same preflight as start_dialog, for the same reason: a review that runs
+    // at an effort the model silently clamped is a review the host misreads.
+    const preflight = await preflightPartner(partnerAgent, {
+      partnerCommand,
+      model,
+      reasoningEffort: reasoning_effort,
+      toolProfile: "read",
+      projectPath: project_path,
+      allowUnknownModel: allow_unknown_model === true,
+    });
+    if (!preflight.ok) {
+      return { content: [{ type: "text", text: `Error: ${preflight.errorText}` }] };
+    }
+    const effectiveReasoningEffort = preflight.effort;
+    // Degradations the caller must see. These are warnings rather than errors --
+    // per negotiate()'s rule, a change to how WELL the partner works is loud, a
+    // change to what it is ALLOWED to do is fatal -- but "loud" only counts if
+    // it reaches the host, and the runner log does not.
+    const preflightWarnings = preflight.warnings ?? [];
+
     const execOpts = { cwd: project_path, timeout: 30000, maxBuffer: 10 * 1024 * 1024 };
 
     // Resolve current branch and HEAD SHA for metadata
@@ -963,6 +1199,7 @@ server.tool(
     fs.writeFileSync(path.join(sessionDir, "conversation.jsonl"), "");
 
     // Write status
+    const runnerToken = crypto.randomBytes(16).toString("hex");
     const status = {
       session_id: sessionId,
       type: "review",
@@ -983,7 +1220,10 @@ server.tool(
       reasoning_effort: effectiveReasoningEffort,
       model: model || null,
       partner_timeout_ms: partnerTimeoutMs,
+      allow_unknown_model: allow_unknown_model === true,
       runner_pid: null,
+      runner_token: runnerToken,
+      runner_state: "starting",
     };
     fs.writeFileSync(
       path.join(sessionDir, "status.json"),
@@ -998,11 +1238,19 @@ server.tool(
       project_path,
       partnerCommand,
       String(softCap),
-      effectiveReasoningEffort,
+      // Absent must serialize as empty, not as null. spawn() stringifies a null
+      // argv entry to the literal "null", which the runner then reads as an
+      // explicitly requested effort named "null" before dropping it again.
+      effectiveReasoningEffort || "",
       model || "",
       hostAgent,
       partnerAgent,
       String(partnerTimeoutMs),
+      buildRunnerTokenArg(runnerToken),
+      // Appended as a flag rather than a positional: the runners read their
+      // options by index, and the preflight's answer has to survive into the
+      // turn or the two validate the same id differently.
+      ...(allow_unknown_model === true ? ["--allow-unknown-model"] : []),
     ];
     const runner = spawn(
       process.execPath,
@@ -1017,11 +1265,19 @@ server.tool(
     runner.on("error", () => {});
     runner.unref();
 
+    // Same read-modify-write as start_dialog: never replay a pre-spawn status
+    // object over an exit record the runner already produced.
     status.runner_pid = runner.pid;
-    fs.writeFileSync(
-      path.join(sessionDir, "status.json"),
-      JSON.stringify(status, null, 2)
-    );
+    status.runner_state = "running";
+    markSessionRunnerStarted(sessionDir, {
+      runnerToken,
+      pid: runner.pid,
+    });
+    // Closes the remaining start-vs-exit race. The write above and the runner's
+    // own exit record are two whole-file writes with no ordering between them;
+    // the exit EVENT has an unambiguous order, so use it to re-assert the truth
+    // if our "running" landed on top of a newer "exited".
+    watchRunnerExit(runner, sessionDir, { runnerToken });
 
     return {
       content: [
@@ -1036,16 +1292,28 @@ server.tool(
               diff_label: diffLabel,
               files_changed: meta.files_changed.length,
               diff_size: diff.length,
+              // How much of the diff is actually embedded in the partner's
+              // prompt. The partner is told to read the rest from disk, but only
+              // the host can judge whether a review that leaned on the embedded
+              // copy covered the change -- and it cannot judge that without
+              // being told the copy was partial.
+              diff_chars_embedded: Math.min(diff.length, MAX_REVIEW_DIFF_CHARS),
+              diff_truncated: diff.length > MAX_REVIEW_DIFF_CHARS,
               host_agent: hostAgent,
               partner_agent: partnerAgent,
               partner_command: partnerCommand,
               max_rounds: softCap,
               hard_cap: hardCap,
               reasoning_effort: effectiveReasoningEffort,
+              effective_reasoning_effort: preflight.effectiveEffort,
+              warnings: preflightWarnings,
               model: model || "default",
               partner_timeout_ms: partnerTimeoutMs,
               message:
-                `Code review started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${model || "default"}, reasoning effort: ${effectiveReasoningEffort}. ${partnerDisplay} is generating an initial review in detached tmux and is not killed by the wait hint.`,
+                `Code review started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${model || "default"}, reasoning effort: ${effectiveReasoningEffort}. ${partnerDisplay} is generating an initial review in detached tmux and is not killed by the wait hint.` +
+                (diff.length > MAX_REVIEW_DIFF_CHARS
+                  ? ` NOTE: this diff is ${diff.length} chars and only the first ${MAX_REVIEW_DIFF_CHARS} (${Math.round((MAX_REVIEW_DIFF_CHARS / diff.length) * 100)}%) are embedded in ${partnerDisplay}'s prompt. It is instructed to read the changed files from ${project_path} for the remainder, but treat any finding that depends on the unembedded portion as unverified unless it cites the file it read.`
+                  : ""),
             },
             null,
             2
@@ -1152,6 +1420,23 @@ server.tool(
     const hostAgent = getSessionHostAgent(status);
     const partnerAgent = getSessionPartnerAgent(status);
     const partnerDisplay = getAgentDisplayName(partnerAgent);
+
+    // A message needs a runner to consume it. Without this check the log is an
+    // append-only sink that still accepts writes after the session is over --
+    // work that will never be answered, growing a file every poll re-reads.
+    if (status?.runner_state === "exited" || !isSessionRunnerAlive(status, sessionDir)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Error: this session's runner is no longer running` +
+              (status?.runner_exit_reason ? ` (${status.runner_exit_reason})` : "") +
+              `, so ${partnerDisplay} cannot answer. Start a new session; call end_dialog to close this one.`,
+          },
+        ],
+      };
+    }
 
     // Auto-refresh diff BEFORE appending message so it's ready when the runner
     // sees the new message and immediately starts building the prompt.
@@ -1395,9 +1680,7 @@ server.tool(
 
     const status = readStat(session_id);
     const partnerAgent = getSessionPartnerAgent(status);
-    const alive = status?.runner_pid
-      ? isProcessAlive(status.runner_pid)
-      : false;
+    const alive = isSessionRunnerAlive(status, sessionDir);
 
     const processingPath = getProcessingPath(sessionDir);
     const processing = fs.existsSync(processingPath);
@@ -1490,9 +1773,19 @@ server.tool(
     const terminatedPartnerTerminal = await terminateCurrentPartnerTerminal(sessionDir);
     unlinkProcessingMarkers(sessionDir);
 
-    if (status?.runner_pid && isProcessAlive(status.runner_pid)) {
+    // The headless counterpart to terminateCurrentPartnerTerminal. A headless
+    // child has no entry in current_terminal.json, so ending the session was the
+    // one place it could be orphaned without anything noticing.
+    let reapedHeadlessChildren = 0;
+    try {
+      reapedHeadlessChildren = await reapOrphanedHeadlessChildren(sessionDir);
+    } catch {
+      // Cleanup is best-effort; never fail closing a session over it.
+    }
+
+    if (isSessionRunnerAlive(status, sessionDir)) {
       await new Promise((resolve) => setTimeout(resolve, END_DIALOG_GRACE_MS));
-      if (isProcessAlive(status.runner_pid)) {
+      if (isSessionRunnerAlive(status, sessionDir)) {
         try {
           process.kill(status.runner_pid, "SIGTERM");
         } catch {
@@ -1502,6 +1795,13 @@ server.tool(
       await new Promise((resolve) => setTimeout(resolve, 500));
       await terminateCurrentPartnerTerminal(sessionDir);
       unlinkProcessingMarkers(sessionDir);
+      // The runner had to be signalled, so it may have spawned a child between
+      // the first sweep and dying. Sweep again now that it is gone.
+      try {
+        reapedHeadlessChildren += await reapOrphanedHeadlessChildren(sessionDir);
+      } catch {
+        /* best-effort */
+      }
     }
 
     const messages = readConv(session_id);
@@ -1516,6 +1816,7 @@ server.tool(
             {
               ended: true,
               terminated_partner_terminal: terminatedPartnerTerminal,
+              reaped_headless_children: reapedHeadlessChildren,
               session_type: status?.type || "unknown",
               total_messages: messages.length,
               review_status: reviewStatus,
@@ -1531,25 +1832,282 @@ server.tool(
 );
 
 server.tool(
+  "list_adapters",
+  "List every AI CLI this server can drive as a partner, with its capabilities and whether its binary is actually installed. Call this before start_dialog when you are unsure which partner agents are available.",
+  {
+    probe: z
+      .boolean()
+      .optional()
+      .describe(
+        "Also run each installed CLI's version command. Slower; off by default."
+      ),
+    installed_only: z
+      .boolean()
+      .optional()
+      .describe("Return only adapters whose binary is present on PATH."),
+  },
+  async ({ probe, installed_only }) => {
+    const described = await Promise.all(
+      listAdapters().map((adapter) => describeAdapter(adapter, { probe: probe === true }))
+    );
+    const adapters = installed_only === true
+      ? described.filter((a) => a.binary_available)
+      : described;
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              adapters,
+              installed: adapters.filter((a) => a.binary_available).map((a) => a.id),
+              missing: described.filter((a) => !a.binary_available).map((a) => a.id),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+/**
+ * How a discovery result should be read. The structured fields say what
+ * happened; this says what it MEANS, because the difference between "these are
+ * your seven real Codex models" and "nothing answered, here is a list we
+ * maintain by hand" is the whole value of the call, and a caller that misreads
+ * it will confidently tell the user a working model does not exist.
+ */
+function describeProvenance(adapter, discovery) {
+  const name = adapter.displayName;
+  if (discovery.strategy === "static") {
+    return (
+      `Discovery did not answer for ${name}, so this is the hand-maintained list from ` +
+      `its manifest. It is a snapshot, not a catalog: treat an id that is absent as ` +
+      `unverified rather than invalid, and pass it through if the user asked for it.`
+    );
+  }
+  if (discovery.stale) {
+    return (
+      `Read from ${discovery.source}, but that source is past its refresh window. A ` +
+      `model released since it was written would be missing. Call again with ` +
+      `refresh: true to re-read it.`
+    );
+  }
+  if (discovery.models.length === 0) {
+    return (
+      `${discovery.source} was reachable and returned no models at all. That is a ` +
+      `configuration or credentials problem at the source, not proof that ${name} has ` +
+      `no models -- it rules nothing in or out.`
+    );
+  }
+  return (
+    `These are the models ${name} can currently be asked for, read live from ` +
+    `${discovery.source}. An id absent from this list will be rejected.`
+  );
+}
+
+server.tool(
+  "list_models",
+  "List the models one partner agent can actually be asked for right now, with where that list came from. Call this before passing a model to start_dialog or start_code_review -- do not assert from memory which models exist. Reports whether the list is a live catalog or a hand-maintained fallback, which decides whether an absent id is invalid or merely unverified.",
+  {
+    agent: z.string().describe("Adapter id, as returned by list_adapters"),
+    refresh: z
+      .boolean()
+      .optional()
+      .describe(
+        "Re-read the source, bypassing the per-source cache. Off by default: some sources are free to re-read (a local cache file) and others are expensive (listing grok's models boots a full agent shell)."
+      ),
+    include_metadata: z
+      .boolean()
+      .optional()
+      .describe(
+        "Return each model's accepted efforts, default effort and context window instead of bare ids."
+      ),
+  },
+  async ({ agent, refresh, include_metadata }) => {
+    let adapter;
+    try {
+      adapter = getAdapter(agent);
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${err.message}` }] };
+    }
+
+    // Never throws: a failed lookup degrades to the static list with a notice,
+    // because a partner that could have been started must not be blocked by a
+    // listing that did not answer.
+    const discovery = await resolveDiscovery(adapter, { refresh: refresh === true });
+
+    const models =
+      include_metadata === true
+        ? discovery.models.map((model) => ({
+            id: model.id,
+            ...(model.efforts ? { efforts: model.efforts } : {}),
+            ...(model.defaultEffort ? { default_effort: model.defaultEffort } : {}),
+            ...(model.context ? { context: model.context } : {}),
+          }))
+        : discovery.models.map((model) => model.id);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              agent: adapter.id,
+              models,
+              count: discovery.models.length,
+              source: discovery.source,
+              strategy: discovery.strategy,
+              fetched_at: discovery.fetchedAt,
+              stale: discovery.stale,
+              // Whether this list is grounds to call an absent id invalid.
+              authoritative: isEnumerable(discovery),
+              provenance: describeProvenance(adapter, discovery),
+              notices: discovery.notices,
+              // Aliases are not catalog entries, so no discovery source can
+              // return them -- but they are still valid to pass.
+              aliases: adapter.modelAliases ?? {},
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "check_adapter",
+  "Preflight one partner agent against the options you intend to use. Reports blocking errors and any option that would be silently dropped, without starting a session. Validates the model and reasoning effort together, since which efforts are legal depends on the model. Use list_models for what models exist.",
+  {
+    agent: z.string().describe("Adapter id, as returned by list_adapters"),
+    engine: z
+      .enum(ENGINES)
+      .optional()
+      .describe("Execution engine to check. Defaults to the adapter's own default."),
+    model: z.string().optional(),
+    reasoning_effort: z
+      .string()
+      .optional()
+      .describe(
+        "Checked against the chosen MODEL, not just the agent: an effort the agent parses may still be invalid for that model, and Claude answers such a pair by silently running at high."
+      ),
+    tool_profile: z.string().optional(),
+    allow_unknown_model: z
+      .boolean()
+      .optional()
+      .describe(
+        "Pass a model the server does not recognize anyway. Only relevant when a live catalog was consulted; an unrecognized model is otherwise a warning already."
+      ),
+  },
+  async ({ agent, engine, model, reasoning_effort, tool_profile, allow_unknown_model }) => {
+    let adapter;
+    try {
+      adapter = getAdapter(agent);
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${err.message}` }] };
+    }
+
+    let resolvedEngine;
+    try {
+      resolvedEngine = resolveEngine(adapter, { requested: engine ?? null });
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${err.message}` }] };
+    }
+
+    // Discovery, on the same terms the start tools use.
+    //
+    // This used to be deliberately omitted, on the reasoning that the spawn path
+    // did not fetch a catalog either and feeding one only to the preflight was
+    // the one way the two could disagree. That reasoning was right; its premise
+    // stopped being true when the start tools began resolving discovery. Left
+    // as-is it produced exactly the disagreement it was written to prevent:
+    // check_adapter accepting an opencode effort against an empty manifest that
+    // start_dialog then rejects against the live catalog.
+    const discoveredModels = await resolveDiscoveryForValidation(adapter, {
+      model: model ?? null,
+    });
+
+    const result = negotiate(adapter, {
+      engine: resolvedEngine,
+      model: model ?? null,
+      reasoningEffort: reasoning_effort ?? null,
+      toolProfile: tool_profile ?? null,
+      allowUnknownModel: allow_unknown_model === true,
+      discoveredModels,
+    });
+
+    const { resolution } = result;
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              agent: adapter.id,
+              engine: resolvedEngine,
+              ok: result.errors.length === 0,
+              errors: result.errors,
+              warnings: result.warnings,
+              // What the turn would actually run as. `effective_effort` is the
+              // one fact nothing else reports: with no effort given, the CLI
+              // applies its own per-model default and never says which.
+              resolved: {
+                model: resolution.model,
+                model_id: resolution.modelId,
+                model_known: resolution.modelKnown,
+                accepted_efforts: resolution.efforts,
+                reasoning_effort: resolution.reasoningEffort,
+                default_effort: resolution.defaultEffort,
+                effective_effort: resolution.effectiveEffort,
+              },
+              notices: result.notices,
+              adapter: await describeAdapter(adapter, { probe: true }),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
   "list_sessions",
   "List all dialog and review sessions (active and completed).",
   {},
   async () => {
-    if (!fs.existsSync(DIALOGS_DIR)) {
-      return { content: [{ type: "text", text: "[]" }] };
+    // Both roots, de-duplicated: the current one and the pre-rename one.
+    const seen = new Set();
+    const sessions = [];
+    for (const root of [DIALOGS_DIR, LEGACY_DIALOGS_DIR]) {
+      let entries;
+      try {
+        entries = fs.readdirSync(root);
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (!entry.startsWith("dialog-") && !entry.startsWith("review-")) continue;
+        if (seen.has(entry)) continue;
+        seen.add(entry);
+        sessions.push(entry);
+      }
     }
-
-    const sessions = fs
-      .readdirSync(DIALOGS_DIR)
-      .filter((d) => d.startsWith("dialog-") || d.startsWith("review-"));
     const results = [];
     for (const sessionId of sessions) {
       try {
         const status = readStat(sessionId);
         const messages = readConv(sessionId);
-        const alive = status?.runner_pid
-          ? isProcessAlive(status.runner_pid)
-          : false;
+        const alive = isSessionRunnerAlive(
+          status,
+          resolveSessionDir(sessionId)
+        );
         const budget = computeBudget(status, messages);
         results.push({
         session_id: sessionId,

@@ -1,0 +1,33 @@
+{
+  "id": "cursor",
+  "displayName": "Cursor Agent",
+  "binary": {
+    "default": "cursor-agent",
+    "versionArgs": ["--version"],
+    "installHint": "curl https://cursor.com/install -fsS | bash"
+  },
+  "engines": { "default": "headless", "allowed": ["headless"] },
+  "capabilities": {
+    "modelFlag": true,
+    "reasoningEffort": false,
+    "toolProfiles": "prompt-only",
+    "addDir": false,
+    "writesFiles": true,
+    "tuiDrivable": "risky"
+  },
+  "effortDelivery": "none",
+  "models": [],
+  "defaultToolProfile": "read",
+  "toolProfiles": {},
+  "mcp": { "strategy": "none" },
+  "configIsolation": null,
+  "promptDelivery": { "headless": "argv" },
+  "argv": {
+    "headless": [
+      { "args": ["--print", "--output-format", "stream-json", "--force"] },
+      { "when": { "set": "model" }, "args": ["--model", "{{model}}"] },
+      { "args": ["{{initialPrompt}}"] }
+    ]
+  },
+  "completion": { "sidecar": "always", "stdoutTrustworthy": false }
+}

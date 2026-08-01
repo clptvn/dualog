@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// PreToolUse hook for mcp__codex-dialog__send_message
+// PreToolUse hook for mcp__dualog__send_message
 // Blocks the send if Claude hasn't read the files the partner referenced.
 // Session-scoped: only checks the marker for the target session.
 
@@ -28,7 +28,7 @@ try {
   }
 } catch {}
 
-const markerPath = path.join(os.tmpdir(), `codex-required-reads-${sessionId}`);
+const markerPath = path.join(os.tmpdir(), `dualog-required-reads-${sessionId}`);
 if (!fs.existsSync(markerPath)) process.exit(0);
 
 const content = fs.readFileSync(markerPath, "utf-8").trim();

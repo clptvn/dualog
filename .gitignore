@@ -1,2 +1,13 @@
 node_modules/
 .DS_Store
+
+# Partner config-isolation directories. Adapters relocate a partner's config
+# home to `<sessionDir>/<agent>-home` and SEED IT WITH REAL CREDENTIALS
+# (~/.codex/auth.json and friends). Sessions normally live outside the repo, but
+# a caller that passes the project directory as sessionDir deposits live auth
+# tokens in the working tree -- so this is ignored as a backstop, not because it
+# is ever expected to be here.
+codex-home/
+claude-home/
+qwen-home/
+goose-root/

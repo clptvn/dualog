@@ -27,7 +27,7 @@ try {
 }
 
 const tmpDir = os.tmpdir();
-const prefix = "codex-required-reads-";
+const prefix = "dualog-required-reads-";
 let entries;
 try {
   entries = fs.readdirSync(tmpDir).filter((f) => f.startsWith(prefix));

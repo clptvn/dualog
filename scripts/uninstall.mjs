@@ -12,8 +12,8 @@ const CLAUDE_DIR = path.join(HOME_DIR, ".claude");
 const CLAUDE_JSON = path.join(HOME_DIR, ".claude.json");
 const CLAUDE_COMMANDS_DIR = path.join(CLAUDE_DIR, "commands");
 const CLAUDE_HOOKS_ROOT = path.join(CLAUDE_DIR, "hooks");
-const CLAUDE_HOOKS_DIR = path.join(CLAUDE_HOOKS_ROOT, "codex-dialog");
-const CLAUDE_HOOKS_PLATFORM = path.join(CLAUDE_HOOKS_ROOT, "codex-dialog-platform.mjs");
+const CLAUDE_HOOKS_DIR = path.join(CLAUDE_HOOKS_ROOT, "dualog");
+const CLAUDE_HOOKS_PLATFORM = path.join(CLAUDE_HOOKS_ROOT, "dualog-platform.mjs");
 const CLAUDE_HOOKS_LEGACY_PLATFORM = path.join(CLAUDE_HOOKS_ROOT, "platform.mjs");
 const CLAUDE_SETTINGS_JSON = path.join(CLAUDE_DIR, "settings.json");
 const CODEX_DIR = path.join(HOME_DIR, ".codex");
@@ -21,13 +21,32 @@ const CODEX_SKILLS_DIR = path.join(CODEX_DIR, "skills");
 const CODEX_CONFIG_TOML = path.join(CODEX_DIR, "config.toml");
 
 const CLAUDE_COMMANDS = [
+  "dualog-review-code",
+  "dualog-review-plan",
+  "dualog-review-spec",
+  "dualog-audit",
+];
+
+// Pre-rename artifacts. Removed on install, so a stale command file cannot keep
+// calling a tool namespace the server no longer serves.
+const LEGACY_CLAUDE_COMMANDS = [
   "codex-review-code",
   "codex-review-plan",
   "codex-review-spec",
   "codex-audit",
 ];
+const LEGACY_MCP_KEY = "codex-dialog";
+const LEGACY_HOOKS_DIR_NAME = "codex-dialog";
 
 const CODEX_SKILLS = [
+  "dualog-review-code",
+  "dualog-review-plan",
+  "dualog-review-spec",
+  "dualog-audit",
+  "dualog-ui-implementer",
+];
+
+const LEGACY_CODEX_SKILLS = [
   "claude-review-code",
   "claude-review-plan",
   "claude-review-spec",
@@ -97,13 +116,13 @@ function writeJsonConfig(filePath, config) {
 function removeClaudeMcp() {
   const hasClaude = cliExists("claude");
   if (hasClaude) {
-    runCli("claude", ["mcp", "remove", "codex-dialog", "-s", "user"]);
+    runCli("claude", ["mcp", "remove", "dualog", "-s", "user"]);
     console.log("  Removed Claude MCP registration OK");
   }
 
   const config = readJsonConfig(CLAUDE_JSON);
-  if (config.mcpServers?.["codex-dialog"]) {
-    delete config.mcpServers["codex-dialog"];
+  if (config.mcpServers?.["dualog"]) {
+    delete config.mcpServers["dualog"];
     if (Object.keys(config.mcpServers).length === 0) delete config.mcpServers;
     writeJsonConfig(CLAUDE_JSON, config);
     console.log("  Removed ~/.claude.json MCP fallback OK");
@@ -115,7 +134,7 @@ function removeClaudeMcp() {
 function isCodexDialogHookCommand(command) {
   if (typeof command !== "string") return false;
   return (
-    command.includes("codex-dialog") ||
+    command.includes("dualog") ||
     HOOK_FILE_MARKERS.some((marker) => command.includes(marker))
   );
 }
@@ -124,7 +143,7 @@ function removeOwnedPlatformHelper(filePath) {
   if (!fs.existsSync(filePath)) return;
   try {
     const content = fs.readFileSync(filePath, "utf-8");
-    if (content.includes("claude-codex-dialog platform helpers")) {
+    if (content.includes("dualog platform helpers")) {
       fs.rmSync(filePath, { force: true });
       console.log(`  Removed Claude hook ${path.basename(filePath)} OK`);
     }
@@ -164,14 +183,14 @@ function removeClaudeHooks() {
 
 function removeCodexMcpSection(content) {
   return content
-    .replace(/\n?\[mcp_servers\.codex-dialog\]\n(?:.*\n)*?(?=\n\[|$)/g, "\n")
+    .replace(/\n?\[mcp_servers\.dualog\]\n(?:.*\n)*?(?=\n\[|$)/g, "\n")
     .trimEnd();
 }
 
 function removeCodexMcp() {
   const hasCodex = cliExists("codex");
   if (hasCodex) {
-    runCli("codex", ["mcp", "remove", "codex-dialog"]);
+    runCli("codex", ["mcp", "remove", "dualog"]);
     console.log("  Removed Codex MCP registration OK");
   }
 
@@ -187,7 +206,7 @@ function removeCodexMcp() {
 function main() {
   const mode = parseMode(process.argv.slice(2));
 
-  console.log("claude-codex-dialog uninstaller");
+  console.log("dualog uninstaller");
   console.log("");
 
   if (mode.removeClaude) {

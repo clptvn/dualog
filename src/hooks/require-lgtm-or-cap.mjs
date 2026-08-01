@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// PreToolUse hook for mcp__codex-dialog__end_dialog
+// PreToolUse hook for mcp__dualog__end_dialog
 // Blocks session closure unless the parsed review verdict is approved or the hard round cap is hit.
 
 import fs from "fs";
@@ -35,6 +35,7 @@ let partnerAgent = "codex";
 let partnerDisplay = "Codex";
 let hardCap = 10;
 let runnerPid = null;
+let runnerState = null;
 let status = null;
 let problem = "";
 
@@ -48,6 +49,7 @@ if (fs.existsSync(statusPath)) {
     }
     hardCap = status?.hard_cap || (status?.max_rounds || 5) + 5;
     runnerPid = status?.runner_pid || null;
+    runnerState = typeof status?.runner_state === "string" ? status.runner_state : null;
   } catch {}
 }
 
@@ -73,10 +75,24 @@ const reviewStatus = computeReviewStatus(status, messages, { problem });
 const partnerRounds = messages.filter((m) => m.from === partnerAgent).length;
 if (reviewStatus.close_allowed) process.exit(0);
 
-// Check if runner is dead (allow closing dead sessions)
-if (runnerPid) {
+// Allow closing a session whose runner is gone. A session cannot make progress
+// without one, so blocking here only strands it.
+//
+// The persisted state is the authoritative signal, not a PID probe: a runner
+// records its own exit via markSessionRunnerExited(), and that same write sets
+// runner_pid to null (keeping the old value as last_runner_pid). Checking only
+// runner_pid therefore inverted the intent -- every runner that shut down
+// cleanly (idle_shutdown, partner_terminal_failure, fatal_error, SIGTERM,
+// SIGINT) erased the evidence this escape hatch needed, and its session could
+// never be closed.
+if (runnerState === "exited") process.exit(0);
+
+// No exit record. Fall back to probing whichever PID we know about; a PID that
+// is no longer running means the runner died without getting to record it.
+const probePid = runnerPid || status?.last_runner_pid || null;
+if (Number.isSafeInteger(probePid) && probePid > 0) {
   try {
-    process.kill(runnerPid, 0);
+    process.kill(probePid, 0);
   } catch {
     // Runner is dead — allow closing
     process.exit(0);

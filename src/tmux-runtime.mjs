@@ -1,9 +1,12 @@
 import fs from "fs";
 import path from "path";
 import { execFile } from "child_process";
+import { envWithAliases } from "./platform.mjs";
+import { tryGetAdapter } from "./adapters/registry.mjs";
+import { isBlocked, isIdlePrompt } from "./tui/markers.mjs";
 
 const DEFAULT_TMUX_BINARY = "tmux";
-const DEFAULT_TMUX_SOCKET_NAME = "codex-dialog";
+const DEFAULT_TMUX_SOCKET_NAME = "dualog";
 const TMUX_EXEC_TIMEOUT_MS = 10000;
 const DEFAULT_CAPTURE_LINES = 240;
 const DEFAULT_CAPTURE_MAX_CHARS = 30000;
@@ -12,9 +15,10 @@ const DEFAULT_TAIL_MAX_CHARS = 3000;
 
 function tmuxBinary() {
   const configured =
-    process.env.CODEX_DIALOG_TMUX_BINARY ||
-    process.env.CONDUCTOR_TMUX_BINARY ||
-    DEFAULT_TMUX_BINARY;
+    envWithAliases(
+      ["DUALOG_TMUX_BINARY", "CODEX_DIALOG_TMUX_BINARY", "CONDUCTOR_TMUX_BINARY"],
+      DEFAULT_TMUX_BINARY
+    );
   const trimmed = configured.trim();
   if (!trimmed) {
     throw new Error("tmux binary path must not be empty");
@@ -69,7 +73,7 @@ export async function isTmuxAvailable() {
 }
 
 export function buildTmuxSessionName(sessionId, label) {
-  const raw = `ccd-${sessionId}-${label}`;
+  const raw = `dlg-${sessionId}-${label}`;
   const sanitized = raw.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 180);
   if (!sanitized) {
     throw new Error(`Invalid tmux session name derived from ${raw}`);
@@ -341,6 +345,7 @@ export function analyzeTerminalActivity(captureText, agent, options = {}) {
   const verb = extractVerb(normalizedStatus);
   const model = extractModelLabel(nonEmptyLines);
   const hasIdlePrompt = detectIdlePrompt(nonEmptyLines, agent);
+  const hasBlockedPrompt = detectBlockedPrompt(nonEmptyLines, agent);
 
   let state = "unknown";
   let confidence = "low";
@@ -363,6 +368,11 @@ export function analyzeTerminalActivity(captureText, agent, options = {}) {
   } else if (/\b(starting mcp servers|booting|loading)\b/u.test(lowerStatus)) {
     state = "starting";
     confidence = "medium";
+  } else if (hasBlockedPrompt) {
+    // Checked ahead of idle: a blocked pane looks idle, and treating it as idle
+    // is what makes a driver send the next prompt into a parked turn.
+    state = "blocked";
+    confidence = "high";
   } else if (hasIdlePrompt) {
     state = "idle_prompt";
     confidence = "medium";
@@ -392,6 +402,7 @@ export function analyzeTerminalActivity(captureText, agent, options = {}) {
     tokens,
     elapsed,
     idle_prompt_visible: hasIdlePrompt,
+    blocked_prompt_visible: hasBlockedPrompt,
     status_line: normalizedStatus || null,
   };
 }
@@ -500,22 +511,15 @@ function extractModelLabel(lines) {
 }
 
 function detectIdlePrompt(lines, agent) {
-  const tailOriginal = lines.slice(-8).join("\n");
-  const tail = normalizeTerminalText(tailOriginal).toLowerCase();
-  if (agent === "claude") {
-    return (
-      /(?:\u276F|\u203A)\s*$/u.test(tailOriginal) ||
-      tail.includes("try \"") ||
-      tail.includes("shift+tab to cycle") ||
-      tail.includes("bypass permissions on")
-    );
-  }
-  return (
-    /(?:\u276F|\u203A)\s*$/u.test(tailOriginal) ||
-    tail.includes("/model to change") ||
-    tail.includes("tip: try the codex app") ||
-    tail.includes("context ")
-  );
+  return isIdlePrompt(tryGetAdapter(agent)?.tui ?? null, lines.join("\n"));
+}
+
+// A pane parked on a plan-approval or ask-the-human step reads as idle to the
+// classifier above, which would make a driver send the next prompt into a turn
+// that can never advance. Adapters declaring `blocked` markers get it reported
+// as its own state instead.
+function detectBlockedPrompt(lines, agent) {
+  return isBlocked(tryGetAdapter(agent)?.tui ?? null, lines.join("\n"));
 }
 
 function buildActivitySummary(state, parts) {
@@ -526,6 +530,8 @@ function buildActivitySummary(state, parts) {
   if (state === "writing") return `Partner appears to be writing or editing${detail}.`;
   if (state === "working") return `Partner appears to be working${detail}.`;
   if (state === "starting") return `Partner appears to be starting up${detail}.`;
+  if (state === "blocked")
+    return `Partner is waiting on a human decision and will not advance on its own${detail}.`;
   if (state === "idle_prompt") return `Partner appears to be at an idle prompt${detail}.`;
   if (state === "not_running") return `Partner tmux session is not running${detail}.`;
   return `Partner activity is unclear${detail}.`;
@@ -561,10 +567,10 @@ function readJson(filePath) {
 }
 
 function buildTmuxArgs(args) {
-  const socketName =
-    process.env.CODEX_DIALOG_TMUX_SOCKET ||
-    process.env.CONDUCTOR_TMUX_SOCKET ||
-    DEFAULT_TMUX_SOCKET_NAME;
+  const socketName = envWithAliases(
+    ["DUALOG_TMUX_SOCKET", "CODEX_DIALOG_TMUX_SOCKET", "CONDUCTOR_TMUX_SOCKET"],
+    DEFAULT_TMUX_SOCKET_NAME
+  );
   const trimmedSocketName = socketName.trim();
   if (!trimmedSocketName || trimmedSocketName.includes("/") || trimmedSocketName.includes("\0")) {
     throw new Error("tmux socket name must be a non-empty name, not a path");

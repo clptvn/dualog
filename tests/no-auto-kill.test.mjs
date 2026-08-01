@@ -3,12 +3,21 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import test from "node:test";
+import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
+import { killTmuxServer } from "./helpers/tmux.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tmuxSocket = `codex-dialog-test-${process.pid}`;
 process.env.CODEX_DIALOG_TMUX_SOCKET = tmuxSocket;
+
+// This suite proves a session is NOT auto-killed, so it necessarily ends with a
+// live session. Owning the socket by pid is what makes tearing the whole server
+// down at file scope compatible with that: the assertion is about dualog's
+// behavior during the test, not about what survives the process.
+after(() => {
+  killTmuxServer(tmuxSocket);
+});
 
 const {
   isTmuxAvailable,

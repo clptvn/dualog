@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// PreToolUse hook for mcp__codex-dialog__send_message.
+// PreToolUse hook for mcp__dualog__send_message.
 // Blocks obvious deferrals of locally testable review findings.
 
 import fs from "fs";

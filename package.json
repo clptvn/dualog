@@ -1,8 +1,8 @@
 {
-  "name": "claude-codex-dialog",
-  "version": "1.0.0",
+  "name": "dualog",
+  "version": "2.0.0",
   "type": "module",
-  "description": "Bidirectional MCP server enabling back-and-forth discussions between Claude Code and Codex CLI",
+  "description": "MCP server for real back-and-forth conversations between two AI coding agents, across any CLI",
   "scripts": {
     "start": "node src/dialog-server.mjs",
     "test": "node --test tests/*.test.mjs",

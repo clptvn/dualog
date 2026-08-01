@@ -1,0 +1,19 @@
+{
+  "fetched_at": "2026-08-01T18:00:00Z",
+  "grok_version": "1.4.0",
+  "auth_method": "oauth",
+  "origin": "https://api.x.ai/v1/models",
+  "etag": "REDACTED",
+  "models": {
+    "grok-4.5": {
+      "supports_reasoning_effort": true,
+      "reasoning_effort": "high",
+      "reasoning_efforts": ["high", "medium", "low"]
+    },
+    "grok-4.3": {
+      "supports_reasoning_effort": true,
+      "reasoning_effort": "high",
+      "reasoning_efforts": ["none", "low", "medium", "high"]
+    }
+  }
+}

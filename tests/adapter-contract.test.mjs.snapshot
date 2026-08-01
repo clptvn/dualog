@@ -1,0 +1,200 @@
+exports[`argv for every adapter and engine 1`] = `
+{
+  "claude/tmux-interactive": {
+    "command": "claude",
+    "args": [
+      "--permission-mode",
+      "bypassPermissions",
+      "--allowedTools",
+      "Read,Grep,Glob,Bash,LSP",
+      "--mcp-config",
+      "<SESSION_DIR>/claude-empty-mcp.json",
+      "--strict-mcp-config",
+      "--add-dir",
+      "/fixture/project",
+      "--add-dir",
+      "<SESSION_DIR>",
+      "--name",
+      "fixture-session",
+      "--disallowedTools",
+      "Edit,MultiEdit,Write,NotebookEdit",
+      "--model",
+      "fixture-model",
+      "--effort",
+      "low"
+    ],
+    "env": {
+      "DUALOG_ROLE": "partner",
+      "DUALOG_DEPTH": "1"
+    }
+  },
+  "codex/tmux-interactive": {
+    "command": "codex",
+    "args": [
+      "-C",
+      "/fixture/project",
+      "--sandbox",
+      "workspace-write",
+      "--add-dir",
+      "<SESSION_DIR>",
+      "--ask-for-approval",
+      "never",
+      "--no-alt-screen",
+      "-c",
+      "approval_policy=\\"never\\"",
+      "--model",
+      "fixture-model",
+      "-c",
+      "model_reasoning_effort=\\"low\\"",
+      "Completion protocol is mandatory: write result.md then done.json"
+    ],
+    "env": {
+      "CODEX_HOME": "<SESSION_DIR>/codex-home",
+      "DUALOG_ROLE": "partner",
+      "DUALOG_DEPTH": "1"
+    }
+  },
+  "cursor/headless": {
+    "command": "cursor-agent",
+    "args": [
+      "--print",
+      "--output-format",
+      "stream-json",
+      "--force",
+      "--model",
+      "fixture-model",
+      "Completion protocol is mandatory: write result.md then done.json"
+    ],
+    "env": {
+      "DUALOG_ROLE": "partner",
+      "DUALOG_DEPTH": "1"
+    }
+  },
+  "goose/headless": {
+    "command": "goose",
+    "args": [
+      "run",
+      "--no-session",
+      "--no-profile",
+      "--with-builtin",
+      "developer",
+      "-q",
+      "--model",
+      "fixture-model",
+      "-t",
+      "Completion protocol is mandatory: write result.md then done.json"
+    ],
+    "env": {
+      "GOOSE_MODE": "auto",
+      "GOOSE_THINKING_EFFORT": "off",
+      "GOOSE_PATH_ROOT": "<SESSION_DIR>/goose-root",
+      "GOOSE_DISABLE_KEYRING": "1",
+      "DUALOG_ROLE": "partner",
+      "DUALOG_DEPTH": "1"
+    }
+  },
+  "grok/headless": {
+    "command": "grok",
+    "args": [
+      "--cwd",
+      "/fixture/project",
+      "--sandbox",
+      "off",
+      "--always-approve",
+      "--no-plan",
+      "--no-ask-user",
+      "--no-leader",
+      "--no-wait-for-background",
+      "--no-auto-update",
+      "--output-format",
+      "json",
+      "-m",
+      "fixture-model",
+      "--reasoning-effort",
+      "none",
+      "-p",
+      "Completion protocol is mandatory: write result.md then done.json"
+    ],
+    "env": {
+      "GROK_CLAUDE_MCPS_ENABLED": "0",
+      "GROK_CURSOR_MCPS_ENABLED": "0",
+      "GROK_FOLDER_TRUST": "0",
+      "GROK_DISABLE_AUTOUPDATER": "1",
+      "GROK_HOME": "<SESSION_DIR>/grok-home",
+      "DUALOG_ROLE": "partner",
+      "DUALOG_DEPTH": "1"
+    }
+  },
+  "grok/tmux-interactive": {
+    "command": "grok",
+    "args": [
+      "--cwd",
+      "/fixture/project",
+      "--sandbox",
+      "off",
+      "--always-approve",
+      "--no-plan",
+      "--no-ask-user",
+      "--no-leader",
+      "--no-auto-update",
+      "--minimal",
+      "--no-alt-screen",
+      "-m",
+      "fixture-model",
+      "--reasoning-effort",
+      "none",
+      "Completion protocol is mandatory: write result.md then done.json"
+    ],
+    "env": {
+      "GROK_CLAUDE_MCPS_ENABLED": "0",
+      "GROK_CURSOR_MCPS_ENABLED": "0",
+      "GROK_FOLDER_TRUST": "0",
+      "GROK_DISABLE_AUTOUPDATER": "1",
+      "GROK_HOME": "<SESSION_DIR>/grok-home",
+      "DUALOG_ROLE": "partner",
+      "DUALOG_DEPTH": "1"
+    }
+  },
+  "opencode/headless": {
+    "command": "opencode",
+    "args": [
+      "run",
+      "--dir",
+      "/fixture/project",
+      "--auto",
+      "--format",
+      "json",
+      "--model",
+      "fixture-model",
+      "--variant",
+      "minimal",
+      "Completion protocol is mandatory: write result.md then done.json"
+    ],
+    "env": {
+      "OPENCODE_CONFIG_DIR": "<SESSION_DIR>/opencode-config",
+      "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+      "XDG_DATA_HOME": "<SESSION_DIR>/opencode-data",
+      "DUALOG_ROLE": "partner",
+      "DUALOG_DEPTH": "1"
+    }
+  },
+  "qwen/headless": {
+    "command": "qwen",
+    "args": [
+      "--approval-mode",
+      "yolo",
+      "--allowed-mcp-server-names",
+      "",
+      "-m",
+      "fixture-model",
+      "-p",
+      "Completion protocol is mandatory: write result.md then done.json"
+    ],
+    "env": {
+      "QWEN_HOME": "<SESSION_DIR>/qwen-home",
+      "DUALOG_ROLE": "partner",
+      "DUALOG_DEPTH": "1"
+    }
+  }
+}
+`;

@@ -1,16 +1,30 @@
 import fs from "fs";
 import path from "path";
-import { dialogsDir } from "./platform.mjs";
+import { dialogsDir, legacyDialogsDir, resolveExistingSessionDir } from "./platform.mjs";
 
 export const DIALOGS_DIR = dialogsDir();
+export const LEGACY_DIALOGS_DIR = legacyDialogsDir();
+export { resolveExistingSessionDir };
 fs.mkdirSync(DIALOGS_DIR, { recursive: true });
+// Agent ids are validated structurally here, not against the adapter registry.
+// This file is copied into the user-level hooks directory by the installer and
+// must stay dependency-light -- importing the registry would drag zod and the
+// whole adapter layer in with it.
+//
+// The authoritative check lives at the MCP tool boundary, where the parameter
+// enum is built from the registry. By the time an id reaches this module it has
+// already been validated; all that is needed here is that it round-trips safely
+// into the conversation log's `from` field.
+const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+/** Retained for callers that want the historical pair. */
 export const KNOWN_AGENTS = ["claude", "codex"];
 const BLOCKING_FINDING_RE =
   /\[(CRITICAL|CORRECTNESS|ARCHITECTURE|SECURITY|ROBUSTNESS|GAP|AMBIGUITY|SCOPE|FEASIBILITY|UX|TESTABILITY)\]/i;
 const REVIEW_STATUS_SCHEMA_VERSION = 1;
 
 export function normalizeAgent(agent, fallback = "codex") {
-  return KNOWN_AGENTS.includes(agent) ? agent : fallback;
+  return typeof agent === "string" && AGENT_ID_PATTERN.test(agent) ? agent : fallback;
 }
 
 export function getSessionHostAgent(status) {
@@ -21,8 +35,19 @@ export function getSessionPartnerAgent(status) {
   return normalizeAgent(status?.partner_agent, "codex");
 }
 
+/**
+ * Human-readable name for an agent id.
+ *
+ * A fallback only. Callers with registry access should prefer the adapter's own
+ * `displayName`, which is the one an adapter author controls (and the only way
+ * to get casing like "opencode" rather than "Opencode").
+ */
 export function getAgentDisplayName(agent) {
-  return normalizeAgent(agent, "codex") === "claude" ? "Claude" : "Codex";
+  const id = normalizeAgent(agent, "codex");
+  return id
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 }
 
 export function isReviewApprovalDialog(problem) {
@@ -322,17 +347,134 @@ function withConvLock(convPath, fn) {
   throw new Error("Failed to acquire conversation lock after retries");
 }
 
+/**
+ * The largest single message that may enter the conversation log.
+ *
+ * The log is append-only and re-read in full by every poll, so an unbounded
+ * message is not just one large allocation -- it becomes a permanent cost paid
+ * several times a second for the rest of the session. Both producers are
+ * capped: the partner through the completion sidecar, and the host through
+ * send_message, which otherwise had no ceiling of any kind.
+ */
+export const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
+
+/**
+ * A whole session's conversation log may not exceed this.
+ *
+ * The per-entry cap bounds one message; it does NOT bound the file, because
+ * nothing limits how many messages a host may append. The round budget counts
+ * PARTNER replies, so a host can append indefinitely -- including after the
+ * runner has exited and nothing is left to consume them. Since every poll
+ * re-reads this file in full, an unbounded log is an unbounded recurring cost,
+ * which is the thing the per-message cap was mistaken for fixing.
+ */
+export const MAX_CONVERSATION_BYTES = 64 * 1024 * 1024;
+
+/**
+ * The id for the next message, in constant time when the cache can be trusted.
+ *
+ * Ids are assigned here and only ever appended, so the next one can be
+ * remembered rather than recomputed. Two earlier attempts at that were wrong in
+ * instructive ways, and the guards below exist because of them:
+ *
+ *  - Reading the last record off a fixed 64 KiB tail broke as soon as a record
+ *    exceeded the window: no parseable line remained in it, so it silently fell
+ *    back to scanning the whole log while holding the lock -- losing the
+ *    optimization exactly when the log was largest.
+ *
+ *  - Caching the bare next id was WORSE THAN THE SCAN. The lock serializes
+ *    writers but does not make the JSONL append and the cache update one
+ *    transaction: a crash between them, or the deliberately swallowed cache
+ *    write failure, leaves a stale value that still looks valid. The next append
+ *    then reuses a live id, and because both runners advance `lastProcessedId`
+ *    to the maximum they have seen and accept only strictly greater ids, the
+ *    duplicated message is skipped permanently rather than merely misnumbered.
+ *
+ * So the cache records the log SIZE it describes. If the file is not exactly
+ * that long, the cache does not describe it and is ignored. Interruption at any
+ * point leaves a size mismatch, which costs one rebuild scan -- never a
+ * duplicate id.
+ */
+function messageIdCachePath(convPath) {
+  return `${convPath}.next-id`;
+}
+
+function readMessageIdCache(convPath, currentSize) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(messageIdCachePath(convPath), "utf-8"));
+    const nextId = parsed?.next_id;
+    const bytes = parsed?.bytes;
+    if (!Number.isSafeInteger(nextId) || nextId <= 0) return null;
+    if (!Number.isSafeInteger(bytes) || bytes !== currentSize) return null;
+    return nextId;
+  } catch {
+    return null;
+  }
+}
+
+function nextMessageId(sessionDir, convPath, currentSize) {
+  // An empty log always restarts at 1, whatever a stale cache claims.
+  if (currentSize === 0) return 1;
+
+  const cached = readMessageIdCache(convPath, currentSize);
+  if (cached !== null) return cached;
+
+  const messages = readConversation(sessionDir);
+  const maxId = messages.reduce((max, m) => {
+    const n = m?.id;
+    return typeof n === "number" && Number.isSafeInteger(n) && n > max ? n : max;
+  }, 0);
+  return maxId + 1;
+}
+
 export function appendMessage(sessionDir, from, content) {
   const convPath = resolveConvPath(sessionDir);
+  const text = String(content ?? "");
+  const bytes = Buffer.byteLength(text, "utf-8");
+  if (bytes > MAX_MESSAGE_BYTES) {
+    throw new Error(
+      `Message is ${bytes} bytes, past the ${MAX_MESSAGE_BYTES}-byte limit for one conversation entry. ` +
+        `The log is re-read in full on every poll, so an oversized entry is a cost paid for the whole session.`
+    );
+  }
+
   return withConvLock(convPath, () => {
-    const messages = readConversation(sessionDir);
-    const maxId = messages.reduce((max, m) => {
-      const n = m?.id;
-      return typeof n === "number" && Number.isSafeInteger(n) && n > max ? n : max;
-    }, 0);
-    const id = maxId + 1;
-    const msg = { id, from, content, timestamp: new Date().toISOString() };
-    fs.appendFileSync(convPath, JSON.stringify(msg) + "\n");
+    // Enforced inside the lock, against the size on disk, so concurrent
+    // appenders cannot each observe a log that is under the limit and together
+    // push it past.
+    let currentSize = 0;
+    try {
+      currentSize = fs.statSync(convPath).size;
+    } catch {
+      /* not created yet */
+    }
+    if (currentSize + bytes > MAX_CONVERSATION_BYTES) {
+      throw new Error(
+        `This session's conversation log would exceed ${MAX_CONVERSATION_BYTES} bytes ` +
+          `(currently ${currentSize}, adding ${bytes}). The log is re-read in full on every ` +
+          `poll, so it cannot grow without bound. End this session and start another.`
+      );
+    }
+
+    const id = nextMessageId(sessionDir, convPath, currentSize);
+    const msg = { id, from, content: text, timestamp: new Date().toISOString() };
+    const line = JSON.stringify(msg) + "\n";
+    fs.appendFileSync(convPath, line);
+
+    try {
+      // Stamped with the size this value describes. A crash between the append
+      // above and this write, or a failure of this write, leaves the recorded
+      // size disagreeing with the file -- which the reader treats as "does not
+      // describe this log" and rebuilds from. That is what makes the cache safe
+      // to lose rather than a source of duplicate ids.
+      fs.writeFileSync(
+        messageIdCachePath(convPath),
+        JSON.stringify({ next_id: id + 1, bytes: currentSize + Buffer.byteLength(line, "utf-8") })
+      );
+    } catch {
+      // Advisory: a missing or unwritable cache costs one full scan on the next
+      // append, never correctness.
+    }
     return msg;
   });
 }

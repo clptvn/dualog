@@ -1,0 +1,53 @@
+{
+  "id": "opencode",
+  "displayName": "opencode",
+  "binary": {
+    "default": "opencode",
+    "versionArgs": ["--version"],
+    "installHint": "curl -fsSL https://opencode.ai/install | bash"
+  },
+  "engines": { "default": "headless", "allowed": ["headless"] },
+  "capabilities": {
+    "modelFlag": true,
+    "reasoningEffort": true,
+    "toolProfiles": "prompt-only",
+    "addDir": false,
+    "writesFiles": true,
+    "tuiDrivable": "risky"
+  },
+  "reasoningEfforts": ["minimal", "low", "medium", "high", "max"],
+  "effortDelivery": "argv",
+  "models": [],
+  "discovery": {
+    "strategy": "cli-command",
+    "format": "opencode-models",
+    "args": ["models"]
+  },
+  "defaultToolProfile": "read",
+  "toolProfiles": {},
+  "mcp": { "strategy": "none" },
+  "configIsolation": {
+    "env": "OPENCODE_CONFIG_DIR",
+    "dir": "{{sessionDir}}/opencode-config",
+    "seedFromEnv": "OPENCODE_CONFIG_DIR",
+    "seedFromFallback": "{{home}}/.config/opencode",
+    "copyIfExists": ["auth.json"],
+    "extraEnv": {
+      "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+      "XDG_DATA_HOME": "{{sessionDir}}/opencode-data"
+    }
+  },
+  "promptDelivery": { "headless": "argv" },
+  "argv": {
+    "headless": [
+      { "args": ["run", "--dir", "{{projectPath}}", "--auto", "--format", "json"] },
+      { "when": { "set": "model" }, "args": ["--model", "{{model}}"] },
+      {
+        "when": { "set": "reasoningEffort" },
+        "args": ["--variant", "{{reasoningEffort}}"]
+      },
+      { "args": ["{{initialPrompt}}"] }
+    ]
+  },
+  "completion": { "sidecar": "always", "stdoutTrustworthy": false }
+}

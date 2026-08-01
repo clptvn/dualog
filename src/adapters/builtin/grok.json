@@ -1,0 +1,114 @@
+{
+  "id": "grok",
+  "displayName": "Grok Build",
+  "binary": {
+    "default": "grok",
+    "versionArgs": ["--version"],
+    "installHint": "curl -fsSL https://x.ai/cli/install.sh | bash"
+  },
+  "engines": { "default": "headless", "allowed": ["headless", "tmux-interactive"] },
+  "capabilities": {
+    "modelFlag": true,
+    "reasoningEffort": true,
+    "toolProfiles": "prompt-only",
+    "addDir": false,
+    "writesFiles": true,
+    "tuiDrivable": "yes"
+  },
+  "reasoningEfforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+  "effortDelivery": "argv",
+  "models": [
+    { "id": "grok-build" },
+    {
+      "id": "grok-4.5",
+      "efforts": ["low", "medium", "high"],
+      "defaultEffort": "high"
+    },
+    { "id": "grok-4.3", "efforts": ["none", "low", "medium", "high"] },
+    { "id": "grok-build-0.1" }
+  ],
+  "discovery": {
+    "strategy": "local-cache",
+    "format": "grok-cache",
+    "path": "{{configHome}}/models_cache.json",
+    "originListUrlEnv": "GROK_MODELS_LIST_URL",
+    "originBaseUrlEnv": "GROK_MODELS_BASE_URL",
+    "catalogProvider": "xai"
+  },
+  "defaultToolProfile": "read",
+  "toolProfiles": {},
+  "mcp": { "strategy": "config-dir" },
+  "configIsolation": {
+    "env": "GROK_HOME",
+    "dir": "{{sessionDir}}/grok-home",
+    "seedFromEnv": "GROK_HOME",
+    "seedFromFallback": "{{home}}/.grok",
+    "copyIfMissing": ["auth.json"],
+    "copyIfExists": ["trusted_folders.toml"]
+  },
+  "env": {
+    "GROK_CLAUDE_MCPS_ENABLED": "0",
+    "GROK_CURSOR_MCPS_ENABLED": "0",
+    "GROK_FOLDER_TRUST": "0",
+    "GROK_DISABLE_AUTOUPDATER": "1"
+  },
+  "promptDelivery": { "headless": "argv", "tmux-interactive": "argv" },
+  "argv": {
+    "headless": [
+      {
+        "args": [
+          "--cwd", "{{projectPath}}",
+          "--sandbox", "off",
+          "--always-approve",
+          "--no-plan",
+          "--no-ask-user",
+          "--no-leader",
+          "--no-wait-for-background",
+          "--no-auto-update",
+          "--output-format", "json"
+        ]
+      },
+      { "when": { "set": "model" }, "args": ["-m", "{{model}}"] },
+      { "when": { "set": "reasoningEffort" }, "args": ["--reasoning-effort", "{{reasoningEffort}}"] },
+      { "args": ["-p", "{{initialPrompt}}"] }
+    ],
+    "tmux-interactive": [
+      {
+        "args": [
+          "--cwd", "{{projectPath}}",
+          "--sandbox", "off",
+          "--always-approve",
+          "--no-plan",
+          "--no-ask-user",
+          "--no-leader",
+          "--no-auto-update",
+          "--minimal",
+          "--no-alt-screen"
+        ]
+      },
+      { "when": { "set": "model" }, "args": ["-m", "{{model}}"] },
+      { "when": { "set": "reasoningEffort" }, "args": ["--reasoning-effort", "{{reasoningEffort}}"] },
+      { "args": ["{{initialPrompt}}"] }
+    ]
+  },
+  "tui": {
+    "readyAll": [],
+    "readyAny": ["minimal · /help"],
+    "notReady": ["Starting session…"],
+    "busy": ["working…"],
+    "idle": ["minimal · /help"],
+    "blocked": ["Plan ready for review", "Waiting on answers for"],
+    "startupPrompts": [
+      {
+        "kind": "workspace_trust",
+        "description": "trusted-directory option",
+        "input": "y",
+        "matchAll": ["Do you trust the contents of this directory", "No, quit"]
+      }
+    ],
+    "exitKeys": ["C-q", "C-q"],
+    "usesAltScreen": false,
+    "suppressStartupWhenReady": true
+  },
+  "completion": { "sidecar": "always", "stdoutTrustworthy": false }
+}

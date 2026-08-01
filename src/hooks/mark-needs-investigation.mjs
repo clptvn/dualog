@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// PostToolUse hook for codex-dialog response-reading tools. Parses responses,
+// PostToolUse hook for dualog response-reading tools. Parses responses,
 // extracts validated referenced_files, and writes them to a session-scoped
 // marker file.
 
@@ -60,7 +60,7 @@ const hasTaggedFindings = msgs.some(
 );
 if (referencedFiles.length === 0 && !hasTaggedFindings) process.exit(0);
 
-const marker = path.join(os.tmpdir(), `codex-required-reads-${sessionId}`);
+const marker = path.join(os.tmpdir(), `dualog-required-reads-${sessionId}`);
 
 // Don't overwrite an existing marker — investigation is still in progress
 if (fs.existsSync(marker)) process.exit(0);

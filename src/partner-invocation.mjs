@@ -1,4 +1,5 @@
 import fs from "fs";
+import { envWithAliases } from "./platform.mjs";
 import path from "path";
 import crypto from "crypto";
 import { getAgentDisplayName, normalizeAgent } from "./shared.mjs";
@@ -19,6 +20,24 @@ import {
   CLAUDE_REASONING_EFFORTS,
   CODEX_REASONING_EFFORTS,
 } from "./runtime-defaults.mjs";
+import { buildInvocationFromAdapter } from "./adapters/argv.mjs";
+// Imported rather than redefined. A recursion guard with two definitions is a
+// recursion guard that can drift, and only one of them would be the one a real
+// spawn uses.
+import { partnerSentinelEnv } from "./adapters/env.mjs";
+import { resolveDiscoveryForValidation } from "./adapters/resolve-for-validation.mjs";
+import { getAdapter, tryGetAdapter } from "./adapters/registry.mjs";
+import {
+  isReady,
+  detectStartupPrompt as detectStartupPromptFromTui,
+} from "./tui/markers.mjs";
+import {
+  SUBMISSION_MARKER,
+  buildBootstrapPrompt,
+  readCompletion,
+} from "./engines/completion.mjs";
+import { resolveEngine } from "./engines/index.mjs";
+import { runHeadlessTurn } from "./engines/headless.mjs";
 
 const VALID_CODEX_EFFORTS = new Set(CODEX_REASONING_EFFORTS);
 const VALID_CLAUDE_EFFORTS = new Set(CLAUDE_REASONING_EFFORTS);
@@ -27,8 +46,22 @@ const CLAUDE_READ_TOOLS = "Read,Grep,Glob,Bash,LSP";
 const CLAUDE_IMPLEMENTATION_TOOLS =
   "Read,Grep,Glob,Bash,LSP,Edit,MultiEdit,Write";
 const CLAUDE_READ_DISALLOWED_TOOLS = "Edit,MultiEdit,Write,NotebookEdit";
-const POST_SUBMIT_VERIFY_MS = 30000;
-const POST_SUBMIT_RETRY_MS = 15000;
+const POST_SUBMIT_VERIFY_MS = parsePositiveInt(
+  envWithAliases(["DUALOG_POST_SUBMIT_VERIFY_MS", "CODEX_DIALOG_POST_SUBMIT_VERIFY_MS"]),
+  30000
+);
+const POST_SUBMIT_RETRY_MS = parsePositiveInt(
+  envWithAliases(["DUALOG_POST_SUBMIT_RETRY_MS", "CODEX_DIALOG_POST_SUBMIT_RETRY_MS"]),
+  15000
+);
+const POST_SUBMIT_RETRY_TRIGGER_MS = parsePositiveInt(
+  envWithAliases(["DUALOG_POST_SUBMIT_RETRY_TRIGGER_MS", "CODEX_DIALOG_POST_SUBMIT_RETRY_TRIGGER_MS"]),
+  5000
+);
+const TERMINAL_FAILURE_CHECK_INTERVAL_MS = parsePositiveInt(
+  envWithAliases(["DUALOG_TERMINAL_FAILURE_CHECK_MS", "CODEX_DIALOG_TERMINAL_FAILURE_CHECK_MS"]),
+  5000
+);
 
 export class PartnerTurnCancelledError extends Error {
   constructor(message) {
@@ -42,11 +75,66 @@ export function isPartnerTurnCancelledError(err) {
   return Boolean(err?.cancelledByEndDialog);
 }
 
+export class PartnerTerminalFailureError extends Error {
+  constructor(message, failureCode = "terminal_failure") {
+    super(message);
+    this.name = "PartnerTerminalFailureError";
+    this.partnerTerminalFailed = true;
+    this.failureCode = failureCode;
+  }
+}
+
+export function isPartnerTerminalFailureError(err) {
+  return Boolean(err?.partnerTerminalFailed);
+}
+
+export function detectPartnerTerminalFailure(captureText) {
+  const recentLines = String(captureText || "").split(/\r?\n/u).slice(-50);
+  const text = normalizeCapturedText(recentLines.join("\n"));
+  if (!text) return null;
+
+  const failures = [
+    {
+      code: "usage_limit",
+      pattern:
+        /\b(?:you(?:'|’)ve hit your (?:monthly spend|session|usage|rate) limit|usage limit (?:has been )?reached|rate limit (?:has been )?reached|insufficient[_ ]quota|credit balance is too low)\b/iu,
+      summary: "the partner CLI reported an account usage, spend, or rate limit",
+    },
+    {
+      code: "policy_block",
+      pattern:
+        /\b(?:safeguards flagged this message|Claude Code can(?:not|'t|’t) respond to this request)\b/iu,
+      summary: "the partner CLI reported a terminal policy or safeguard refusal",
+    },
+    {
+      code: "authentication_required",
+      pattern:
+        /\b(?:authentication required|not logged in|please (?:run|use) \/?login|401 unauthorized|account has been disabled)\b/iu,
+      summary: "the partner CLI reported an authentication or account failure",
+    },
+  ];
+
+  for (const failure of failures) {
+    if (failure.pattern.test(text)) {
+      return { code: failure.code, summary: failure.summary };
+    }
+  }
+  return null;
+}
+
 function normalizeToolProfile(toolProfile) {
   return VALID_TOOL_PROFILES.has(toolProfile) ? toolProfile : "read";
 }
 
-function buildInvocation({
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// Exported for the golden argv snapshots. Those snapshots are the regression
+// proof for the adapter-registry refactor: the registry-driven argv builder
+// must reproduce this function's output byte for byte.
+export function buildInvocation({
   partnerAgent,
   partnerCommand,
   projectPath,
@@ -91,7 +179,7 @@ function buildInvocation({
     if (reasoningEffort && VALID_CLAUDE_EFFORTS.has(reasoningEffort)) {
       args.push("--effort", reasoningEffort);
     }
-    return { command: partnerCommand, args };
+    return { command: partnerCommand, args, env: partnerSentinelEnv() };
   }
 
   const args = [
@@ -119,7 +207,7 @@ function buildInvocation({
   return {
     command: partnerCommand,
     args,
-    env: prepareCodexPartnerEnv(sessionDir),
+    env: { ...prepareCodexPartnerEnv(sessionDir), ...partnerSentinelEnv() },
     usesInitialPrompt: Boolean(initialPrompt),
   };
 }
@@ -177,15 +265,25 @@ export async function runPartnerCommand({
   tempPrefix,
   responseInstruction,
   sessionDir,
+  engine: requestedEngine = null,
+  // Decided by the start-tool preflight and carried through the runner. Without
+  // it the turn re-validates on stricter terms than the start call used and
+  // rejects a model the caller explicitly allowed.
+  allowUnknownModel = false,
 }) {
   const normalizedAgent = normalizeAgent(partnerAgent, "codex");
-  const partnerDisplay = getAgentDisplayName(normalizedAgent);
+  const partnerDisplay =
+    tryGetAdapter(normalizedAgent)?.displayName ?? getAgentDisplayName(normalizedAgent);
   const normalizedToolProfile = normalizeToolProfile(toolProfile);
 
   if (!sessionDir) {
-    throw new Error("Interactive partner invocation requires sessionDir");
+    throw new Error("Partner invocation requires sessionDir");
   }
-  if (!(await isTmuxAvailable())) {
+
+  const resolvedAdapter = getAdapter(normalizedAgent);
+  const engine = resolveEngine(resolvedAdapter, { requested: requestedEngine, log });
+
+  if (engine === "tmux-interactive" && !(await isTmuxAvailable())) {
     throw new Error("tmux is required for interactive partner sessions but was not found on PATH");
   }
 
@@ -201,6 +299,34 @@ export async function runPartnerCommand({
   const capturePath = path.join(turnDir, "terminal-capture.txt");
   fs.writeFileSync(promptPath, prompt);
 
+  if (engine === "headless") {
+    return (
+      await runHeadlessTurn({
+        adapter: resolvedAdapter,
+        partnerCommand,
+        bootstrap: buildBootstrapPrompt({
+          promptPath,
+          resultPath,
+          donePath,
+          projectPath,
+          responseInstruction,
+        }),
+        projectPath,
+        sessionDir,
+        turnDir,
+        resultPath,
+        donePath,
+        model,
+        reasoningEffort,
+        allowUnknownModel,
+        toolProfile: normalizedToolProfile,
+        timeoutMs,
+        log,
+        endSignalPath: path.join(sessionDir, "end_signal"),
+      })
+    ).trim();
+  }
+
   const sessionName = buildTmuxSessionName(
     path.basename(sessionDir),
     turnId
@@ -213,17 +339,54 @@ export async function runPartnerCommand({
     projectPath,
     responseInstruction,
   });
-  const { command, args, env, usesInitialPrompt } = buildInvocation({
-    partnerAgent: normalizedAgent,
-    partnerCommand,
-    projectPath,
-    sessionDir,
+  // Whether the bootstrap goes in argv or gets pasted into the TUI is the
+  // adapter's call, not a hardcoded per-agent branch: pass it either way and
+  // let promptDelivery decide.
+  const adapter = getAdapter(normalizedAgent);
+  // The same catalog the start-tool preflight validated against. Without it this
+  // check falls back to the manifest, and a live catalog that has widened a
+  // model's effort set would let a session start and then have its every turn
+  // refused here -- the two disagreeing about the same pair.
+  const discoveredModels = await resolveDiscoveryForValidation(adapter, {
     model,
-    reasoningEffort,
-    toolProfile: normalizedToolProfile,
-    sessionName,
-    initialPrompt: normalizedAgent === "codex" ? bootstrap : null,
+    projectPath,
+    log,
   });
+  const { command, args, env, usesInitialPrompt, notices } =
+    buildInvocationFromAdapter(adapter, {
+      partnerCommand,
+      projectPath,
+      sessionDir,
+      sessionName,
+      model,
+      reasoningEffort,
+      toolProfile: normalizedToolProfile,
+      initialPrompt: bootstrap,
+      discoveredModels,
+      applyOperatorDefault: true,
+      allowUnknownModel,
+    });
+
+  // A dropped or adjusted option must be reported. If the host asked for an
+  // effort level this partner cannot honor, it needs to know that before it
+  // reasons about the reply as though the setting had applied.
+  for (const notice of notices) {
+    log(`Adapter "${adapter.id}": ${notice.message}`);
+  }
+
+  // Logging alone was not enough. The runner's log is not visible to the host,
+  // so an error-severity finding -- an effort this MODEL rejects, say -- would
+  // drop the flag, start the turn anyway, and leave the session reporting a
+  // setting that was never applied. Refuse instead: the same check runs in
+  // preflightPartner() before a session exists, so reaching here means the
+  // options changed underneath us or a caller bypassed the start tools.
+  const blocking = notices.filter((notice) => notice.severity === "error");
+  if (blocking.length) {
+    throw new Error(
+      `Adapter "${adapter.id}" cannot run this turn as requested: ` +
+        blocking.map((notice) => notice.message).join("; ")
+    );
+  }
 
   const timeoutHint =
     typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
@@ -346,16 +509,32 @@ export async function runPartnerCommand({
       finalCapturePath = capturePath;
     }
     const cancelled = isPartnerTurnCancelledError(err);
-    if (handle && cancelled) {
+
+    // Once a pane exists, every exit from this function must take it down.
+    //
+    // Cleanup used to run only for cancellation and PartnerTerminalFailureError,
+    // leaving any other exception's pane alive under status
+    // "error_waiting_for_end". Nothing ever attached to such a pane -- that
+    // status is written here and read nowhere -- so it was not a resume path,
+    // just a pane nobody owned. It also could not be reclaimed later:
+    // terminateCurrentPartnerTerminal() resolves exactly one handle out of
+    // current_terminal.json, and the next turn overwrites that file. A single
+    // ordinary error (a partner naming a result_path outside its turn directory
+    // trips a plain Error in readCompletion) was enough to strand a pane for the
+    // lifetime of the session.
+    if (handle) {
       try {
         await terminateTmuxSession(handle);
       } catch (cleanupErr) {
         log(`Failed to terminate ${partnerDisplay} tmux session: ${cleanupErr.message}`);
       }
     }
+
     const { last } = readTerminalState(sessionDir);
     const alreadyTerminated =
       last?.session_name === state.session_name && last.status === "terminated";
+    // Report what is actually true after cleanup rather than assuming it worked:
+    // a pane that survived termination is a fact the host needs.
     const terminalStillAlive = handle
       ? await isTmuxSessionAlive(handle.sessionName).catch(() => false)
       : false;
@@ -367,7 +546,7 @@ export async function runPartnerCommand({
           status: cancelled
             ? "cancelled"
             : terminalStillAlive
-              ? "error_waiting_for_end"
+              ? "error_terminal_leaked"
               : "failed",
           ...(terminalStillAlive ? {} : { completed_at: new Date().toISOString() }),
           last_capture_path: finalCapturePath,
@@ -378,38 +557,6 @@ export async function runPartnerCommand({
     }
     throw err;
   }
-}
-
-function buildBootstrapPrompt({
-  partnerDisplay,
-  promptPath,
-  resultPath,
-  donePath,
-  projectPath,
-  responseInstruction,
-}) {
-  return `Read the prompt file at:
-${promptPath}
-
-Follow the prompt exactly for the project at:
-${projectPath}
-
-${responseInstruction || "Produce the requested response."}
-
-Completion protocol is mandatory:
-1. Do all investigation or implementation work requested by the prompt.
-2. Write ONLY the final message that should be sent back to the host agent to:
-${resultPath}
-3. Then write this JSON object to:
-${donePath}
-
-{"status":"ok","result_path":"${jsonEscape(resultPath)}","summary":"completed","error":null}
-
-If you cannot complete the work, still write a useful final message to the result file, then write done.json with "status":"error" and a concise non-empty "error" string.
-
-Use shell/Bash commands for these sidecar writes if file-write tools are unavailable in this session.
-
-Do not stop after printing to the terminal. The host will not receive your response until both sidecar files exist.`;
 }
 
 async function waitForInteractiveReady({
@@ -431,10 +578,11 @@ async function waitForInteractiveReady({
     }
     if (!(await isTmuxSessionAlive(handle.sessionName))) {
       const persistedCapturePath = persistCaptureText(capturePath, lastSnapshot, log);
-      throw new Error(
+      throw new PartnerTerminalFailureError(
         `${partnerDisplay} tmux session exited before the interactive prompt was ready` +
           (lastSnapshot ? `; terminal: ${lastSnapshot.slice(-1000)}` : "") +
-          (persistedCapturePath ? `; capture: ${persistedCapturePath}` : "")
+          (persistedCapturePath ? `; capture: ${persistedCapturePath}` : ""),
+        "terminal_exited"
       );
     }
     try {
@@ -442,6 +590,7 @@ async function waitForInteractiveReady({
     } catch {
       lastSnapshot = "";
     }
+    throwIfPartnerTerminalFailed(lastSnapshot, partnerDisplay, agent);
 
     const startupPrompt = lastSnapshot
       ? detectStartupPrompt(agent, lastSnapshot)
@@ -495,6 +644,7 @@ async function waitForPromptSubmission({
   let deadline = startedAt + POST_SUBMIT_VERIFY_MS;
   let retriedEnter = false;
   let lastSnapshot = "";
+  let submissionObserved = false;
 
   while (Date.now() <= deadline) {
     if (fs.existsSync(endSignalPath)) {
@@ -503,7 +653,10 @@ async function waitForPromptSubmission({
     if (fs.existsSync(donePath) || fs.existsSync(resultPath)) return;
 
     if (!(await isTmuxSessionAlive(handle.sessionName))) {
-      throw new Error(`${partnerDisplay} tmux session exited after prompt submission`);
+      throw new PartnerTerminalFailureError(
+        `${partnerDisplay} tmux session exited after prompt submission`,
+        "terminal_exited"
+      );
     }
 
     try {
@@ -511,6 +664,10 @@ async function waitForPromptSubmission({
       persistCaptureText(capturePath, lastSnapshot, log);
     } catch {
       lastSnapshot = "";
+    }
+    throwIfPartnerTerminalFailed(lastSnapshot, partnerDisplay, agent);
+    if (lastSnapshot.includes(SUBMISSION_MARKER)) {
+      submissionObserved = true;
     }
 
     const activity = analyzeTerminalActivity(lastSnapshot, agent, { alive: true });
@@ -526,7 +683,7 @@ async function waitForPromptSubmission({
 
     if (
       !retriedEnter &&
-      Date.now() - startedAt > 5000 &&
+      Date.now() - startedAt > POST_SUBMIT_RETRY_TRIGGER_MS &&
       isInteractiveReady(agent, lastSnapshot)
     ) {
       log(`${partnerDisplay} still appears idle after prompt paste; retrying Enter once`);
@@ -536,6 +693,16 @@ async function waitForPromptSubmission({
     }
 
     await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  const finalActivity = analyzeTerminalActivity(lastSnapshot, agent, {
+    alive: true,
+  });
+  if (!submissionObserved && finalActivity.state === "idle_prompt") {
+    throw new PartnerTerminalFailureError(
+      `${partnerDisplay} prompt submission failed: the partner remained at its input prompt and the submitted turn was never observed`,
+      "prompt_submission_failed"
+    );
   }
 
   log(
@@ -557,6 +724,7 @@ async function waitForSidecarCompletion({
 }) {
   const endSignalPath = path.join(sessionDir, "end_signal");
   let lastProgressLog = 0;
+  let lastFailureCheck = 0;
 
   while (true) {
     if (fs.existsSync(endSignalPath)) {
@@ -566,8 +734,9 @@ async function waitForSidecarCompletion({
     const completion = readCompletion({ turnDir, resultPath, donePath });
     if (completion) {
       if (completion.status === "error") {
-        throw new Error(
-          `${partnerDisplay} reported an interactive turn error: ${completion.error || completion.result}`
+        throw new PartnerTerminalFailureError(
+          `${partnerDisplay} reported an interactive turn error: ${completion.error || completion.result}`,
+          "sidecar_error"
         );
       }
       return completion.result;
@@ -576,18 +745,30 @@ async function waitForSidecarCompletion({
     if (!(await isTmuxSessionAlive(handle.sessionName))) {
       const persistedCapture = readOptionalText(capturePath);
       const inspection = await inspectPartnerTerminal(sessionDir).catch(() => null);
-      throw new Error(
+      throw new PartnerTerminalFailureError(
         `${partnerDisplay} tmux session exited before writing completion sidecars` +
           (persistedCapture ? `; terminal: ${persistedCapture.slice(-1000)}` : "") +
           (!persistedCapture && inspection?.capture?.text
             ? `; terminal: ${inspection.capture.text.slice(-1000)}`
-            : "")
+            : ""),
+        "terminal_exited"
       );
     }
 
-    if (Date.now() - lastProgressLog > 60000) {
-      lastProgressLog = Date.now();
+    const now = Date.now();
+    const shouldLogProgress = now - lastProgressLog > 60000;
+    if (
+      shouldLogProgress ||
+      now - lastFailureCheck > TERMINAL_FAILURE_CHECK_INTERVAL_MS
+    ) {
+      lastFailureCheck = now;
       const capture = await captureAndPersist(handle, capturePath, log);
+      throwIfPartnerTerminalFailed(capture?.text, partnerDisplay, agent);
+      if (!shouldLogProgress) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        continue;
+      }
+      lastProgressLog = now;
       const activity = analyzeTerminalActivity(capture?.text || "", agent, {
         alive: true,
       });
@@ -600,57 +781,33 @@ async function waitForSidecarCompletion({
   }
 }
 
-function readCompletion({ turnDir, resultPath, donePath }) {
-  try {
-    fs.statSync(donePath);
-  } catch (err) {
-    if (isTransientFsError(err)) return null;
-    throw err;
+function throwIfPartnerTerminalFailed(captureText, partnerDisplay, agent) {
+  const failure = detectPartnerTerminalFailure(captureText);
+  if (!failure) return;
+  const activity = analyzeTerminalActivity(captureText, agent, { alive: true });
+  if (
+    [
+      "thinking",
+      "working",
+      "running_command",
+      "reading",
+      "writing",
+      "starting",
+    ].includes(activity.state)
+  ) {
+    return;
   }
+  throw new PartnerTerminalFailureError(
+    `${partnerDisplay} interactive turn cannot continue because ${failure.summary}`,
+    failure.code
+  );
+}
 
-  let done;
-  try {
-    done = JSON.parse(fs.readFileSync(donePath, "utf-8"));
-  } catch {
-    return null;
-  }
-
-  const status = done?.status === "error" ? "error" : "ok";
-  const selectedResultPath =
-    typeof done?.result_path === "string" && done.result_path.trim()
-      ? done.result_path
-      : resultPath;
-  const resolvedResultPath = assertPathInside(turnDir, selectedResultPath);
-  let resultExists = false;
-  try {
-    resultExists = fs.statSync(resolvedResultPath).isFile();
-  } catch (err) {
-    if (!isTransientFsError(err)) throw err;
-  }
-  if (!resultExists) {
-    if (status === "error") {
-      return {
-        status,
-        result: "",
-        error: typeof done?.error === "string" ? done.error : "Partner reported an error before writing a result file",
-      };
-    }
-    return null;
-  }
-  let realResultPath;
-  let result;
-  try {
-    realResultPath = assertRealPathInside(turnDir, resolvedResultPath);
-    result = fs.readFileSync(realResultPath, "utf-8");
-  } catch (err) {
-    if (isTransientFsError(err)) return null;
-    throw err;
-  }
-  return {
-    status,
-    result,
-    error: typeof done?.error === "string" ? done.error : null,
-  };
+function normalizeCapturedText(captureText) {
+  return String(captureText || "")
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
 }
 
 async function captureAndPersist(handle, capturePath, log) {
@@ -697,128 +854,21 @@ function isInteractiveBusy(agent, snapshot) {
   ].includes(activity.state);
 }
 
-function isInteractiveReady(agent, snapshot) {
-  if (agent === "claude") {
-    const hasClaudeHeader =
-      /Claude Code v\d+\.\d+\.\d+/u.test(snapshot) ||
-      snapshot.includes("Claude Code v");
-    const hasPromptUi =
-      snapshot.includes('Try "') ||
-      snapshot.includes("shift+tab to cycle") ||
-      snapshot.includes("bypass permissions on") ||
-      snapshot.includes("plan mode on");
-    return hasClaudeHeader && hasPromptUi;
-  }
+// Readiness and startup-interstitial detection are adapter data now. These
+// wrappers keep the existing call sites unchanged while the matching itself
+// comes from the manifest's marker sets. See src/tui/markers.mjs for the scope
+// rules, which are not uniform across marker classes.
+function adapterTuiFor(agent) {
+  return tryGetAdapter(agent)?.tui ?? null;
+}
 
-  const tail = snapshot.slice(-2000);
-  if (tail.includes("Booting MCP server") || /model:\s+loading/u.test(tail)) {
-    return false;
-  }
-  const hasCodexHeader =
-    /OpenAI Codex \(v\d+\.\d+\.\d+\)/u.test(snapshot) ||
-    snapshot.includes("OpenAI Codex");
-  const hasPromptUi =
-    snapshot.includes("›") ||
-    snapshot.includes("Context ") ||
-    snapshot.includes("/model to change") ||
-    snapshot.includes("Tip: Try the Codex App");
-  return hasCodexHeader && hasPromptUi;
+function isInteractiveReady(agent, snapshot) {
+  return isReady(adapterTuiFor(agent), snapshot);
 }
 
 function detectStartupPrompt(agent, snapshot) {
-  const tail = snapshot.slice(-4000);
-  const lowerTail = tail.toLowerCase();
-  if (agent === "claude") {
-    if (isInteractiveReady(agent, snapshot)) return null;
-    if (
-      snapshot.includes("Quick safety check") &&
-      snapshot.includes("Yes, I trust this folder") &&
-      snapshot.includes("No, exit")
-    ) {
-      return {
-        kind: "workspace_trust",
-        input: "1",
-        description: "trusted-folder option",
-      };
-    }
-    if (
-      lowerTail.includes("bypass permissions") &&
-      (lowerTail.includes("warning") || lowerTail.includes("mode")) &&
-      (
-        lowerTail.includes("yes, i accept") ||
-        /^\s*(?:\d+[\).]?\s*)?(?:yes|accept|continue)\b.*(?:accept|bypass|permission|continue)/imu.test(tail)
-      ) &&
-      /^[^\w\n]*(?:\d+[\).]?\s*)?(?:no|cancel|exit)\b/imu.test(tail)
-    ) {
-      return {
-        kind: "bypass_permissions_warning",
-        input: "2",
-        description: "bypass-permissions confirmation",
-      };
-    }
-    if (
-      lowerTail.includes("choose") &&
-      (lowerTail.includes("theme") || lowerTail.includes("text style"))
-    ) {
-      return {
-        kind: "theme_picker",
-        input: "",
-        description: "default theme selection",
-      };
-    }
-    return null;
-  }
-  if (
-    snapshot.includes("Do you trust the contents of this directory") &&
-    snapshot.includes("Yes, continue") &&
-    snapshot.includes("No, quit")
-  ) {
-    return {
-      kind: "workspace_trust",
-      input: "1",
-      description: "trusted-directory option",
-    };
-  }
-  if (
-    snapshot.includes("Do you trust") &&
-    snapshot.includes("Trusting the directory") &&
-    snapshot.includes("No, quit")
-  ) {
-    return {
-      kind: "workspace_trust",
-      input: "1",
-      description: "trusted-directory option",
-    };
-  }
-  return null;
-}
-
-function assertPathInside(rootDir, targetPath) {
-  const root = path.resolve(rootDir);
-  const resolved = path.isAbsolute(targetPath)
-    ? path.resolve(targetPath)
-    : path.resolve(root, targetPath);
-  const rel = path.relative(root, resolved);
-  if (rel.startsWith("..") || path.isAbsolute(rel)) {
-    throw new Error(`Completion result path is outside the turn directory: ${targetPath}`);
-  }
-  return resolved;
-}
-
-function isTransientFsError(err) {
-  return ["ENOENT", "ENOTDIR", "EAGAIN", "EBUSY"].includes(err?.code);
-}
-
-function assertRealPathInside(rootDir, targetPath) {
-  const root = fs.realpathSync(rootDir);
-  const resolved = fs.realpathSync(targetPath);
-  const rel = path.relative(root, resolved);
-  if (rel.startsWith("..") || path.isAbsolute(rel)) {
-    throw new Error(`Completion result path resolves outside the turn directory: ${targetPath}`);
-  }
-  return resolved;
-}
-
-function jsonEscape(value) {
-  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const tui = adapterTuiFor(agent);
+  return detectStartupPromptFromTui(tui, snapshot, {
+    readyWins: Boolean(tui?.suppressStartupWhenReady),
+  });
 }

@@ -1,0 +1,188 @@
+{
+  "id": "claude",
+  "displayName": "Claude",
+
+  "binary": {
+    "default": "claude",
+    "versionArgs": ["--version"],
+    "installHint": "https://docs.anthropic.com/en/docs/claude-code"
+  },
+
+  "engines": {
+    "default": "tmux-interactive",
+    "allowed": ["tmux-interactive"]
+  },
+
+  "capabilities": {
+    "modelFlag": true,
+    "reasoningEffort": true,
+    "toolProfiles": "flags",
+    "addDir": true,
+    "writesFiles": true,
+    "tuiDrivable": "yes"
+  },
+
+  "reasoningEfforts": ["low", "medium", "high", "xhigh", "max"],
+  "effortDelivery": "argv",
+  "models": [
+    {
+      "id": "claude-fable-5",
+      "efforts": ["low", "medium", "high", "xhigh", "max"],
+      "defaultEffort": "high"
+    },
+    {
+      "id": "claude-opus-5",
+      "efforts": ["low", "medium", "high", "xhigh", "max"],
+      "defaultEffort": "high"
+    },
+    {
+      "id": "claude-sonnet-5",
+      "efforts": ["low", "medium", "high", "xhigh", "max"],
+      "defaultEffort": "high"
+    },
+    {
+      "id": "claude-mythos-5",
+      "efforts": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "id": "claude-opus-4-8",
+      "efforts": ["low", "medium", "high", "xhigh", "max"],
+      "defaultEffort": "high"
+    },
+    {
+      "id": "claude-opus-4-8[1m]",
+      "efforts": ["low", "medium", "high", "xhigh", "max"],
+      "defaultEffort": "high"
+    },
+    {
+      "id": "claude-opus-4-7[1m]",
+      "efforts": ["low", "medium", "high", "xhigh", "max"],
+      "defaultEffort": "xhigh"
+    },
+    {
+      "id": "claude-opus-4-6[1m]",
+      "efforts": ["low", "medium", "high", "max"]
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "efforts": ["low", "medium", "high", "max"]
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "efforts": []
+    }
+  ],
+
+  "discovery": {
+    "strategy": "sdk-control",
+    "format": "claude-list-models",
+    "catalogProvider": "anthropic"
+  },
+
+  "defaultToolProfile": "read",
+  "toolProfiles": {
+    "read": {
+      "allowedTools": "Read,Grep,Glob,Bash,LSP",
+      "disallowedTools": "Edit,MultiEdit,Write,NotebookEdit"
+    },
+    "implementation": {
+      "allowedTools": "Read,Grep,Glob,Bash,LSP,Edit,MultiEdit,Write"
+    }
+  },
+
+  "mcp": {
+    "strategy": "empty-config-file",
+    "path": "{{sessionDir}}/claude-empty-mcp.json",
+    "content": { "mcpServers": {} }
+  },
+
+  "configIsolation": null,
+
+  "promptDelivery": { "tmux-interactive": "tui-paste" },
+
+  "argv": {
+    "tmux-interactive": [
+      {
+        "args": [
+          "--permission-mode",
+          "bypassPermissions",
+          "--allowedTools",
+          "{{toolProfileAllowedTools}}",
+          "--mcp-config",
+          "{{mcpConfigPath}}",
+          "--strict-mcp-config",
+          "--add-dir",
+          "{{projectPath}}",
+          "--add-dir",
+          "{{sessionDir}}",
+          "--name",
+          "{{sessionName}}"
+        ]
+      },
+      {
+        "when": { "set": "toolProfileDisallowedTools" },
+        "args": ["--disallowedTools", "{{toolProfileDisallowedTools}}"]
+      },
+      { "when": { "set": "model" }, "args": ["--model", "{{model}}"] },
+      {
+        "when": { "set": "reasoningEffort" },
+        "args": ["--effort", "{{reasoningEffort}}"]
+      }
+    ]
+  },
+
+  "tui": {
+    "readyAll": ["Claude Code v"],
+    "readyAny": [
+      "Try \"",
+      "shift+tab to cycle",
+      "bypass permissions on",
+      "plan mode on"
+    ],
+    "notReady": [],
+    "idle": [
+      "re:[\\u276F\\u203A]\\s*$",
+      "try \"",
+      "shift+tab to cycle",
+      "bypass permissions on"
+    ],
+    "blocked": [],
+    "startupPrompts": [
+      {
+        "kind": "workspace_trust",
+        "description": "trusted-folder option",
+        "input": "1",
+        "matchAll": [
+          "Quick safety check",
+          "Yes, I trust this folder",
+          "No, exit"
+        ]
+      },
+      {
+        "kind": "bypass_permissions_warning",
+        "description": "bypass-permissions confirmation",
+        "input": "2",
+        "matchAll": [
+          "re:bypass permissions",
+          "re:warning|mode",
+          "re:/^[^\\w\\n]*(?:\\d+[\\).]?\\s*)?(?:no|cancel|exit)\\b/imu"
+        ],
+        "matchAny": [
+          "re:yes, i accept",
+          "re:/^\\s*(?:\\d+[\\).]?\\s*)?(?:yes|accept|continue)\\b.*(?:accept|bypass|permission|continue)/imu"
+        ]
+      },
+      {
+        "kind": "theme_picker",
+        "description": "default theme selection",
+        "input": "",
+        "matchAll": ["re:choose", "re:theme|text style"]
+      }
+    ],
+    "suppressStartupWhenReady": true,
+    "exitCommand": "/exit",
+    "usesAltScreen": false
+  },
+
+  "completion": { "sidecar": "always", "stdoutTrustworthy": false }
+}

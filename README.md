@@ -1,260 +1,181 @@
-# claude-codex-dialog
+# dualog
 
-A bidirectional MCP server for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex). It runs background review/dialog runners so either tool can host the conversation while the other acts as the reviewing partner.
+An MCP server that lets one AI coding agent hold a real, multi-round conversation
+with a **different** AI coding agent running in its own CLI — for code review,
+plan review, spec review, and audits.
 
-## Features
+Two agents, one dialog. Neither is the tool of the other; they argue.
 
-- **Bidirectional host support** — Claude can host Codex reviews, or Codex can host Claude reviews
-- **General Dialog** — open-ended technical discussions between the two agents
-- **Code Review** — the partner agent auto-generates an initial review from a git diff
-- **Plan Review** — adversarial review of implementation plans before code is written
-- **Spec Review** — adversarial review of product/feature specs before planning or implementation
-- **Code Audit** — deep audits of existing files for bugs, architecture issues, robustness, and security
-- **UI implementation partnership** — Codex can delegate frontend/UI implementation to Claude Opus 4.7 while Codex owns backend/API/data integration
-- **Claude-only enforcement hooks** — optional guardrails on the Claude side; no equivalent Codex hooks are installed
+```
+Claude Code  ──►  dualog  ──►  Codex / Grok / opencode / Qwen / Cursor / …
+     ▲                              │
+     └──────────  findings  ◄────────┘
+```
 
-## How it works
+The partner is not called through an API. It is the **real CLI**, running in a
+detached tmux session or headlessly, with its own auth, its own tools, and its
+own opinions.
 
-### Dialog mode
-1. The host agent calls `start_dialog`
-2. The server spawns a background runner for the configured partner agent
-3. The host sends messages with `send_message`
-4. The runner starts the real interactive partner CLI in a detached tmux session, pastes the prompt into the TUI, waits for sidecar completion files, and appends replies to `conversation.jsonl`
-5. The conversation continues until ended or the hard round cap is reached
+## Supported agents
 
-### Code review mode
-1. The host agent calls `start_code_review`
-2. The server generates a git diff and spawns a review runner
-3. The partner agent auto-generates an initial review from the diff
-4. The host reads findings via `check_messages`, investigates, fixes or rebuts, and replies with `send_message`
-5. The review continues until MCP responses report `review_status.approved: true`, the hard cap is reached, or the session is ended
+Run `list_adapters` to see which are installed on your machine.
 
-Session data is stored under `~/.claude/dialogs/`.
+| Agent | id | Engine | Notes |
+| --- | --- | --- | --- |
+| Claude Code | `claude` | tmux | Renders inline, no alt screen — the best TUI target |
+| Codex | `codex` | tmux | `--oss --local-provider ollama` drives local models with no extra setup |
+| Grok Build | `grok` | tmux or headless | Positional prompt seeds the TUI, so no keystroke injection |
+| opencode | `opencode` | headless | Best route to local/OSS models via an OpenAI-compatible base URL |
+| Qwen Code | `qwen` | headless | Full `OPENAI_BASE_URL` support (Ollama, LM Studio, vLLM, OpenRouter) |
+| Cursor Agent | `cursor` | headless | |
+| Goose | `goose` | headless | |
 
-## Prerequisites
+Anything else is a JSON file away — see **[docs/adding-an-agent.md](docs/adding-an-agent.md)**,
+which includes ready-made recipes for aider, crush, copilot, droid, amp,
+openhands, continue, and cline.
 
-- [Node.js](https://nodejs.org/) >= 18
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) on your `PATH` if you want Claude-hosted commands or Claude as a review partner
-- [Codex CLI](https://github.com/openai/codex) on your `PATH` if you want Codex-hosted skills or Codex as a review partner
-- `tmux` on your `PATH` for partner sessions. The server uses detached tmux sessions and does not open terminal windows.
-
-For the full bidirectional install, both CLIs should be available.
-
-macOS, Linux, and WSL are supported when `tmux` is installed. Native Windows can still run the installer wrappers, but partner sessions require a tmux-capable environment such as WSL.
+Gemini is deliberately **not** shipped: Google stopped serving Gemini CLI
+requests for the free tier, AI Pro, AI Ultra, and individual Code Assist on
+2026-06-18, and its `isHeadlessMode()` checks `CI=true` unconditionally, which
+makes the TUI unreachable in most agent harnesses. `qwen` is the actively
+maintained fork and covers the same ground.
 
 ## Install
 
-macOS, Linux, WSL, Git Bash, or Windows PowerShell:
-
 ```bash
-git clone https://github.com/clptvn/claude-codex-dialog.git
-cd claude-codex-dialog
-npm run setup
+git clone https://github.com/clptvn/dualog.git
+cd dualog
+npm run setup            # or: --claude | --codex | --both
 ```
 
-Default install mode is `--both`, which does all of the following:
+Requires Node ≥ 18, `tmux` for tmux-engine partners, and whichever agent CLIs
+you actually want to use. macOS, Linux, and WSL.
 
-- registers the MCP server for Claude
-- installs Claude slash commands:
-  - `/codex-review-code`
-  - `/codex-review-plan`
-  - `/codex-review-spec`
-  - `/codex-audit`
-- installs Claude-only investigation hooks
-- registers the MCP server for Codex
-- installs Codex skills:
-  - `/claude-review-code`
-  - `/claude-review-plan`
-  - `/claude-review-spec`
-  - `/claude-audit`
-  - `/claude-ui-implementer`
+Upgrading from `claude-codex-dialog`? The installer migrates you: it removes the
+old `codex-dialog` MCP registration, rewrites hook matchers, and deletes the old
+slash commands. The tool namespace moves from `mcp__codex-dialog__*` to
+`mcp__dualog__*`, so this is a clean break rather than a dual-registration.
+Existing sessions under `~/.claude/dialogs` stay readable.
 
-You can also install only one side:
+## Use
 
-```bash
-npm run setup -- --claude
-npm run setup -- --codex
-npm run setup -- --both
+```
+/dualog-review-code                       review uncommitted changes
+/dualog-review-code staged security       narrow the diff and the focus
+/dualog-review-plan path/to/plan.md
+/dualog-review-spec docs/specs/foo.md
+/dualog-audit src/
 ```
 
-POSIX shell wrappers are still available:
+Add `partner:<agent-id>` to any of them to choose who reviews.
 
-```bash
-./install.sh --claude
-./install.sh --codex
-./install.sh --both
-```
+## Tools
 
-PowerShell wrappers are also available:
+`start_dialog`, `start_code_review`, `send_message`, `check_messages`,
+`wait_for_partner_response`, `get_full_history`, `get_review_summary`,
+`check_partner_alive`, `end_dialog`, `list_sessions`, and:
 
-```powershell
-.\install.ps1 -Claude
-.\install.ps1 -Codex
-.\install.ps1 -Both
-```
+- **`list_adapters`** — every agent this server can drive, its capabilities, and
+  whether its binary is actually installed
+- **`check_adapter`** — preflight one agent against the options you intend to
+  use, before starting a session
 
-To uninstall:
+## How a turn works
 
-```bash
-npm run uninstall
-```
+1. The full prompt is written to `turns/<id>/prompt.md`.
+2. The partner CLI is launched — in tmux, or headlessly.
+3. It is handed a short bootstrap that points at the prompt file and states the
+   completion protocol.
+4. It does the work, writes `result.md`, then `done.json`.
+5. The runner reads the sidecars and appends the reply to `conversation.jsonl`.
 
-Or remove only one side:
+The indirection through files is deliberate: terminal output is wrapped,
+truncated, interleaved with tool chatter, and in most CLIs impossible to
+delimit. `done.json` also proves the partner actually had working write
+access — a capability several CLIs revoke silently in headless mode.
 
-```bash
-./uninstall.sh --claude
-./uninstall.sh --codex
-./uninstall.sh --both
-```
+Turns are never killed by a wall-clock timeout. The host inspects the pane with
+`check_partner_alive` and calls `end_dialog` when a partner is genuinely stuck.
 
-Or in PowerShell:
+## Adding an agent
 
-```powershell
-.\uninstall.ps1 -Claude
-.\uninstall.ps1 -Codex
-.\uninstall.ps1 -Both
-```
-
-Restart the relevant CLI after installation or uninstall so it reloads MCP config and commands/skills.
-
-## MCP Tools
-
-### Dialog
-
-| Tool | Description |
-|------|-------------|
-| `start_dialog` | Start a new dialog session with a configurable host/partner agent pair |
-
-### Code Review
-
-| Tool | Description |
-|------|-------------|
-| `start_code_review` | Start a review session where the configured partner auto-generates an initial review from a git diff |
-| `get_review_summary` | Get review metadata, structured findings, and `review_status` approval state |
-
-### Shared
-
-| Tool | Description |
-|------|-------------|
-| `send_message` | Send a message from the host agent into an ongoing session |
-| `check_messages` | Read new partner messages, current runner status, and parsed `review_status` |
-| `wait_for_partner_response` | Long-poll until the partner replies, the session reaches a terminal condition, or this wait call times out |
-| `get_full_history` | Get the complete conversation history |
-| `check_partner_alive` | Check runner status, inferred partner activity, and a compact tail of the live or saved tmux pane |
-| `end_dialog` | End the session and return the final conversation |
-| `list_sessions` | List all dialog and review sessions |
-
-`review_status` uses closed enum values:
-
-- `state`: `approved`, `changes_requested`, `needs_discussion`, `in_progress`, `hard_cap_reached`
-- `verdict`: `APPROVE`, `CHANGES_REQUESTED`, `NEEDS_DISCUSSION`, `IN_PROGRESS`, `HARD_CAP_REACHED`, or `null`
-- `source`: `structured_verdict`, `legacy_lgtm`, `legacy_approve`, `blocking_findings`, `hard_cap`, `none`
-- `close_allowed_reason`: `approved`, `hard_cap`, or `null`
-- Always-present fields: `schema_version`, `state`, `approved`, `close_allowed`, `close_allowed_reason`, `verdict`, `source`, `source_message_id`, `partner_agent`, `allows_approve_verdict`, and `hard_cap_reached`
-
-### Waiting for partner responses
-
-Use `wait_for_partner_response` instead of repeatedly polling while the background runner is invoking the partner CLI.
-
-- After `start_code_review`, call `wait_for_partner_response` with `since_id: 0` to wait for the initial review.
-- After `send_message`, call `wait_for_partner_response` with `since_id` set to the returned `message_id`.
-- The default wait timeout is 10 minutes. Explicit waits only bound the MCP wait call; they do not kill the partner. If a wait returns `timeout_processing`, call `check_partner_alive` and inspect `partner_terminal.activity` plus `partner_terminal.capture.tail_text` to decide whether it is making progress, stuck, or should be ended.
-- The tool returns the same public payload as `check_messages`, plus `wait_result`, `waited_ms`, `timed_out`, and `next_since_id`.
-- `wait_result` is one of `message`, `error`, `runner_exited`, `ended`, `hard_cap`, `timeout_processing`, `timeout_idle`, or `cancelled`.
-
-## Usage
-
-### In Claude Code
-
-After Claude-side install:
-
-```text
-/codex-review-code
-/codex-review-code staged security
-/codex-review-plan path/to/plan.md
-/codex-review-spec docs/specs/foo.md
-/codex-audit src/
-```
-
-### In Codex
-
-After Codex-side install:
-
-```text
-/claude-review-code
-/claude-review-code staged security
-/claude-review-plan path/to/plan.md
-/claude-review-spec docs/specs/foo.md
-/claude-audit src/
-/claude-ui-implementer implement the settings billing UI
-```
-
-## Configuration
-
-Defaults preserve the original flow:
-
-- `host_agent` defaults to `claude`
-- `partner_agent` defaults to `codex`
-- `partner_command` defaults based on `partner_agent`
-
-To invert the flow, set:
-
-- `host_agent: "codex"`
-- `partner_agent: "claude"`
-
-Both `start_dialog` and `start_code_review` also accept:
-
-- `partner_command`
-- `model`: forwarded to the selected partner CLI. Codex examples: `gpt-5.6` (the Sol alias), `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`. Claude examples: `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-8[1m]`, `claude-opus-4-7[1m]`, `claude-opus-4-6[1m]`, `claude-sonnet-4-6`. Claude Fable 5 has 1M context by default; do not add a `[1m]` suffix.
-- `reasoning_effort`: defaults to `high` when omitted. Codex accepts `low`, `medium`, `high`, `xhigh`, GPT-5.6's `max` effort, and the Codex-only `ultra` mode for GPT-5.6 Sol and Terra.
-- `max_rounds`
-- `partner_timeout_ms`: backward-compatible wait hint for clients that choose their own `wait_for_partner_response.timeout_ms`. Defaults to `900000` (15 minutes). It no longer kills partner CLI turns.
-
-Partner runtime details:
-
-- Claude partners run through the real interactive `claude` CLI in tmux. The server does not use `claude -p` or the Agent SDK. Claude partner sessions use an empty strict MCP config so nested partner turns do not recursively load the host's MCP servers.
-- Codex partners run through the real interactive `codex` CLI in tmux. The server does not use `codex exec` for partner turns. Codex partner turns use a per-session `CODEX_HOME` with copied auth and no user MCP config, so nested Codex does not recursively boot the host's MCP servers.
-- GPT-5.6 is currently a limited preview in Codex and the API, and is not yet available in ChatGPT. Selecting a GPT-5.6 model requires a provisioned Codex workspace and a Codex CLI version whose model catalog includes it.
-- tmux sessions use the dedicated `codex-dialog` tmux socket by default, isolated from the user's normal tmux server and config. Override with `CODEX_DIALOG_TMUX_SOCKET` if needed.
-- Completion is delivered through per-turn sidecar files under `~/.claude/dialogs/<session_id>/turns/`.
-- `check_partner_alive` includes `partner_terminal.activity`, which summarizes whether the partner appears to be thinking, reading/searching files, running a command, writing, starting, idle, or unknown. When visible, it also extracts the model label, status verb, elapsed time, and token count from the CLI status line.
-- `check_partner_alive` returns only `partner_terminal.capture.tail_text` by default, capped to a few bottom pane lines to avoid filling the caller's context window. Pass `include_full_capture: true` only when you intentionally need the full bounded pane capture.
-- Active partner turns are not killed by wall-clock timeout. This is intentional: the host agent should inspect the pane and call `end_dialog` when a partner is actually stuck, rather than relying on a blind timer for large reviews.
-- Once a partner turn starts, pane activity classification is diagnostic only. Idle, unknown, or unchanged activity never times out or terminates the tmux session; the turn waits for explicit completion, partner-process exit, or `end_dialog`.
-- Inactive runners with no active turn self-shutdown after `CODEX_DIALOG_IDLE_SHUTDOWN_MS` milliseconds, defaulting to 24 hours, so abandoned sessions do not poll forever.
-- Runner shutdown and server restart do not sweep or terminate active `ccd-*` sessions. The `end_dialog` tool is the explicit cleanup path; manual emergency cleanup remains available with `tmux -L codex-dialog kill-server`.
-- During long turns the runner periodically saves pane captures, so a later partner crash can report the last observed terminal tail or full saved capture path instead of only saying the tmux session disappeared.
-
-`start_dialog` also accepts:
-
-- `tool_profile`: `read` by default. Claude read-profile sessions disallow the known file-edit tools in addition to prompting for read-only behavior, but Bash remains available for inspection commands. Use `implementation` only when the partner should edit files, such as the `/claude-ui-implementer` Codex skill.
-- `subject_path`: optional path to a reviewed document, such as a plan or spec. The dialog runner rereads this file before every partner turn and includes the current contents as authoritative context.
-- `subject_kind`: optional label for `subject_path`: `plan`, `spec`, or `document`.
-
-The server still accepts `codex_command` for backward compatibility, and also accepts `claude_command` when Claude is the configured partner.
-
-## Round budget
-
-Each session has a soft round budget, default `5`, with a hard cap of `soft + 5`.
-
-Every `check_messages`, `wait_for_partner_response`, `send_message`, and `check_partner_alive` response includes:
+A manifest, dropped in a directory. No source changes:
 
 ```json
 {
-  "max_rounds": 5,
-  "hard_cap": 10,
-  "rounds_used": 2,
-  "rounds_remaining": 3,
-  "hard_rounds_remaining": 8,
-  "past_soft_cap": false
+  "id": "mycli",
+  "displayName": "My CLI",
+  "binary": { "default": "mycli" },
+  "engines": { "default": "headless", "allowed": ["headless"] },
+  "capabilities": { "modelFlag": true, "reasoningEffort": false,
+                    "toolProfiles": "none", "addDir": false,
+                    "writesFiles": true, "tuiDrivable": "no" },
+  "mcp": { "strategy": "none" },
+  "promptDelivery": { "headless": "argv" },
+  "argv": { "headless": [
+    { "args": ["run", "--yes"] },
+    { "when": { "set": "model" }, "args": ["--model", "{{model}}"] },
+    { "args": ["{{initialPrompt}}"] }
+  ] },
+  "completion": { "sidecar": "always", "stdoutTrustworthy": false }
 }
 ```
 
-The runners explicitly instruct the partner agent to deliver complete feedback each round instead of drip-feeding findings.
+Save to `~/.config/dualog/adapters/mycli.json`. Manifests merge by `id`, so you
+can also patch a shipped adapter — point it at a wrapper script, add env vars,
+retune markers — without forking.
 
-## Hooks
+Validation is strict and every error names the file it came from. The contract
+suite in `npm test` runs over every registered adapter automatically.
 
-The investigation-enforcement hooks are installed only for Claude-hosted flows. They are intentionally not installed for Codex-hosted flows.
+## Recursion guard
+
+Every spawned partner gets `DUALOG_ROLE=partner` and an incremented
+`DUALOG_DEPTH`. A nested copy of this server sees the sentinel and serves an
+empty tool list instead of recursing.
+
+This is unconditional and does not depend on per-CLI cooperation, which matters:
+several agent CLIs have no reliable "disable MCP" switch, and some read MCP
+config from `homedir()` regardless of their config-dir override. Env inherits
+transitively, so it also covers partner-spawns-partner.
+
+## Configuration
+
+`start_dialog` and `start_code_review` accept `partner_agent`, `partner_command`,
+`model`, `reasoning_effort`, `max_rounds`, `tool_profile`, `subject_path`.
+
+Model strings are forwarded verbatim; unknown values pass through with a warning
+rather than being rejected, because vendors ship new ids continuously. Reasoning
+effort **is** validated against the chosen agent — an unsupported effort flag can
+stop a CLI from starting — and a dropped option is reported back to the caller
+rather than silently ignored.
+
+Environment: `DUALOG_TMUX_SOCKET`, `DUALOG_TMUX_BINARY`, `DUALOG_IDLE_SHUTDOWN_MS`,
+`DUALOG_STRATEGY`, `DUALOG_ADAPTER_PATH`, `DUALOG_MAX_DEPTH`. The former
+`CODEX_DIALOG_*` names still work as aliases.
+
+Sessions live in `~/.dualog/sessions/`.
+
+## Round budget
+
+Soft default 5 rounds, hard cap soft + 5. Every response carries
+`{max_rounds, hard_cap, rounds_used, rounds_remaining, hard_rounds_remaining,
+past_soft_cap}`. Partners are told to deliver complete feedback each round
+rather than drip-feeding findings across rounds.
+
+## Testing
+
+```bash
+npm test                 # contract suite, argv snapshots, marker equivalence, engines
+npm run smoke:wait-tool  # boots the real MCP server over stdio
+```
+
+Most supported CLIs are not installed on any given machine and have no free
+tier, so everything except the vendor's own behavior is made testable:
+schema validation, golden argv snapshots, fake CLI binaries driven through the
+real engines, and marker matching replayed against recorded pane transcripts
+with a cross-contamination guard (one agent's idle markers must never match
+another's busy screen).
 
 ## License
 

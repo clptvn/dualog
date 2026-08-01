@@ -9,6 +9,7 @@
  */
 
 import fs from "fs";
+import { envWithAliases } from "./platform.mjs";
 import path from "path";
 import {
   appendMessage,
@@ -19,11 +20,18 @@ import {
 } from "./shared.mjs";
 import {
   isPartnerTurnCancelledError,
+  isPartnerTerminalFailureError,
   runPartnerCommand,
 } from "./partner-invocation.mjs";
 import {
-  DEFAULT_REASONING_EFFORT,
-  normalizeReasoningEffortForAgent,
+  markSessionRunnerExited,
+  readRunnerToken,
+} from "./runner-lifecycle.mjs";
+import { tryGetAdapter } from "./adapters/registry.mjs";
+import { terminateActiveHeadlessTurnsAndWait } from "./engines/headless.mjs";
+import {
+  MAX_REVIEW_DIFF_CHARS,
+  requestedReasoningEffortForAdapter,
 } from "./runtime-defaults.mjs";
 
 const sessionDir = process.argv[2];
@@ -31,24 +39,33 @@ const projectPath = process.argv[3] || process.cwd();
 const partnerCommand = process.argv[4] || "codex";
 const SOFT_CAP = parseInt(process.argv[5], 10) || 5;
 const HARD_CAP = SOFT_CAP + 5;
-const RAW_REASONING_EFFORT = process.argv[6] || DEFAULT_REASONING_EFFORT;
+const RAW_REASONING_EFFORT = process.argv[6] || null;
 const PARTNER_MODEL = process.argv[7] || null;
 const HOST_AGENT = normalizeAgent(process.argv[8], "claude");
 const PARTNER_AGENT = normalizeAgent(process.argv[9], "codex");
-const REASONING_EFFORT = normalizeReasoningEffortForAgent(
-  RAW_REASONING_EFFORT,
-  PARTNER_AGENT
-);
+// Defaulted from the adapter, never validated here: the adapter layer owns the
+// per-CLI and per-model menus, and a second opinion in this file is how "high"
+// came to be handed to CLIs that expose no effort control at all.
+const REASONING_EFFORT = requestedReasoningEffortForAdapter(RAW_REASONING_EFFORT);
 const DEFAULT_PARTNER_TIMEOUT_MS = 15 * 60 * 1000;
 const PARTNER_TIMEOUT_MS =
   Math.max(1000, parseInt(process.argv[10], 10)) || DEFAULT_PARTNER_TIMEOUT_MS;
+const RUNNER_TOKEN = readRunnerToken();
+// Read as a flag, not by index: the preflight already decided this, and the
+// turn must validate the model on the same terms or it will reject an id the
+// start call deliberately allowed.
+const ALLOW_UNKNOWN_MODEL = process.argv.includes("--allow-unknown-model");
 
 if (!sessionDir || HOST_AGENT === PARTNER_AGENT) {
   process.exit(1);
 }
 
-const HOST_DISPLAY = getAgentDisplayName(HOST_AGENT);
-const PARTNER_DISPLAY = getAgentDisplayName(PARTNER_AGENT);
+// Prefer the adapter's own display name; getAgentDisplayName is only a
+// title-cased fallback for ids with no manifest (it cannot know that
+// "opencode" is not "Opencode").
+const HOST_DISPLAY = tryGetAdapter(HOST_AGENT)?.displayName ?? getAgentDisplayName(HOST_AGENT);
+const PARTNER_DISPLAY =
+  tryGetAdapter(PARTNER_AGENT)?.displayName ?? getAgentDisplayName(PARTNER_AGENT);
 const DIFF_PATH = path.join(sessionDir, "diff.patch");
 const REFRESHED_DIFF_PATH = path.join(sessionDir, "diff_refreshed.patch");
 const META_PATH = path.join(sessionDir, "review_meta.json");
@@ -60,11 +77,13 @@ const LOG_PATH = path.join(sessionDir, "runner.log");
 const MAX_TURNS = HARD_CAP;
 const POLL_INTERVAL_MS = 5000;
 const IDLE_SHUTDOWN_MS = parsePositiveInt(
-  process.env.CODEX_DIALOG_IDLE_SHUTDOWN_MS,
+  envWithAliases(["DUALOG_IDLE_SHUTDOWN_MS", "CODEX_DIALOG_IDLE_SHUTDOWN_MS"]),
   24 * 60 * 60 * 1000
 );
 const MAX_CONVERSATION_MESSAGES = 20;
-const MAX_DIFF_CHARS = 50000;
+// Shared with the server so start_code_review can tell the host how much of the
+// diff its partner will actually be handed.
+const MAX_DIFF_CHARS = MAX_REVIEW_DIFF_CHARS;
 
 function parsePositiveInt(value, fallback) {
   const parsed = Number.parseInt(value, 10);
@@ -78,13 +97,31 @@ function log(msg) {
 
 let terminatingFromSignal = false;
 
-function exitFromSignal(signal) {
+async function exitFromSignal(signal) {
   if (terminatingFromSignal) return;
   terminatingFromSignal = true;
   log(`${signal} received; exiting runner without terminating the active partner terminal`);
+  // A tmux pane is deliberately preserved -- it is recorded in
+  // current_terminal.json and can be inspected or terminated later. A headless
+  // child has no such handle, so leaving it running orphans it for good.
+  //
+  // Awaited, not fire-and-forget: escalation to SIGKILL has to happen BEFORE
+  // process.exit(), or the timer carrying it dies with this process and a child
+  // that ignores SIGTERM outlives the runner that owned it.
+  try {
+    const signalled = await terminateActiveHeadlessTurnsAndWait();
+    if (signalled) log(`Terminated ${signalled} headless partner process(es) on ${signal}`);
+  } catch (err) {
+    log(`Failed to terminate headless partner process(es): ${err.message}`);
+  }
   try {
     fs.unlinkSync(PROCESSING_PATH);
   } catch {}
+  markSessionRunnerExited(sessionDir, {
+    runnerToken: RUNNER_TOKEN,
+    reason: signal,
+    exitCode: 0,
+  });
   process.exit(0);
 }
 
@@ -264,6 +301,8 @@ async function main() {
   let partnerTurns = 0;
   let lastActivityTime = Date.now();
   let consecutiveErrors = 0;
+  let exitReason = "hard_cap";
+  let initialTerminalFailure = false;
   const MAX_CONSECUTIVE_ERRORS = 3;
 
   log("=== Review runner started ===");
@@ -291,6 +330,7 @@ async function main() {
       projectPath,
       model: PARTNER_MODEL,
       reasoningEffort: REASONING_EFFORT,
+      allowUnknownModel: ALLOW_UNKNOWN_MODEL,
       timeoutMs: PARTNER_TIMEOUT_MS,
       log,
       tempPrefix: `${PARTNER_AGENT}-review`,
@@ -316,6 +356,9 @@ async function main() {
         "system",
         `Failed to generate initial review: ${err.message}. ${HOST_DISPLAY} can still send messages to retry.`
       );
+      if (isPartnerTerminalFailureError(err)) {
+        initialTerminalFailure = true;
+      }
     }
   }
 
@@ -323,9 +366,21 @@ async function main() {
     fs.unlinkSync(PROCESSING_PATH);
   } catch {}
 
+  if (initialTerminalFailure) {
+    log("Partner terminal reached a definitive failure; exiting runner after cleanup");
+    appendMessage(
+      sessionDir,
+      "system",
+      "Review runner stopped after a definitive partner terminal failure. Start a new review after resolving the partner CLI error."
+    );
+    log("=== Review runner exiting ===");
+    return "partner_terminal_failure";
+  }
+
   while (partnerTurns < MAX_TURNS) {
     if (fs.existsSync(END_SIGNAL_PATH)) {
       log("End signal detected, shutting down gracefully");
+      exitReason = "end_signal";
       break;
     }
 
@@ -375,6 +430,7 @@ async function main() {
           projectPath,
           model: PARTNER_MODEL,
           reasoningEffort: REASONING_EFFORT,
+      allowUnknownModel: ALLOW_UNKNOWN_MODEL,
           timeoutMs: PARTNER_TIMEOUT_MS,
           log,
           tempPrefix: `${PARTNER_AGENT}-review`,
@@ -392,6 +448,7 @@ async function main() {
       } catch (err) {
         if (isPartnerTurnCancelledError(err) || fs.existsSync(END_SIGNAL_PATH)) {
           log(`Review turn ${partnerTurns + 1} cancelled by end_dialog`);
+          exitReason = "end_signal";
           try {
             fs.unlinkSync(PROCESSING_PATH);
           } catch {}
@@ -407,6 +464,17 @@ async function main() {
           `${err.message}\n\nConsecutive errors: ${consecutiveErrors}`
         );
 
+        if (isPartnerTerminalFailureError(err)) {
+          log("Partner terminal reached a definitive failure; exiting runner after cleanup");
+          appendMessage(
+            sessionDir,
+            "system",
+            `Review runner stopped after a definitive partner terminal failure: ${err.message}. Start a new review after resolving the partner CLI error.`
+          );
+          exitReason = "partner_terminal_failure";
+          break;
+        }
+
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
           log("Too many consecutive errors, shutting down");
           appendMessage(
@@ -414,6 +482,7 @@ async function main() {
             "system",
             `Review runner encountered ${MAX_CONSECUTIVE_ERRORS} consecutive errors and is shutting down. Last error: ${err.message}`
           );
+          exitReason = "consecutive_errors";
           break;
         }
       }
@@ -428,6 +497,7 @@ async function main() {
         "system",
         "Review runner shut down due to inactivity while no partner turn was active. Start a new review to continue."
       );
+      exitReason = "idle_shutdown";
       break;
     }
 
@@ -448,12 +518,26 @@ async function main() {
   } catch {}
 
   log("=== Review runner exiting ===");
+  return exitReason;
 }
 
-main().catch((err) => {
-  log(`Fatal error: ${err.message}\n${err.stack}`);
-  try {
-    fs.writeFileSync(ERROR_PATH, `Fatal: ${err.message}`);
-  } catch {}
-  process.exit(1);
-});
+main()
+  .then((reason) => {
+    markSessionRunnerExited(sessionDir, {
+      runnerToken: RUNNER_TOKEN,
+      reason,
+      exitCode: 0,
+    });
+  })
+  .catch((err) => {
+    log(`Fatal error: ${err.message}\n${err.stack}`);
+    try {
+      fs.writeFileSync(ERROR_PATH, `Fatal: ${err.message}`);
+    } catch {}
+    markSessionRunnerExited(sessionDir, {
+      runnerToken: RUNNER_TOKEN,
+      reason: "fatal_error",
+      exitCode: 1,
+    });
+    process.exit(1);
+  });

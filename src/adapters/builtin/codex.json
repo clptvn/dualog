@@ -1,0 +1,156 @@
+{
+  "id": "codex",
+  "displayName": "Codex",
+
+  "binary": {
+    "default": "codex",
+    "versionArgs": ["--version"],
+    "installHint": "https://github.com/openai/codex"
+  },
+
+  "engines": {
+    "default": "tmux-interactive",
+    "allowed": ["tmux-interactive"]
+  },
+
+  "capabilities": {
+    "modelFlag": true,
+    "reasoningEffort": true,
+    "toolProfiles": "prompt-only",
+    "addDir": true,
+    "writesFiles": true,
+    "tuiDrivable": "yes"
+  },
+
+  "reasoningEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+  "effortDelivery": "argv",
+  "modelAliases": { "gpt-5.6": "gpt-5.6-sol" },
+  "models": [
+    {
+      "id": "gpt-5.6-sol",
+      "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+      "defaultEffort": "low",
+      "context": 272000
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+      "defaultEffort": "medium",
+      "context": 272000
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "efforts": ["low", "medium", "high", "xhigh", "max"],
+      "defaultEffort": "medium",
+      "context": 272000
+    },
+    {
+      "id": "gpt-5.5",
+      "efforts": ["low", "medium", "high", "xhigh"],
+      "defaultEffort": "medium",
+      "context": 272000
+    },
+    {
+      "id": "gpt-5.4",
+      "efforts": ["low", "medium", "high", "xhigh"],
+      "defaultEffort": "medium",
+      "context": 272000
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "efforts": ["low", "medium", "high", "xhigh"],
+      "defaultEffort": "medium",
+      "context": 272000
+    },
+    {
+      "id": "gpt-5.3-codex-spark",
+      "efforts": ["low", "medium", "high", "xhigh"],
+      "defaultEffort": "high",
+      "context": 128000
+    }
+  ],
+
+  "discovery": {
+    "strategy": "local-cache",
+    "format": "codex-cache",
+    "path": "{{configHome}}/models_cache.json",
+    "catalogProvider": "openai"
+  },
+
+  "defaultToolProfile": "read",
+  "toolProfiles": {},
+
+  "mcp": { "strategy": "config-dir" },
+
+  "configIsolation": {
+    "env": "CODEX_HOME",
+    "dir": "{{sessionDir}}/codex-home",
+    "seedFromEnv": "CODEX_HOME",
+    "seedFromFallback": "{{home}}/.codex",
+    "copyIfMissing": ["auth.json"],
+    "copyIfExists": ["version.json"]
+  },
+
+  "promptDelivery": { "tmux-interactive": "argv" },
+
+  "argv": {
+    "tmux-interactive": [
+      {
+        "args": [
+          "-C",
+          "{{projectPath}}",
+          "--sandbox",
+          "workspace-write",
+          "--add-dir",
+          "{{sessionDir}}",
+          "--ask-for-approval",
+          "never",
+          "--no-alt-screen",
+          "-c",
+          "approval_policy=\"never\""
+        ]
+      },
+      { "when": { "set": "model" }, "args": ["--model", "{{model}}"] },
+      {
+        "when": { "set": "reasoningEffort" },
+        "args": ["-c", "model_reasoning_effort={{reasoningEffortJson}}"]
+      },
+      { "when": { "set": "initialPrompt" }, "args": ["{{initialPrompt}}"] }
+    ]
+  },
+
+  "tui": {
+    "readyAll": ["OpenAI Codex"],
+    "readyAny": ["›", "Context ", "/model to change", "Tip: Try the Codex App"],
+    "notReady": ["Booting MCP server", "re:model:\\s+loading"],
+    "idle": [
+      "re:[\\u276F\\u203A]\\s*$",
+      "/model to change",
+      "tip: try the codex app",
+      "context "
+    ],
+    "blocked": [],
+    "startupPrompts": [
+      {
+        "kind": "workspace_trust",
+        "description": "trusted-directory option",
+        "input": "1",
+        "matchAll": [
+          "Do you trust the contents of this directory",
+          "Yes, continue",
+          "No, quit"
+        ]
+      },
+      {
+        "kind": "workspace_trust",
+        "description": "trusted-directory option",
+        "input": "1",
+        "matchAll": ["Do you trust", "Trusting the directory", "No, quit"]
+      }
+    ],
+    "exitCommand": "/exit",
+    "usesAltScreen": false
+  },
+
+  "completion": { "sidecar": "always", "stdoutTrustworthy": false }
+}

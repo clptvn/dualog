@@ -1,0 +1,20 @@
+{
+  "data": [
+    {
+      "id": "anthropic/claude-opus-5",
+      "name": "Anthropic: Claude Opus 5",
+      "created": 1770000000,
+      "context_length": 1000000,
+      "supported_parameters": ["tools", "reasoning", "structured_outputs"]
+    },
+    {
+      "id": "meta-llama/llama-3.3-70b-instruct",
+      "name": "Meta: Llama 3.3 70B Instruct",
+      "created": 1732924800,
+      "context_length": 131072,
+      "supported_parameters": ["tools", "structured_outputs"]
+    }
+  ],
+  "total_count": 2,
+  "links": { "next": null }
+}
