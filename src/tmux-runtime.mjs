@@ -484,14 +484,14 @@ function extractVerb(text) {
 function extractModelLabel(lines) {
   for (const line of lines.slice(0, 16)) {
     const normalized = normalizeTerminalText(line);
-    if (/\b(Fable|Opus|Sonnet|Haiku|GPT|gpt-)\b/iu.test(normalized)) {
+    if (/\b(Fable|Opus|Sonnet|Haiku|GPT|gpt-|Grok|grok-)\b/iu.test(normalized)) {
       return normalized.slice(0, 120);
     }
   }
   for (const line of lines.slice(0, 12)) {
     const normalized = normalizeTerminalText(line);
     if (
-      /\b(Claude Code|OpenAI Codex)\b/iu.test(normalized)
+      /\b(Claude Code|OpenAI Codex|Grok Build)\b/iu.test(normalized)
     ) {
       return normalized.slice(0, 120);
     }
@@ -508,6 +508,16 @@ function detectIdlePrompt(lines, agent) {
       tail.includes("try \"") ||
       tail.includes("shift+tab to cycle") ||
       tail.includes("bypass permissions on")
+    );
+  }
+  if (agent === "grok") {
+    return (
+      /(?:\u276F|\u203A|\u276F|\u276f)\s*$/u.test(tailOriginal) ||
+      tail.includes("shift+tab") ||
+      tail.includes("always-approve") ||
+      tail.includes("type a message") ||
+      tail.includes("enter to send") ||
+      /\bgrok\b/u.test(tail)
     );
   }
   return (

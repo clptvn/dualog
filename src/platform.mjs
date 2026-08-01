@@ -12,7 +12,21 @@ export function homeDir() {
   return os.homedir();
 }
 
+/**
+ * Session storage root.
+ *
+ * Resolution order:
+ * 1. CODEX_DIALOG_HOME (explicit override)
+ * 2. Legacy default ~/.claude/dialogs (backward compatible)
+ *
+ * Grok-only and Codex-only hosts can set CODEX_DIALOG_HOME to e.g.
+ * ~/.codex-dialog/dialogs without breaking existing Claude installs.
+ */
 export function dialogsDir() {
+  const override = process.env.CODEX_DIALOG_HOME;
+  if (override && String(override).trim()) {
+    return path.resolve(String(override).trim());
+  }
   return path.join(homeDir(), ".claude", "dialogs");
 }
 

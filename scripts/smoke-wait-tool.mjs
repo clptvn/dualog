@@ -188,6 +188,88 @@ async function main() {
       );
     }
 
+    // A3: Grok host + partner metadata (end immediately; no live partner required)
+    {
+      const result = await client.callTool(
+        {
+          name: "start_dialog",
+          arguments: {
+            problem_description: "grok host metadata smoke",
+            project_path: repoRoot,
+            host_agent: "grok",
+            partner_agent: "codex",
+            max_rounds: 1,
+          },
+        },
+        undefined,
+        { timeout: 10000 }
+      );
+      const payload = parseToolText(result);
+      assert.equal(payload.host_agent, "grok");
+      assert.equal(payload.partner_agent, "codex");
+      if (payload.dialog_dir) createdDirs.push(payload.dialog_dir);
+      const status = JSON.parse(
+        fs.readFileSync(path.join(payload.dialog_dir, "status.json"), "utf-8")
+      );
+      assert.equal(status.host_agent, "grok");
+      assert.equal(status.partner_agent, "codex");
+      await client.callTool(
+        { name: "end_dialog", arguments: { session_id: payload.session_id } },
+        undefined,
+        { timeout: 10000 }
+      );
+    }
+
+    // B4: host === partner rejected
+    {
+      const result = await client.callTool(
+        {
+          name: "start_dialog",
+          arguments: {
+            problem_description: "should fail",
+            project_path: repoRoot,
+            host_agent: "grok",
+            partner_agent: "grok",
+          },
+        },
+        undefined,
+        { timeout: 10000 }
+      );
+      const text = result.content?.find((item) => item.type === "text")?.text || "";
+      assert.match(text, /must be different/i);
+    }
+
+    // Group dialog start metadata
+    {
+      const { tools } = await client.listTools();
+      assert.ok(tools.find((t) => t.name === "start_group_dialog"));
+      const result = await client.callTool(
+        {
+          name: "start_group_dialog",
+          arguments: {
+            problem_description: "group metadata smoke",
+            project_path: repoRoot,
+            participants: ["grok", "claude", "codex"],
+            facilitator: "grok",
+            mode: "addressable",
+            max_rounds: 1,
+          },
+        },
+        undefined,
+        { timeout: 10000 }
+      );
+      const payload = parseToolText(result);
+      assert.equal(payload.host_agent, "grok");
+      assert.deepEqual(payload.partner_agents, ["claude", "codex"]);
+      assert.ok(payload.session_id.startsWith("group-"));
+      if (payload.dialog_dir) createdDirs.push(payload.dialog_dir);
+      await client.callTool(
+        { name: "end_dialog", arguments: { session_id: payload.session_id } },
+        undefined,
+        { timeout: 15000 }
+      );
+    }
+
     {
       const { sessionId } = createSession({
         messages: [

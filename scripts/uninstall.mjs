@@ -19,6 +19,10 @@ const CLAUDE_SETTINGS_JSON = path.join(CLAUDE_DIR, "settings.json");
 const CODEX_DIR = path.join(HOME_DIR, ".codex");
 const CODEX_SKILLS_DIR = path.join(CODEX_DIR, "skills");
 const CODEX_CONFIG_TOML = path.join(CODEX_DIR, "config.toml");
+const GROK_DIR = path.join(HOME_DIR, ".grok");
+const GROK_CONFIG_TOML = path.join(GROK_DIR, "config.toml");
+const GROK_SKILLS_DIR = path.join(GROK_DIR, "skills");
+const GROK_COMMANDS_DIR = path.join(GROK_DIR, "commands");
 
 const CLAUDE_COMMANDS = [
   "codex-review-code",
@@ -35,6 +39,13 @@ const CODEX_SKILLS = [
   "claude-ui-implementer",
 ];
 
+const GROK_COMMANDS = [
+  "codex-review-code",
+  "codex-review-plan",
+  "codex-review-spec",
+  "codex-audit",
+];
+
 const HOOK_FILE_MARKERS = [
   "enforce-investigation.mjs",
   "enforce-resolution.mjs",
@@ -46,24 +57,52 @@ const HOOK_FILE_MARKERS = [
 function parseMode(argv) {
   let removeClaude = true;
   let removeCodex = true;
+  let removeGrok = false;
+  let sawFlag = false;
 
   for (const arg of argv) {
     const normalized = arg.toLowerCase();
     if (normalized === "--claude" || normalized === "-claude") {
+      if (!sawFlag) {
+        removeClaude = false;
+        removeCodex = false;
+        removeGrok = false;
+      }
+      sawFlag = true;
       removeClaude = true;
-      removeCodex = false;
     } else if (normalized === "--codex" || normalized === "-codex") {
-      removeClaude = false;
+      if (!sawFlag) {
+        removeClaude = false;
+        removeCodex = false;
+        removeGrok = false;
+      }
+      sawFlag = true;
       removeCodex = true;
+    } else if (normalized === "--grok" || normalized === "-grok") {
+      if (!sawFlag) {
+        removeClaude = false;
+        removeCodex = false;
+        removeGrok = false;
+      }
+      sawFlag = true;
+      removeGrok = true;
     } else if (normalized === "--both" || normalized === "-both") {
+      sawFlag = true;
       removeClaude = true;
       removeCodex = true;
+    } else if (normalized === "--all" || normalized === "-all") {
+      sawFlag = true;
+      removeClaude = true;
+      removeCodex = true;
+      removeGrok = true;
     } else {
-      throw new Error(`Unknown option: ${arg}\nUsage: npm run uninstall -- [--claude|--codex|--both]`);
+      throw new Error(
+        `Unknown option: ${arg}\nUsage: npm run uninstall -- [--claude|--codex|--grok|--both|--all]`
+      );
     }
   }
 
-  return { removeClaude, removeCodex };
+  return { removeClaude, removeCodex, removeGrok };
 }
 
 function runCli(command, args) {
@@ -184,6 +223,28 @@ function removeCodexMcp() {
   }
 }
 
+function removeGrokMcpSection(content) {
+  return content
+    .replace(/\n?\[mcp_servers\.codex-dialog\]\n(?:.*\n)*?(?=\n\[|$)/g, "\n")
+    .trimEnd();
+}
+
+function removeGrokMcp() {
+  const hasGrok = cliExists("grok");
+  if (hasGrok) {
+    runCli("grok", ["mcp", "remove", "codex-dialog"]);
+    console.log("  Removed Grok MCP registration OK");
+  }
+
+  if (fs.existsSync(GROK_CONFIG_TOML)) {
+    const updated = removeGrokMcpSection(fs.readFileSync(GROK_CONFIG_TOML, "utf-8"));
+    fs.writeFileSync(GROK_CONFIG_TOML, updated ? updated + "\n" : "");
+    console.log("  Removed ~/.grok/config.toml MCP section OK");
+  } else if (!hasGrok) {
+    console.log("  WARNING: Grok CLI not found. Skipped Grok MCP removal.");
+  }
+}
+
 function main() {
   const mode = parseMode(process.argv.slice(2));
 
@@ -215,9 +276,26 @@ function main() {
     removeCodexMcp();
   }
 
+  if (mode.removeGrok) {
+    for (const command of GROK_COMMANDS) {
+      const target = path.join(GROK_COMMANDS_DIR, `${command}.md`);
+      if (fs.existsSync(target)) {
+        fs.rmSync(target, { force: true });
+        console.log(`  Removed Grok /${command} OK`);
+      }
+    }
+    const skillTarget = path.join(GROK_SKILLS_DIR, "codex-dialog");
+    if (fs.existsSync(skillTarget)) {
+      fs.rmSync(skillTarget, { recursive: true, force: true });
+      console.log("  Removed Grok skill codex-dialog OK");
+    }
+    removeGrokMcp();
+  }
+
   console.log("");
   if (mode.removeClaude) console.log(" Restart Claude Code to apply the removal.");
   if (mode.removeCodex) console.log(" Restart Codex to apply the removal.");
+  if (mode.removeGrok) console.log(" Restart Grok Build to apply the removal.");
   console.log("");
 }
 

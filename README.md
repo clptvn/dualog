@@ -1,17 +1,27 @@
 # claude-codex-dialog
 
-A bidirectional MCP server for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex). It runs background review/dialog runners so either tool can host the conversation while the other acts as the reviewing partner.
+An MCP server for multi-agent review dialogs. Supported **hosts** (the client that calls the MCP tools):
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+- [Codex CLI](https://github.com/openai/codex)
+- [Grok Build](https://x.ai/cli)
+
+Supported **partners** (spawned in detached `tmux` for background turns): Claude, Codex, and Grok Build CLIs.
+
+Any host can pair with a different partner (e.g. Claude host → Grok partner, Codex host → Claude partner, Grok host → Codex partner). `host_agent` and `partner_agent` must differ.
 
 ## Features
 
-- **Bidirectional host support** — Claude can host Codex reviews, or Codex can host Claude reviews
-- **General Dialog** — open-ended technical discussions between the two agents
+- **Multi-host and multi-partner support** — Claude, Codex, or Grok Build can host; Claude, Codex, or Grok can partner
+- **Group mode** — one facilitator + up to two partners (`start_group_dialog` / `start_group_code_review`) for three-model collaboration (sequential turns)
+- **General Dialog** — open-ended technical discussions between host and partner
 - **Code Review** — the partner agent auto-generates an initial review from a git diff
 - **Plan Review** — adversarial review of implementation plans before code is written
 - **Spec Review** — adversarial review of product/feature specs before planning or implementation
 - **Code Audit** — deep audits of existing files for bugs, architecture issues, robustness, and security
 - **UI implementation partnership** — Codex can delegate frontend/UI implementation to Claude Opus 4.7 while Codex owns backend/API/data integration
-- **Claude-only enforcement hooks** — optional guardrails on the Claude side; no equivalent Codex hooks are installed
+- **Claude-only enforcement hooks** — optional guardrails on the Claude side; no equivalent Codex/Grok hooks are installed
+- **Session hygiene** — active-session limits, diff size caps, partner-home cache prune on `end_dialog`, optional retention
 
 ## How it works
 
@@ -29,16 +39,17 @@ A bidirectional MCP server for [Claude Code](https://docs.anthropic.com/en/docs/
 4. The host reads findings via `check_messages`, investigates, fixes or rebuts, and replies with `send_message`
 5. The review continues until MCP responses report `review_status.approved: true`, the hard cap is reached, or the session is ended
 
-Session data is stored under `~/.claude/dialogs/`.
+Session data is stored under `~/.claude/dialogs/` by default (override with `CODEX_DIALOG_HOME`).
 
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) >= 18
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) on your `PATH` if you want Claude-hosted commands or Claude as a review partner
 - [Codex CLI](https://github.com/openai/codex) on your `PATH` if you want Codex-hosted skills or Codex as a review partner
+- [Grok Build CLI](https://x.ai/cli) on your `PATH` if you want Grok-hosted commands
 - `tmux` on your `PATH` for partner sessions. The server uses detached tmux sessions and does not open terminal windows.
 
-For the full bidirectional install, both CLIs should be available.
+For full multi-host install, install the host CLI(s) you use plus at least one partner CLI.
 
 macOS, Linux, and WSL are supported when `tmux` is installed. Native Windows can still run the installer wrappers, but partner sessions require a tmux-capable environment such as WSL.
 
@@ -52,7 +63,7 @@ cd claude-codex-dialog
 npm run setup
 ```
 
-Default install mode is `--both`, which does all of the following:
+Default install mode is `--both` (Claude + Codex hosts), which does all of the following:
 
 - registers the MCP server for Claude
 - installs Claude slash commands:
@@ -69,13 +80,41 @@ Default install mode is `--both`, which does all of the following:
   - `/claude-audit`
   - `/claude-ui-implementer`
 
-You can also install only one side:
+Install only the hosts you need (flags combine):
 
 ```bash
 npm run setup -- --claude
 npm run setup -- --codex
-npm run setup -- --both
+npm run setup -- --grok
+npm run setup -- --both          # Claude + Codex (historical default)
+npm run setup -- --all           # Claude + Codex + Grok Build
 ```
+
+### Grok Build host
+
+```bash
+npm run setup -- --grok
+# or
+npm run setup -- --all
+```
+
+This registers `codex-dialog` in `~/.grok/config.toml` (user scope), installs:
+
+- skill: `~/.grok/skills/codex-dialog/`
+- commands: `~/.grok/commands/codex-{review-code,review-plan,review-spec,audit}.md`
+
+Grok tool names are `codex-dialog__*` (not Claude’s `mcp__codex-dialog__*`). When starting a session from Grok, pass `host_agent: "grok"` so metadata is labeled correctly. Partner default remains Codex.
+
+To use **Grok as the partner** (Claude or Codex host reviews via Grok in tmux):
+
+```text
+start_code_review(..., host_agent: "claude", partner_agent: "grok")
+start_dialog(..., host_agent: "codex", partner_agent: "grok")
+```
+
+Partner turns use an isolated `GROK_HOME` under the session dir (auth copied, MCP empty) so nested Grok sessions do not re-load this dialog server.
+
+Restart Grok (or refresh `/mcps`) after install.
 
 POSIX shell wrappers are still available:
 
@@ -143,6 +182,26 @@ Restart the relevant CLI after installation or uninstall so it reloads MCP confi
 | `check_partner_alive` | Check runner status, inferred partner activity, and a compact tail of the live or saved tmux pane |
 | `end_dialog` | End the session and return the final conversation |
 | `list_sessions` | List all dialog and review sessions |
+| `cleanup_sessions` | Prune heavy partner caches; optionally delete ended sessions past retention |
+| `start_group_dialog` | Multi-partner dialog (facilitator + partners, modes: addressable/round_robin/fan_out/review) |
+| `start_group_code_review` | Multi-partner sequential code review |
+
+### Group collaboration (three models)
+
+```text
+start_group_dialog({
+  participants: ["grok", "claude", "codex"],
+  facilitator: "grok",
+  mode: "fan_out",   // or addressable | round_robin | review
+  problem_description: "…",
+  project_path: "…"
+})
+send_message({ session_id, content: "…", to: "all" })  // or to: "claude" | ["claude","codex"]
+wait_for_partner_response({ session_id, since_id, expect: "all_pending" })
+end_dialog({ session_id })
+```
+
+Partners run **sequentially** in tmux (one at a time). v1 max: 1 facilitator + 2 partners.
 
 `review_status` uses closed enum values:
 
@@ -175,6 +234,19 @@ After Claude-side install:
 /codex-review-spec docs/specs/foo.md
 /codex-audit src/
 ```
+
+### In Grok Build
+
+After Grok-side install (`npm run setup -- --grok` or `--all`):
+
+```text
+/codex-review-code
+/codex-review-plan path/to/plan.md
+/codex-review-spec docs/specs/foo.md
+/codex-audit src/
+```
+
+Or drive tools directly with `host_agent: "grok"` and `partner_agent: "codex"` (default). Prefer `wait_for_partner_response` over sleep-polling. Grok MCP config sets a high timeout for that tool.
 
 ### In Codex
 
@@ -232,6 +304,21 @@ Partner runtime details:
 - `subject_kind`: optional label for `subject_path`: `plan`, `spec`, or `document`.
 
 The server still accepts `codex_command` for backward compatibility, and also accepts `claude_command` when Claude is the configured partner.
+
+## Environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CODEX_DIALOG_HOME` | `~/.claude/dialogs` | Session storage root |
+| `CODEX_DIALOG_MAX_ACTIVE_SESSIONS` | `3` | Soft cap on concurrent live runners |
+| `CODEX_DIALOG_RETENTION_DAYS` | `14` | Auto-delete ended sessions older than N days (`0` disables) |
+| `CODEX_DIALOG_MAX_DIFF_BYTES` | `400000` | Cap review diff size before partner sees it |
+| `CODEX_DIALOG_TMUX_SOCKET` | `codex-dialog` | Dedicated tmux socket name |
+| `CODEX_DIALOG_IDLE_SHUTDOWN_MS` | `24h` | Inactive runner self-shutdown |
+
+On `end_dialog`, the server aggressively prunes per-session `codex-home` caches/plugins (conversation history is kept). Use `cleanup_sessions` for bulk reclaim.
+
+Codex partners with `tool_profile: "read"` (default for reviews) use `--sandbox read-only`. Implementation profile keeps `workspace-write`.
 
 ## Round budget
 

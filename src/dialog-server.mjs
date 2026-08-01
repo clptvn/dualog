@@ -11,7 +11,10 @@ import {
   getAgentDisplayName,
   getSessionHostAgent,
   getSessionPartnerAgent,
-  normalizeAgent,
+  getSessionPartnerAgents,
+  isGroupSession,
+  normalizeHostAgent,
+  normalizePartnerAgent,
   readConversation,
   appendMessage,
   isProcessAlive,
@@ -27,6 +30,15 @@ import {
   ALL_REASONING_EFFORTS,
   normalizeReasoningEffortForAgent,
 } from "./runtime-defaults.mjs";
+import {
+  assertUnderActiveSessionLimit,
+  capDiffText,
+  pruneExpiredSessions,
+  pruneSessionHeavyArtifacts,
+} from "./session-maintenance.mjs";
+
+const HOST_AGENT_ENUM = z.enum(["claude", "codex", "grok"]);
+const PARTNER_AGENT_ENUM = z.enum(["claude", "codex", "grok"]);
 
 const server = new McpServer({
   name: "codex-dialog",
@@ -42,14 +54,14 @@ const WAIT_FALLBACK_INTERVAL_MS = 5000;
 const WAIT_PROGRESS_INTERVAL_MS = 30000;
 const END_DIALOG_GRACE_MS = 5500;
 const MODEL_OVERRIDE_DESCRIPTION =
-  "Optional partner model override. Model strings are forwarded to the selected partner CLI. Claude examples: claude-fable-5, claude-opus-4-8, claude-opus-4-8[1m], claude-opus-4-7[1m], claude-opus-4-6[1m], claude-sonnet-4-6. Claude Fable 5 has 1M context by default; do not add a [1m] suffix. Codex examples: gpt-5.6 (alias for Sol), gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.3-codex.";
+  "Optional partner model override. Model strings are forwarded to the selected partner CLI. Claude examples: claude-fable-5, claude-opus-4-8, claude-opus-4-8[1m], claude-opus-4-7[1m], claude-opus-4-6[1m], claude-sonnet-4-6. Claude Fable 5 has 1M context by default; do not add a [1m] suffix. Codex examples: gpt-5.6 (alias for Sol), gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.3-codex. Grok examples: grok-4.5, grok-build.";
 const REASONING_EFFORT_DESCRIPTION =
-  "Optional partner-specific reasoning effort level. Defaults to high. For Codex this is low|medium|high|xhigh|max|ultra; max is available with the GPT-5.6 family, while ultra is available with GPT-5.6 Sol and Terra. For Claude this is low|medium|high|xhigh|max.";
+  "Optional partner-specific reasoning effort level. Defaults to high. For Codex this is low|medium|high|xhigh|max|ultra; max is available with the GPT-5.6 family, while ultra is available with GPT-5.6 Sol and Terra. For Claude and Grok this is low|medium|high|xhigh|max.";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function resolveSessionDir(sessionId) {
-  if (!/^(dialog|review)-\d+-[0-9a-f]+$/.test(sessionId)) {
+  if (!/^(dialog|review|group)-\d+-[0-9a-f]+$/.test(sessionId)) {
     throw new Error(`Invalid session ID format: ${sessionId}`);
   }
   return path.join(DIALOGS_DIR, sessionId);
@@ -59,8 +71,8 @@ function readConv(sessionId) {
   return readConversation(resolveSessionDir(sessionId));
 }
 
-function appendMsg(sessionId, from, content) {
-  return appendMessage(resolveSessionDir(sessionId), from, content);
+function appendMsg(sessionId, from, content, options = {}) {
+  return appendMessage(resolveSessionDir(sessionId), from, content, options);
 }
 
 function readStat(sessionId) {
@@ -89,10 +101,12 @@ function resolvePartnerCommandValue(
   partnerAgent,
   partnerCommand,
   codexCommand,
-  claudeCommand
+  claudeCommand,
+  grokCommand
 ) {
   if (partnerCommand) return partnerCommand;
   if (partnerAgent === "claude") return claudeCommand || "claude";
+  if (partnerAgent === "grok") return grokCommand || "grok";
   return codexCommand || "codex";
 }
 
@@ -138,11 +152,13 @@ function resolveSubjectPath(subjectPath, projectPath) {
 function computeBudget(status, messages) {
   const maxRounds = status?.max_rounds ?? 5;
   const hardCap = status?.hard_cap ?? maxRounds + 5;
-  const partnerAgent = getSessionPartnerAgent(status);
-  // Only real partner turns count toward the budget. System notices (idle
-  // shutdown, hard-cap reached, error shutdown, etc.) use from: "system"
-  // and must not inflate rounds_used past hard_cap.
-  const roundsUsed = messages.filter((m) => m.from === partnerAgent).length;
+  const partners = getSessionPartnerAgents(status);
+  const partnerSet = new Set(partners);
+  // Partner turns only (system messages excluded). Group sessions count all partners.
+  const roundsUsed = messages.filter((m) => partnerSet.has(m.from)).length;
+  const by_agent = Object.fromEntries(
+    partners.map((a) => [a, messages.filter((m) => m.from === a).length])
+  );
   const roundsRemaining = Math.max(0, maxRounds - roundsUsed);
   const hardRoundsRemaining = Math.max(0, hardCap - roundsUsed);
   return {
@@ -152,6 +168,8 @@ function computeBudget(status, messages) {
     rounds_remaining: roundsRemaining,
     hard_rounds_remaining: hardRoundsRemaining,
     past_soft_cap: roundsUsed > maxRounds,
+    partner_agents: partners,
+    by_agent,
   };
 }
 
@@ -209,13 +227,17 @@ function getLatestMessageId(messages) {
   return messages.length > 0 ? messages[messages.length - 1].id : 0;
 }
 
-function getWakeMessages(messages, status, sinceId, includeSystem) {
-  const partnerAgent = getSessionPartnerAgent(status);
-  return messages.filter(
-    (m) =>
-      m.id > sinceId &&
-      (m.from === partnerAgent || (includeSystem && m.from === "system"))
-  );
+function getWakeMessages(messages, status, sinceId, includeSystem, expect) {
+  const partners = getSessionPartnerAgents(status);
+  const partnerSet = new Set(partners);
+  return messages.filter((m) => {
+    if (m.id <= sinceId) return false;
+    if (includeSystem && m.from === "system") return true;
+    if (expect && expect !== "any" && expect !== "all_pending") {
+      return m.from === expect;
+    }
+    return partnerSet.has(m.from);
+  });
 }
 
 function normalizePartnerTimeout(timeoutMs) {
@@ -242,11 +264,22 @@ function buildSessionSnapshot(sessionId, options = {}) {
   const status = readStatus(sessionDir);
   const hostAgent = getSessionHostAgent(status);
   const partnerAgent = getSessionPartnerAgent(status);
+  const partnerAgents = getSessionPartnerAgents(status);
   const runnerAlive = status?.runner_pid
     ? isProcessAlive(status.runner_pid)
     : false;
   const processingPath = getProcessingPath(sessionDir);
   const partnerProcessing = fs.existsSync(processingPath);
+  let processingAgent = null;
+  if (partnerProcessing) {
+    try {
+      const raw = fs.readFileSync(processingPath, "utf-8");
+      const parsed = JSON.parse(raw);
+      processingAgent = parsed?.agent || null;
+    } catch {
+      processingAgent = null;
+    }
+  }
   const errorPath = path.join(sessionDir, "last_error.txt");
   const lastError = readOptionalText(errorPath);
   const budget = computeBudget(status, messages);
@@ -268,9 +301,13 @@ function buildSessionSnapshot(sessionId, options = {}) {
     latest_id: getLatestMessageId(messages),
     host_agent: hostAgent,
     partner_agent: partnerAgent,
+    partner_agents: partnerAgents,
+    mode: status?.mode || null,
+    turn_state: status?.turn_state || null,
     partner_timeout_ms: normalizePartnerTimeout(status?.partner_timeout_ms),
     partner_runner_alive: runnerAlive,
     partner_currently_processing: partnerProcessing,
+    processing_agent: processingAgent,
     ...(partnerAgent === "codex"
       ? {
           codex_runner_alive: runnerAlive,
@@ -321,17 +358,60 @@ function hasHardCapReached(snapshot) {
   );
 }
 
-function classifyWaitResult(snapshot, sinceId, includeSystem) {
+function classifyWaitResult(snapshot, sinceId, includeSystem, expect = "any") {
   if (snapshot.payload.last_error) return "error";
   if (fs.existsSync(snapshot.internal.endSignalPath)) return "ended";
   if (hasHardCapReached(snapshot)) return "hard_cap";
   if (!snapshot.payload.partner_runner_alive) return "runner_exited";
+
+  const status = snapshot.internal.status;
+  const messages = snapshot.internal.messages;
+
+  if (expect === "all_pending" && isGroupSession(status)) {
+    const pending = status?.turn_state?.pending_targets || [];
+    if (pending.length === 0) {
+      // No pending wave — any partner message after sinceId wakes
+      if (
+        getWakeMessages(messages, status, sinceId, includeSystem, "any").length >
+        0
+      ) {
+        return "message";
+      }
+      return null;
+    }
+    // All pending targets have replied after last_host_message_id
+    const hostMsgId = status?.turn_state?.last_host_message_id || sinceId;
+    const replied = new Set(
+      messages
+        .filter((m) => m.id > hostMsgId && pending.includes(m.from))
+        .map((m) => m.from)
+    );
+    // System failure messages also clear a wave
+    const failedAll =
+      messages.some(
+        (m) =>
+          m.id > hostMsgId &&
+          m.from === "system" &&
+          /Partner .* failed/i.test(m.content || "")
+      ) && pending.every((a) => replied.has(a) || true);
+    if (pending.every((a) => replied.has(a))) {
+      return "message";
+    }
+    // If pending drained by runner to []
+    if ((status?.turn_state?.pending_targets || []).length === 0 && replied.size) {
+      return "message";
+    }
+    void failedAll;
+    return null;
+  }
+
   if (
     getWakeMessages(
-      snapshot.internal.messages,
-      snapshot.internal.status,
+      messages,
+      status,
       sinceId,
-      includeSystem
+      includeSystem,
+      expect
     ).length > 0
   ) {
     return "message";
@@ -380,6 +460,7 @@ async function sendWaitProgress(extra, progressToken, startedAt, timeoutMs) {
 function waitForSessionChange(sessionId, options, extra) {
   const sinceId = options.sinceId || 0;
   const includeSystem = options.includeSystem !== false;
+  const expect = options.expect || "any";
   const startedAt = Date.now();
   const sessionDir = resolveSessionDir(sessionId);
   const timeoutMs = normalizeWaitTimeout(options.timeoutMs);
@@ -421,7 +502,12 @@ function waitForSessionChange(sessionId, options, extra) {
         return;
       }
       const snapshot = readSnapshot();
-      const waitResult = classifyWaitResult(snapshot, sinceId, includeSystem);
+      const waitResult = classifyWaitResult(
+        snapshot,
+        sinceId,
+        includeSystem,
+        expect
+      );
       if (waitResult) finish(snapshot, waitResult);
     };
 
@@ -473,14 +559,16 @@ server.tool(
       .string()
       .optional()
       .describe("Path to the project directory for context"),
-    host_agent: z
-      .enum(["claude", "codex"])
+    host_agent: HOST_AGENT_ENUM
       .optional()
-      .describe("Which agent is orchestrating the session (default: 'claude')"),
-    partner_agent: z
-      .enum(["claude", "codex"])
+      .describe(
+        "Which agent is orchestrating the session (default: 'claude'). Use 'grok' when Grok Build is the host."
+      ),
+    partner_agent: PARTNER_AGENT_ENUM
       .optional()
-      .describe("Which agent should respond in the background runner (default: 'codex')"),
+      .describe(
+        "Which agent should respond in the background runner (default: 'codex'). Use 'grok' to spawn Grok Build in tmux."
+      ),
     partner_command: z
       .string()
       .optional()
@@ -493,6 +581,10 @@ server.tool(
       .string()
       .optional()
       .describe("Alias for partner_command when partner_agent='claude'"),
+    grok_command: z
+      .string()
+      .optional()
+      .describe("Alias for partner_command when partner_agent='grok'"),
     max_rounds: z
       .number()
       .int()
@@ -541,6 +633,7 @@ server.tool(
     partner_command,
     codex_command,
     claude_command,
+    grok_command,
     max_rounds,
     reasoning_effort,
     model,
@@ -549,8 +642,8 @@ server.tool(
     subject_path,
     subject_kind,
   }) => {
-    const hostAgent = normalizeAgent(host_agent, "claude");
-    const partnerAgent = normalizeAgent(partner_agent, "codex");
+    const hostAgent = normalizeHostAgent(host_agent, "claude");
+    const partnerAgent = normalizePartnerAgent(partner_agent, "codex");
     if (hostAgent === partnerAgent) {
       return {
         content: [
@@ -559,6 +652,14 @@ server.tool(
             text: "Error: host_agent and partner_agent must be different",
           },
         ],
+      };
+    }
+    try {
+      pruneExpiredSessions();
+      assertUnderActiveSessionLimit();
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err.message}` }],
       };
     }
     const softCap = max_rounds || 5;
@@ -584,7 +685,8 @@ server.tool(
       partnerAgent,
       partner_command,
       codex_command,
-      claude_command
+      claude_command,
+      grok_command
     );
     const partnerDisplay = getAgentDisplayName(partnerAgent);
     const resolvedProjectPath = project_path || process.cwd();
@@ -733,14 +835,16 @@ server.tool(
       .describe(
         "Optional focus area for the review, e.g. 'security', 'performance', 'correctness'"
       ),
-    host_agent: z
-      .enum(["claude", "codex"])
+    host_agent: HOST_AGENT_ENUM
       .optional()
-      .describe("Which agent is orchestrating the review (default: 'claude')"),
-    partner_agent: z
-      .enum(["claude", "codex"])
+      .describe(
+        "Which agent is orchestrating the review (default: 'claude'). Use 'grok' when Grok Build is the host."
+      ),
+    partner_agent: PARTNER_AGENT_ENUM
       .optional()
-      .describe("Which agent should review in the background (default: 'codex')"),
+      .describe(
+        "Which agent should review in the background (default: 'codex'). Use 'grok' to spawn Grok Build in tmux."
+      ),
     partner_command: z
       .string()
       .optional()
@@ -753,6 +857,10 @@ server.tool(
       .string()
       .optional()
       .describe("Alias for partner_command when partner_agent='claude'"),
+    grok_command: z
+      .string()
+      .optional()
+      .describe("Alias for partner_command when partner_agent='grok'"),
     max_rounds: z
       .number()
       .int()
@@ -788,13 +896,14 @@ server.tool(
     partner_command,
     codex_command,
     claude_command,
+    grok_command,
     max_rounds,
     reasoning_effort,
     model,
     partner_timeout_ms,
   }) => {
-    const hostAgent = normalizeAgent(host_agent, "claude");
-    const partnerAgent = normalizeAgent(partner_agent, "codex");
+    const hostAgent = normalizeHostAgent(host_agent, "claude");
+    const partnerAgent = normalizePartnerAgent(partner_agent, "codex");
     if (hostAgent === partnerAgent) {
       return {
         content: [
@@ -803,6 +912,14 @@ server.tool(
             text: "Error: host_agent and partner_agent must be different",
           },
         ],
+      };
+    }
+    try {
+      pruneExpiredSessions();
+      assertUnderActiveSessionLimit();
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err.message}` }],
       };
     }
     const target = diff_target || "uncommitted";
@@ -834,7 +951,8 @@ server.tool(
       partnerAgent,
       partner_command,
       codex_command,
-      claude_command
+      claude_command,
+      grok_command
     );
     const partnerDisplay = getAgentDisplayName(partnerAgent);
     const execOpts = { cwd: project_path, timeout: 30000, maxBuffer: 10 * 1024 * 1024 };
@@ -930,6 +1048,9 @@ server.tool(
       };
     }
 
+    const capped = capDiffText(diff);
+    diff = capped.diff;
+
     // Create session
     const sessionId = `review-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
     const sessionDir = resolveSessionDir(sessionId);
@@ -937,6 +1058,20 @@ server.tool(
 
     // Write review artifacts
     fs.writeFileSync(path.join(sessionDir, "diff.patch"), diff);
+    if (capped.truncated) {
+      fs.writeFileSync(
+        path.join(sessionDir, "diff_truncated.json"),
+        JSON.stringify(
+          {
+            truncated: true,
+            original_bytes: capped.original_bytes,
+            max_bytes: capped.max_bytes,
+          },
+          null,
+          2
+        )
+      );
+    }
 
     const headBranchForMeta = target === "branch" ? (branch || currentBranch) : currentBranch;
     const baseBranchForMeta = target === "branch" ? (base_branch || "main") : "HEAD";
@@ -1138,12 +1273,21 @@ server.tool(
 
 server.tool(
   "send_message",
-  "Send a message to the configured partner session. The background runner will detect it and invoke the partner CLI to respond.",
+  "Send a message to the configured partner session. The background runner will detect it and invoke the partner CLI to respond. For group sessions, pass `to` to select partners (agent name, list, or \"all\").",
   {
-    session_id: z.string().describe("The session ID (dialog or review)"),
+    session_id: z.string().describe("The session ID (dialog, review, or group)"),
     content: z.string().describe("Your message to the partner agent"),
+    to: z
+      .union([
+        z.enum(["all", "claude", "codex", "grok"]),
+        z.array(z.enum(["claude", "codex", "grok"])),
+      ])
+      .optional()
+      .describe(
+        'Group sessions only: which partner(s) should respond. "all", a single agent, or a list. Required in addressable mode.'
+      ),
   },
-  async ({ session_id, content }) => {
+  async ({ session_id, content, to }) => {
     const sessionDir = resolveSessionDir(session_id);
     if (!fs.existsSync(sessionDir)) {
       return { content: [{ type: "text", text: "Error: Session not found" }] };
@@ -1151,7 +1295,8 @@ server.tool(
     const status = readStat(session_id);
     const hostAgent = getSessionHostAgent(status);
     const partnerAgent = getSessionPartnerAgent(status);
-    const partnerDisplay = getAgentDisplayName(partnerAgent);
+    const partnerAgents = getSessionPartnerAgents(status);
+    const partnerDisplay = partnerAgents.map(getAgentDisplayName).join(", ");
 
     // Auto-refresh diff BEFORE appending message so it's ready when the runner
     // sees the new message and immediately starts building the prompt.
@@ -1199,7 +1344,9 @@ server.tool(
       }
     }
 
-    const msg = appendMsg(session_id, hostAgent, content);
+    const msg = appendMsg(session_id, hostAgent, content, {
+      ...(to != null ? { to } : {}),
+    });
     const messages = readConv(session_id);
     const budget = computeBudget(status, messages);
     const reviewStatus = computeReviewStatus(status, messages, {
@@ -1215,6 +1362,8 @@ server.tool(
               message_id: msg.id,
               host_agent: hostAgent,
               partner_agent: partnerAgent,
+              partner_agents: partnerAgents,
+              to: to ?? null,
               partner_timeout_ms: normalizePartnerTimeout(status?.partner_timeout_ms),
               budget,
               review_status: reviewStatus,
@@ -1279,12 +1428,24 @@ server.tool(
       .boolean()
       .optional()
       .describe("Wake on system messages as well as partner messages (default: true)"),
+    expect: z
+      .enum(["any", "all_pending", "claude", "codex", "grok"])
+      .optional()
+      .describe(
+        'Group sessions: "all_pending" waits until every target of the last host wave replies; "any" or a specific agent. Binary sessions: partner only (default any).'
+      ),
   },
-  async ({ session_id, since_id, timeout_ms, include_system }, extra) => {
+  async ({ session_id, since_id, timeout_ms, include_system, expect }, extra) => {
     const sessionDir = resolveSessionDir(session_id);
     if (!fs.existsSync(sessionDir)) {
       return { content: [{ type: "text", text: "Error: Session not found" }] };
     }
+
+    const status = readStat(session_id);
+    const defaultExpect =
+      isGroupSession(status) && (status.mode === "fan_out" || status.mode === "review")
+        ? "all_pending"
+        : "any";
 
     const result = await waitForSessionChange(
       session_id,
@@ -1292,6 +1453,7 @@ server.tool(
         sinceId: since_id || 0,
         timeoutMs: timeout_ms,
         includeSystem: include_system !== false,
+        expect: expect || defaultExpect,
       },
       extra
     );
@@ -1508,6 +1670,8 @@ server.tool(
     const reviewStatus = computeReviewStatus(status, messages, {
       problem: readProblem(sessionDir),
     });
+    // Reclaim partner plugin/tmp bulk after the session ends (conversation kept).
+    const cleanup = pruneSessionHeavyArtifacts(sessionDir, { aggressive: true });
     return {
       content: [
         {
@@ -1519,6 +1683,7 @@ server.tool(
               session_type: status?.type || "unknown",
               total_messages: messages.length,
               review_status: reviewStatus,
+              cleanup,
               messages,
             },
             null,
@@ -1535,13 +1700,20 @@ server.tool(
   "List all dialog and review sessions (active and completed).",
   {},
   async () => {
+    // Side-effect: reclaim disk from expired/ended sessions (never active ones).
+    pruneExpiredSessions();
     if (!fs.existsSync(DIALOGS_DIR)) {
       return { content: [{ type: "text", text: "[]" }] };
     }
 
     const sessions = fs
       .readdirSync(DIALOGS_DIR)
-      .filter((d) => d.startsWith("dialog-") || d.startsWith("review-"));
+      .filter(
+        (d) =>
+          d.startsWith("dialog-") ||
+          d.startsWith("review-") ||
+          d.startsWith("group-")
+      );
     const results = [];
     for (const sessionId of sessions) {
       try {
@@ -1552,16 +1724,18 @@ server.tool(
           : false;
         const budget = computeBudget(status, messages);
         results.push({
-        session_id: sessionId,
-        type: sessionId.startsWith("review-") ? "review" : "dialog",
-        started_at: status?.started_at,
-        host_agent: getSessionHostAgent(status),
-        partner_agent: getSessionPartnerAgent(status),
-        partner_timeout_ms: normalizePartnerTimeout(status?.partner_timeout_ms),
-        message_count: messages.length,
+          session_id: sessionId,
+          type: sessionId.startsWith("review-") ? "review" : "dialog",
+          started_at: status?.started_at,
+          host_agent: getSessionHostAgent(status),
+          partner_agent: getSessionPartnerAgent(status),
+          partner_timeout_ms: normalizePartnerTimeout(status?.partner_timeout_ms),
+          message_count: messages.length,
           runner_alive: alive,
           budget,
-          ...(status?.branch ? { branch: status.branch, base_branch: status.base_branch } : {}),
+          ...(status?.branch
+            ? { branch: status.branch, base_branch: status.base_branch }
+            : {}),
         });
       } catch {
         results.push({ session_id: sessionId, error: "failed to read session" });
@@ -1571,6 +1745,487 @@ server.tool(
     return {
       content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
     };
+  }
+);
+
+server.tool(
+  "cleanup_sessions",
+  "Prune heavy partner artifacts (codex-home caches/plugins/tmp) and optionally delete ended sessions older than retention. Never deletes active runners.",
+  {
+    delete_expired: z
+      .boolean()
+      .optional()
+      .describe(
+        "When true, delete ended sessions older than CODEX_DIALOG_RETENTION_DAYS (default 14). Default false only prunes heavy artifacts."
+      ),
+    aggressive: z
+      .boolean()
+      .optional()
+      .describe(
+        "When true, remove the entire codex-home tree for ended sessions (keeps conversation.jsonl/status)."
+      ),
+  },
+  async ({ delete_expired, aggressive }) => {
+    const root = DIALOGS_DIR;
+    const pruned = [];
+    if (!fs.existsSync(root)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ pruned, retention: null }, null, 2),
+          },
+        ],
+      };
+    }
+    for (const id of fs.readdirSync(root)) {
+      if (!id.startsWith("dialog-") && !id.startsWith("review-")) continue;
+      const dir = path.join(root, id);
+      const status = readStatus(dir);
+      if (status?.runner_pid && isProcessAlive(status.runner_pid)) continue;
+      if (fs.existsSync(path.join(dir, "end_signal")) || !status?.runner_pid) {
+        const result = pruneSessionHeavyArtifacts(dir, {
+          aggressive: Boolean(aggressive),
+        });
+        if (result.pruned.length) pruned.push({ session_id: id, ...result });
+      }
+    }
+    const retention = delete_expired
+      ? pruneExpiredSessions(root)
+      : { deleted: [], note: "delete_expired not set" };
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ pruned, retention }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+// ── Group tools (multi-partner) ──────────────────────────────────────────────
+
+const AGENT_ENUM = z.enum(["claude", "codex", "grok"]);
+const GROUP_MODE_ENUM = z.enum([
+  "addressable",
+  "round_robin",
+  "fan_out",
+  "review",
+]);
+
+function validateGroupParticipants(participants, facilitator) {
+  if (!Array.isArray(participants) || participants.length < 2) {
+    throw new Error("participants must include at least 2 agents");
+  }
+  const normalized = participants.map((p) => {
+    const c = String(p || "")
+      .toLowerCase()
+      .trim();
+    if (c === "grok" || c === "grok-build" || c === "grok_build") return "grok";
+    if (c === "claude") return "claude";
+    if (c === "codex") return "codex";
+    throw new Error(`Unknown participant: ${p}`);
+  });
+  const uniq = [...new Set(normalized)];
+  if (uniq.length < 2) {
+    throw new Error("participants must be unique and length >= 2");
+  }
+  if (uniq.length > 3) {
+    throw new Error("v1 allows at most 3 participants (1 facilitator + 2 partners)");
+  }
+  const fac = normalizeHostAgent(facilitator, "grok");
+  if (!uniq.includes(fac)) {
+    throw new Error("facilitator must be listed in participants");
+  }
+  const partners = uniq.filter((a) => a !== fac);
+  if (!partners.length) {
+    throw new Error("need at least one partner distinct from facilitator");
+  }
+  if (partners.length > 2) {
+    throw new Error("v1 allows at most 2 partners");
+  }
+  return { facilitator: fac, partners, participants: uniq };
+}
+
+function spawnGroupRunner({
+  sessionDir,
+  projectPath,
+  softCap,
+  reasoningEffort,
+  model,
+  hostAgent,
+  toolProfile,
+  partnerTimeoutMs,
+}) {
+  const runnerPath = fileURLToPath(new URL("group-runner.mjs", import.meta.url));
+  const child = spawn(
+    process.execPath,
+    [
+      runnerPath,
+      sessionDir,
+      projectPath,
+      String(softCap),
+      reasoningEffort || "high",
+      model || "",
+      hostAgent,
+      toolProfile || "read",
+      String(partnerTimeoutMs || DEFAULT_PARTNER_TIMEOUT_MS),
+    ],
+    {
+      detached: true,
+      stdio: "ignore",
+      cwd: projectPath,
+    }
+  );
+  child.unref();
+  return child.pid;
+}
+
+server.tool(
+  "start_group_dialog",
+  "Start a multi-partner group dialog. One facilitator (host) orchestrates; partners respond sequentially. Modes: addressable (require send_message.to), round_robin, fan_out, review.",
+  {
+    problem_description: z.string(),
+    project_path: z.string().optional(),
+    participants: z
+      .array(AGENT_ENUM)
+      .min(2)
+      .max(3)
+      .describe("Facilitator + partners, e.g. [\"grok\",\"claude\",\"codex\"]"),
+    facilitator: AGENT_ENUM.describe("Host agent that holds MCP (must be in participants)"),
+    mode: GROUP_MODE_ENUM.optional().describe("Default: addressable"),
+    max_rounds: z.number().int().min(1).max(50).optional(),
+    reasoning_effort: z.enum(ALL_REASONING_EFFORTS).optional(),
+    model: z.string().optional(),
+    partner_timeout_ms: z.number().int().min(MIN_PARTNER_TIMEOUT_MS).optional(),
+    tool_profile: z.enum(["read", "implementation"]).optional(),
+    partner_commands: z
+      .object({
+        claude: z.string().optional(),
+        codex: z.string().optional(),
+        grok: z.string().optional(),
+      })
+      .optional(),
+    models: z
+      .object({
+        claude: z.string().optional(),
+        codex: z.string().optional(),
+        grok: z.string().optional(),
+      })
+      .optional(),
+  },
+  async (args) => {
+    try {
+      pruneExpiredSessions();
+      assertUnderActiveSessionLimit();
+      const { facilitator, partners, participants } = validateGroupParticipants(
+        args.participants,
+        args.facilitator
+      );
+      const softCap = args.max_rounds || 5;
+      const hardCap = softCap + 5;
+      const mode = args.mode || "addressable";
+      const partnerTimeoutMs = normalizePartnerTimeout(args.partner_timeout_ms);
+      const projectPath = args.project_path || process.cwd();
+
+      const sessionId = `group-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+      const sessionDir = resolveSessionDir(sessionId);
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(path.join(sessionDir, "problem.md"), args.problem_description);
+      fs.writeFileSync(path.join(sessionDir, "conversation.jsonl"), "");
+
+      const status = {
+        session_id: sessionId,
+        type: "group_dialog",
+        started_at: new Date().toISOString(),
+        project_path: projectPath,
+        host_agent: facilitator,
+        partner_agent: partners[0],
+        partner_agents: partners,
+        participants,
+        mode,
+        partner_commands: args.partner_commands || {},
+        partner_models: args.models || {},
+        max_rounds: softCap,
+        hard_cap: hardCap,
+        reasoning_effort: args.reasoning_effort || "high",
+        model: args.model || null,
+        partner_timeout_ms: partnerTimeoutMs,
+        tool_profile: args.tool_profile || "read",
+        turn_state: {
+          rr_index: 0,
+          pending_targets: [],
+          completed_targets: [],
+          last_host_message_id: 0,
+        },
+        runner_pid: null,
+      };
+      fs.writeFileSync(
+        path.join(sessionDir, "status.json"),
+        JSON.stringify(status, null, 2)
+      );
+
+      const pid = spawnGroupRunner({
+        sessionDir,
+        projectPath,
+        softCap,
+        reasoningEffort: status.reasoning_effort,
+        model: status.model,
+        hostAgent: facilitator,
+        toolProfile: status.tool_profile,
+        partnerTimeoutMs,
+      });
+      status.runner_pid = pid;
+      fs.writeFileSync(
+        path.join(sessionDir, "status.json"),
+        JSON.stringify(status, null, 2)
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                session_id: sessionId,
+                dialog_dir: sessionDir,
+                type: "group_dialog",
+                host_agent: facilitator,
+                partner_agents: partners,
+                participants,
+                mode,
+                max_rounds: softCap,
+                hard_cap: hardCap,
+                message:
+                  mode === "addressable"
+                    ? 'Group dialog started. send_message with to: "claude"|"codex"|"grok"|"all", then wait_for_partner_response(expect:"all_pending"|agent).'
+                    : "Group dialog started. send_message then wait_for_partner_response.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err.message}` }],
+      };
+    }
+  }
+);
+
+server.tool(
+  "start_group_code_review",
+  "Start a multi-partner group code review. Facilitator hosts; each partner reviews the diff sequentially (mode=review) or as directed.",
+  {
+    project_path: z.string(),
+    participants: z.array(AGENT_ENUM).min(2).max(3),
+    facilitator: AGENT_ENUM,
+    mode: GROUP_MODE_ENUM.optional(),
+    diff_target: z.string().optional(),
+    branch: z.string().optional(),
+    base_branch: z.string().optional(),
+    review_focus: z.string().optional(),
+    max_rounds: z.number().int().min(1).max(50).optional(),
+    reasoning_effort: z.enum(ALL_REASONING_EFFORTS).optional(),
+    model: z.string().optional(),
+    partner_timeout_ms: z.number().int().min(MIN_PARTNER_TIMEOUT_MS).optional(),
+    partner_commands: z
+      .object({
+        claude: z.string().optional(),
+        codex: z.string().optional(),
+        grok: z.string().optional(),
+      })
+      .optional(),
+    models: z
+      .object({
+        claude: z.string().optional(),
+        codex: z.string().optional(),
+        grok: z.string().optional(),
+      })
+      .optional(),
+  },
+  async (args) => {
+    try {
+      pruneExpiredSessions();
+      assertUnderActiveSessionLimit();
+      const { facilitator, partners, participants } = validateGroupParticipants(
+        args.participants,
+        args.facilitator
+      );
+      const target = args.diff_target || "uncommitted";
+      const execOpts = {
+        cwd: args.project_path,
+        timeout: 30000,
+        maxBuffer: 10 * 1024 * 1024,
+      };
+      let diff = "";
+      let diffStat = "";
+      let diffLabel = target;
+      if (target === "staged") {
+        diff = execSync("git diff --cached", execOpts).toString();
+        diffStat = execSync("git diff --cached --stat", {
+          ...execOpts,
+          timeout: 10000,
+        }).toString();
+      } else if (target.startsWith("commit:")) {
+        const sha = target.slice("commit:".length);
+        diff = execFileSync("git", ["show", sha, "--format="], execOpts).toString();
+        diffStat = execFileSync(
+          "git",
+          ["show", sha, "--stat", "--format="],
+          { ...execOpts, timeout: 10000 }
+        ).toString();
+      } else if (target === "branch") {
+        const base = args.base_branch || "main";
+        const head = args.branch || "HEAD";
+        try {
+          diff = execFileSync("git", ["diff", `${base}...${head}`], execOpts).toString();
+        } catch {
+          diff = execFileSync("git", ["diff", `${base}..${head}`], execOpts).toString();
+        }
+        diffLabel = `${head} vs ${base}`;
+      } else {
+        diff = execSync("git diff HEAD", execOpts).toString();
+        if (!diff.trim()) diff = execSync("git diff", execOpts).toString();
+        diffStat = execSync("git diff HEAD --stat", {
+          ...execOpts,
+          timeout: 10000,
+        }).toString();
+        diffLabel = "uncommitted changes vs HEAD";
+      }
+      if (!diff.trim()) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No changes found (${diffLabel}). Nothing to review.`,
+            },
+          ],
+        };
+      }
+      const capped = capDiffText(diff);
+      diff = capped.diff;
+
+      const softCap = args.max_rounds || 5;
+      const hardCap = softCap + 5;
+      const mode = args.mode || "review";
+      const partnerTimeoutMs = normalizePartnerTimeout(args.partner_timeout_ms);
+      let headSha = null;
+      try {
+        headSha = execSync("git rev-parse HEAD", {
+          cwd: args.project_path,
+          timeout: 10000,
+        })
+          .toString()
+          .trim();
+      } catch {}
+
+      const sessionId = `group-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+      const sessionDir = resolveSessionDir(sessionId);
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(path.join(sessionDir, "diff.patch"), diff);
+      fs.writeFileSync(
+        path.join(sessionDir, "problem.md"),
+        `Group code review (${diffLabel})\nFocus: ${args.review_focus || "general correctness and security"}`
+      );
+      fs.writeFileSync(path.join(sessionDir, "conversation.jsonl"), "");
+      fs.writeFileSync(
+        path.join(sessionDir, "review_meta.json"),
+        JSON.stringify(
+          {
+            diff_target: target,
+            diff_label: diffLabel,
+            diff_stat: diffStat.trim(),
+            review_focus: args.review_focus || null,
+            group: true,
+          },
+          null,
+          2
+        )
+      );
+
+      const status = {
+        session_id: sessionId,
+        type: "group_review",
+        started_at: new Date().toISOString(),
+        project_path: args.project_path,
+        host_agent: facilitator,
+        partner_agent: partners[0],
+        partner_agents: partners,
+        participants,
+        mode,
+        partner_commands: args.partner_commands || {},
+        partner_models: args.models || {},
+        max_rounds: softCap,
+        hard_cap: hardCap,
+        reasoning_effort: args.reasoning_effort || "high",
+        model: args.model || null,
+        partner_timeout_ms: partnerTimeoutMs,
+        tool_profile: "read",
+        diff_target: target,
+        head_sha: headSha,
+        branch: args.branch || null,
+        base_branch: args.base_branch || null,
+        turn_state: {
+          rr_index: 0,
+          pending_targets: [],
+          completed_targets: [],
+          last_host_message_id: 0,
+        },
+        runner_pid: null,
+      };
+      fs.writeFileSync(
+        path.join(sessionDir, "status.json"),
+        JSON.stringify(status, null, 2)
+      );
+
+      const pid = spawnGroupRunner({
+        sessionDir,
+        projectPath: args.project_path,
+        softCap,
+        reasoningEffort: status.reasoning_effort,
+        model: status.model,
+        hostAgent: facilitator,
+        toolProfile: "read",
+        partnerTimeoutMs,
+      });
+      status.runner_pid = pid;
+      fs.writeFileSync(
+        path.join(sessionDir, "status.json"),
+        JSON.stringify(status, null, 2)
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                session_id: sessionId,
+                dialog_dir: sessionDir,
+                type: "group_review",
+                host_agent: facilitator,
+                partner_agents: partners,
+                mode,
+                diff_label: diffLabel,
+                diff_truncated: capped.truncated,
+                message:
+                  "Group review started. Runner will invoke each partner sequentially. wait_for_partner_response(since_id:0, expect:\"all_pending\").",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err.message}` }],
+      };
+    }
   }
 );
 
