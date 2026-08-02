@@ -19,6 +19,7 @@ import {
   appendMessage,
   readStatus,
   computeReviewStatus,
+  isProcessAlive,
 } from "./shared.mjs";
 import {
   inspectPartnerTerminal,
@@ -106,6 +107,7 @@ const MAX_WAIT_TIMER_MS = 2_147_483_647;
 const WAIT_FALLBACK_INTERVAL_MS = 5000;
 const WAIT_PROGRESS_INTERVAL_MS = 30000;
 const END_DIALOG_GRACE_MS = 5500;
+const END_DIALOG_POLL_MS = 100;
 const MODEL_OVERRIDE_DESCRIPTION =
   "Optional partner model override, forwarded verbatim to the selected partner CLI. " +
   "An id absent from a LIVE catalog is rejected; where no live catalog can be " +
@@ -401,6 +403,12 @@ async function preflightPartner(partnerAgent, {
 
   return {
     ok: true,
+    // What the caller asked for, echoed back untouched. This is the only field
+    // that can prove the parameter survived transport: `effort` below is the
+    // RESOLVED value, and a legitimate alias translation (goose maps xhigh ->
+    // max) makes it differ for reasons that have nothing to do with loss.
+    requestedModel: model ?? null,
+    requestedEffort: reasoningEffort ?? null,
     // What the turn will actually run as, which is not always what was asked
     // for -- an alias may have been translated, or the CLI's own default used.
     //
@@ -417,7 +425,32 @@ async function preflightPartner(partnerAgent, {
     effectiveEffort: result.resolution?.effectiveEffort ?? null,
     model: result.resolution ? result.resolution.model : model ?? null,
     warnings: result.warnings ?? [],
+    // Info-severity findings are deliberately excluded from `warnings` by
+    // negotiate(), but they are the ones that EXPLAIN a difference between what
+    // was requested and what resolved -- effort_alias_applied and
+    // default_effort_applied both live here. Without them the docs were citing
+    // notices no caller could ever see.
+    notices: result.notices ?? [],
   };
+}
+
+/**
+ * How to describe the effort in a human-readable summary.
+ *
+ * The summary must not contradict the structured fields beside it. Printing the
+ * FLAG (`reasoning_effort`) says "null" whenever we deliberately send no flag
+ * and let the model's own default apply -- which reads as "no effort setting"
+ * when the turn will in fact run at the model's default. The effective value is
+ * the one a human is asking about.
+ */
+function describeEffort(flagEffort, effectiveEffort) {
+  if (effectiveEffort && flagEffort && effectiveEffort !== flagEffort) {
+    return `${effectiveEffort} (requested flag: ${flagEffort})`;
+  }
+  if (effectiveEffort) {
+    return flagEffort ? effectiveEffort : `${effectiveEffort} (the model's own default; no flag sent)`;
+  }
+  return "not configurable for this adapter";
 }
 
 function normalizeWaitTimeout(timeoutMs) {
@@ -655,7 +688,7 @@ function waitForSessionChange(sessionId, options, extra) {
 
 server.tool(
   "start_dialog",
-  "Start a new discussion session with a partner CLI. By default the host is Claude and the partner is Codex, but the session can be inverted so Codex hosts and Claude is the partner. Enforces a soft round budget (default 5) with a hard cap 5 rounds past that. Use subject_path for reviewed documents that should be reread each round, and tool_profile='implementation' only when the partner should edit files.",
+  "Start a new discussion session with a partner CLI. By default the host is Claude and the partner is Codex, but the session can be inverted so Codex hosts and Claude is the partner. Enforces a soft round budget (default 5) with a hard cap 5 rounds past that. Use subject_path for reviewed documents that should be reread each round, and tool_profile='implementation' only when the partner should edit files. The response echoes back the model, reasoning_effort, and other settings it actually used -- compare them against what you passed, because an omitted parameter and one lost in transit are indistinguishable here, and the echo is the only place a dropped setting becomes visible.",
   {
     problem_description: z
       .string()
@@ -786,6 +819,13 @@ server.tool(
       return { content: [{ type: "text", text: `Error: ${preflight.errorText}` }] };
     }
     const effectiveReasoningEffort = preflight.effort;
+    // The model the invocation will ACTUALLY use, which is not always the one
+    // requested: an adapter with capabilities.modelFlag:false drops it entirely
+    // (resolveContext emits dropped_model and resolves to null). Persisting and
+    // echoing the requested value there would certify a selection the turn does
+    // not make -- the precise failure the requested/resolved split exists to
+    // expose, so the resolved side has to be the one that travels.
+    const effectiveModel = preflight.model;
     // Degradations the caller must see. These are warnings rather than errors --
     // per negotiate()'s rule, a change to how WELL the partner works is loud, a
     // change to what it is ALLOWED to do is fatal -- but "loud" only counts if
@@ -829,7 +869,7 @@ server.tool(
       max_rounds: softCap,
       hard_cap: hardCap,
       reasoning_effort: effectiveReasoningEffort,
-      model: model || null,
+      model: effectiveModel ?? null,
       partner_timeout_ms: partnerTimeoutMs,
       tool_profile: tool_profile || "read",
       allow_unknown_model: allow_unknown_model === true,
@@ -856,7 +896,7 @@ server.tool(
       // argv entry to the literal "null", which the runner then reads as an
       // explicitly requested effort named "null" before dropping it again.
       effectiveReasoningEffort || "",
-      model || "",
+      effectiveModel || "",
       hostAgent,
       partnerAgent,
       tool_profile || "read",
@@ -908,16 +948,19 @@ server.tool(
               partner_command: partnerCommand,
               max_rounds: softCap,
               hard_cap: hardCap,
+              requested_model: preflight.requestedModel,
+              requested_reasoning_effort: preflight.requestedEffort,
               reasoning_effort: effectiveReasoningEffort,
               effective_reasoning_effort: preflight.effectiveEffort,
               warnings: preflightWarnings,
-              model: model || "default",
+              notices: preflight.notices ?? [],
+              model: effectiveModel ?? "default",
               partner_timeout_ms: partnerTimeoutMs,
               tool_profile: tool_profile || "read",
               subject_path: subjectPath,
               subject_kind: subjectPath ? (subject_kind || "document") : null,
               message:
-                `Dialog started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${model || "default"}, reasoning effort: ${effectiveReasoningEffort}, tool profile: ${tool_profile || "read"}. Partner turns run in detached tmux and are not killed by the wait hint. Send your first message with send_message, then wait for ${partnerDisplay}.`,
+                `Dialog started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${effectiveModel ?? "default"}, reasoning effort: ${describeEffort(effectiveReasoningEffort, preflight.effectiveEffort)}, tool profile: ${tool_profile || "read"}. Partner turns run in detached tmux and are not killed by the wait hint. Send your first message with send_message, then wait for ${partnerDisplay}.`,
             },
             null,
             2
@@ -932,7 +975,7 @@ server.tool(
 
 server.tool(
   "start_code_review",
-  "Start a code review session where the configured partner agent reviews changes in the background. By default the host is Claude and the reviewer is Codex, but the flow can be inverted so Codex hosts and Claude reviews.",
+  "Start a code review session where the configured partner agent reviews changes in the background. By default the host is Claude and the reviewer is Codex, but the flow can be inverted so Codex hosts and Claude reviews. The response echoes back the model, reasoning_effort, and other settings it actually used -- compare them against what you passed, because an omitted parameter and one lost in transit are indistinguishable here, and the echo is the only place a dropped setting becomes visible.",
   {
     project_path: z
       .string()
@@ -1067,6 +1110,13 @@ server.tool(
       return { content: [{ type: "text", text: `Error: ${preflight.errorText}` }] };
     }
     const effectiveReasoningEffort = preflight.effort;
+    // The model the invocation will ACTUALLY use, which is not always the one
+    // requested: an adapter with capabilities.modelFlag:false drops it entirely
+    // (resolveContext emits dropped_model and resolves to null). Persisting and
+    // echoing the requested value there would certify a selection the turn does
+    // not make -- the precise failure the requested/resolved split exists to
+    // expose, so the resolved side has to be the one that travels.
+    const effectiveModel = preflight.model;
     // Degradations the caller must see. These are warnings rather than errors --
     // per negotiate()'s rule, a change to how WELL the partner works is loud, a
     // change to what it is ALLOWED to do is fatal -- but "loud" only counts if
@@ -1218,7 +1268,7 @@ server.tool(
       max_rounds: softCap,
       hard_cap: hardCap,
       reasoning_effort: effectiveReasoningEffort,
-      model: model || null,
+      model: effectiveModel ?? null,
       partner_timeout_ms: partnerTimeoutMs,
       allow_unknown_model: allow_unknown_model === true,
       runner_pid: null,
@@ -1242,7 +1292,7 @@ server.tool(
       // argv entry to the literal "null", which the runner then reads as an
       // explicitly requested effort named "null" before dropping it again.
       effectiveReasoningEffort || "",
-      model || "",
+      effectiveModel || "",
       hostAgent,
       partnerAgent,
       String(partnerTimeoutMs),
@@ -1304,13 +1354,16 @@ server.tool(
               partner_command: partnerCommand,
               max_rounds: softCap,
               hard_cap: hardCap,
+              requested_model: preflight.requestedModel,
+              requested_reasoning_effort: preflight.requestedEffort,
               reasoning_effort: effectiveReasoningEffort,
               effective_reasoning_effort: preflight.effectiveEffort,
               warnings: preflightWarnings,
-              model: model || "default",
+              notices: preflight.notices ?? [],
+              model: effectiveModel ?? "default",
               partner_timeout_ms: partnerTimeoutMs,
               message:
-                `Code review started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${model || "default"}, reasoning effort: ${effectiveReasoningEffort}. ${partnerDisplay} is generating an initial review in detached tmux and is not killed by the wait hint.` +
+                `Code review started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${effectiveModel ?? "default"}, reasoning effort: ${describeEffort(effectiveReasoningEffort, preflight.effectiveEffort)}. ${partnerDisplay} is generating an initial review in detached tmux and is not killed by the wait hint.` +
                 (diff.length > MAX_REVIEW_DIFF_CHARS
                   ? ` NOTE: this diff is ${diff.length} chars and only the first ${MAX_REVIEW_DIFF_CHARS} (${Math.round((MAX_REVIEW_DIFF_CHARS / diff.length) * 100)}%) are embedded in ${partnerDisplay}'s prompt. It is instructed to read the changed files from ${project_path} for the remainder, but treat any finding that depends on the unembedded portion as unverified unless it cites the file it read.`
                   : ""),
@@ -1784,15 +1837,31 @@ server.tool(
     }
 
     if (isSessionRunnerAlive(status, sessionDir)) {
-      await new Promise((resolve) => setTimeout(resolve, END_DIALOG_GRACE_MS));
+      // Observe the runner rather than assume it. An idle runner checks
+      // end_signal at the TOP of its loop, so it usually exits within a few
+      // hundred milliseconds of the write above -- measured at ~200ms -- while
+      // a flat sleep charged every caller the full worst case before returning.
+      //
+      // The poll deliberately uses isProcessAlive (a cheap kill(pid, 0)) rather
+      // than isSessionRunnerAlive: waiting has no side effects, so it does not
+      // need the command-line identity check, and running that check 55 times
+      // would spawn 55 `ps` processes. Identity still gates the SIGTERM below,
+      // which is the only step that can harm an unrelated process after PID
+      // reuse.
+      const graceEndsAt = Date.now() + END_DIALOG_GRACE_MS;
+      while (Date.now() < graceEndsAt && isProcessAlive(status.runner_pid)) {
+        await new Promise((resolve) => setTimeout(resolve, END_DIALOG_POLL_MS));
+      }
       if (isSessionRunnerAlive(status, sessionDir)) {
         try {
           process.kill(status.runner_pid, "SIGTERM");
         } catch {
           /* already dead */
         }
+        // Only meaningful after a signal: give SIGTERM time to land before the
+        // sweeps below look for what the runner left behind.
+        await new Promise((resolve) => setTimeout(resolve, 500));
       }
-      await new Promise((resolve) => setTimeout(resolve, 500));
       await terminateCurrentPartnerTerminal(sessionDir);
       unlinkProcessingMarkers(sessionDir);
       // The runner had to be signalled, so it may have spawned a child between

@@ -566,7 +566,16 @@ function readJson(filePath) {
   }
 }
 
-function buildTmuxArgs(args) {
+/**
+ * The socket every tmux call in this process must use.
+ *
+ * Exported because a caller outside this module needs to ask tmux the same
+ * question this one does -- and asking on the DEFAULT socket instead of ours
+ * would report "session absent" for a session that is running perfectly well
+ * on the dualog socket. Any second implementation of this lookup is a bug
+ * waiting to happen, so there is one.
+ */
+export function tmuxSocketName() {
   const socketName = envWithAliases(
     ["DUALOG_TMUX_SOCKET", "CODEX_DIALOG_TMUX_SOCKET", "CONDUCTOR_TMUX_SOCKET"],
     DEFAULT_TMUX_SOCKET_NAME
@@ -575,7 +584,11 @@ function buildTmuxArgs(args) {
   if (!trimmedSocketName || trimmedSocketName.includes("/") || trimmedSocketName.includes("\0")) {
     throw new Error("tmux socket name must be a non-empty name, not a path");
   }
-  return ["-f", "/dev/null", "-L", trimmedSocketName, ...args];
+  return trimmedSocketName;
+}
+
+function buildTmuxArgs(args) {
+  return ["-f", "/dev/null", "-L", tmuxSocketName(), ...args];
 }
 
 async function prepareTmuxServer() {

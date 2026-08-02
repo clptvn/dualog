@@ -4,7 +4,7 @@
 
 import fs from "fs";
 import path from "path";
-import { dialogsDir, readStdin } from "../platform.mjs";
+import { resolveExistingSessionDir, readHookPayload } from "../platform.mjs";
 
 async function loadShared() {
   const installedShared = new URL("./shared.mjs", import.meta.url);
@@ -17,18 +17,34 @@ function block(message) {
   process.exit(2);
 }
 
-const input = readStdin();
-let payload;
-try {
-  payload = JSON.parse(input);
-} catch {
-  process.exit(0);
+// A gate that cannot UNDERSTAND its input must not wave the call through.
+//
+// Three failing shapes, two answers. "unreadable" means the budget expired with
+// nothing arriving (transient EAGAIN is already retried inside
+// readHookPayload, so this is not a momentary blip). "invalid" means bytes
+// arrived but are not valid JSON -- a truncated or corrupted write. In both the
+// hook cannot evaluate the decision it exists to make, so it blocks: exit 2 is
+// the direction a safety check should fail. Only a clean EMPTY read is benign,
+// because there is genuinely nothing to check.
+const { payload, outcome } = readHookPayload();
+if (outcome === "unreadable" || outcome === "invalid") {
+  process.stderr.write(
+    `BLOCKED: the dualog session-close gate received ${outcome} hook input, so it cannot verify ` +
+      "this call. Retry; if this persists, check that the hook payload is being piped intact.\n"
+  );
+  process.exit(2);
 }
+if (outcome !== "ok" || !payload) process.exit(0);
 
 const sessionId = payload.tool_input?.session_id;
 if (!sessionId || !/^[\w-]+$/.test(sessionId)) process.exit(0);
 
-const sessionDir = path.join(dialogsDir(), sessionId);
+// resolveExistingSessionDir, not dialogSessionDir: the MCP server resolves a
+// session through the legacy root as well, and a hook that only checks the
+// current root cannot find any pre-rename session. Its existence check below
+// then exits 0 -- which means ALLOW -- so the guard silently stopped applying
+// to every session created before the rename.
+const sessionDir = resolveExistingSessionDir(sessionId);
 if (!fs.existsSync(sessionDir)) process.exit(0);
 
 let partnerAgent = "codex";

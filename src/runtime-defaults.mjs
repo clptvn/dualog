@@ -11,11 +11,17 @@ export const DEFAULT_REASONING_EFFORT = "high";
  */
 export const MAX_REVIEW_DIFF_CHARS = 50000;
 
-// Retained only for the legacy hand-written buildInvocation() that the golden
-// argv snapshots compare against. NOT a validation source: which efforts a given
+// These feed ALL_REASONING_EFFORTS, which the server unions with every
+// installed adapter's own list to build the accepted values for the
+// `reasoning_effort` TOOL PARAMETER -- so a caller is told "not a known effort"
+// at the MCP boundary rather than deep inside an adapter.
+//
+// NOT a validation source for what a given model will honour: which efforts a
 // MODEL accepts is a per-model fact the adapter manifests carry, and treating
 // these two lists as the answer is what rejected Goose's `off` and Grok's
 // `minimal` while letting Claude's `xhigh` through for models that refuse it.
+// (They were also read by the hand-written buildInvocation(), which has since
+// been deleted -- they are not retained for it.)
 export const CODEX_REASONING_EFFORTS = [
   "low",
   "medium",

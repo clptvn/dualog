@@ -1,5 +1,5 @@
 import fs from "fs";
-import { envWithAliases } from "./platform.mjs";
+import { assertManagedSessionPath, envWithAliases } from "./platform.mjs";
 import path from "path";
 import crypto from "crypto";
 import { getAgentDisplayName, normalizeAgent } from "./shared.mjs";
@@ -16,15 +16,7 @@ import {
   terminateTmuxSession,
   writeTerminalState,
 } from "./tmux-runtime.mjs";
-import {
-  CLAUDE_REASONING_EFFORTS,
-  CODEX_REASONING_EFFORTS,
-} from "./runtime-defaults.mjs";
 import { buildInvocationFromAdapter } from "./adapters/argv.mjs";
-// Imported rather than redefined. A recursion guard with two definitions is a
-// recursion guard that can drift, and only one of them would be the one a real
-// spawn uses.
-import { partnerSentinelEnv } from "./adapters/env.mjs";
 import { resolveDiscoveryForValidation } from "./adapters/resolve-for-validation.mjs";
 import { getAdapter, tryGetAdapter } from "./adapters/registry.mjs";
 import {
@@ -39,13 +31,7 @@ import {
 import { resolveEngine } from "./engines/index.mjs";
 import { runHeadlessTurn } from "./engines/headless.mjs";
 
-const VALID_CODEX_EFFORTS = new Set(CODEX_REASONING_EFFORTS);
-const VALID_CLAUDE_EFFORTS = new Set(CLAUDE_REASONING_EFFORTS);
 const VALID_TOOL_PROFILES = new Set(["read", "implementation"]);
-const CLAUDE_READ_TOOLS = "Read,Grep,Glob,Bash,LSP";
-const CLAUDE_IMPLEMENTATION_TOOLS =
-  "Read,Grep,Glob,Bash,LSP,Edit,MultiEdit,Write";
-const CLAUDE_READ_DISALLOWED_TOOLS = "Edit,MultiEdit,Write,NotebookEdit";
 const POST_SUBMIT_VERIFY_MS = parsePositiveInt(
   envWithAliases(["DUALOG_POST_SUBMIT_VERIFY_MS", "CODEX_DIALOG_POST_SUBMIT_VERIFY_MS"]),
   30000
@@ -131,126 +117,16 @@ function parsePositiveInt(value, fallback) {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-// Exported for the golden argv snapshots. Those snapshots are the regression
-// proof for the adapter-registry refactor: the registry-driven argv builder
-// must reproduce this function's output byte for byte.
-export function buildInvocation({
-  partnerAgent,
-  partnerCommand,
-  projectPath,
-  sessionDir,
-  model,
-  reasoningEffort,
-  toolProfile,
-  sessionName,
-  initialPrompt,
-}) {
-  const normalizedAgent = normalizeAgent(partnerAgent, "codex");
-  const normalizedToolProfile = normalizeToolProfile(toolProfile);
-
-  if (normalizedAgent === "claude") {
-    const allowedTools =
-      normalizedToolProfile === "implementation"
-        ? CLAUDE_IMPLEMENTATION_TOOLS
-        : CLAUDE_READ_TOOLS;
-    const emptyMcpConfigPath = path.join(sessionDir, "claude-empty-mcp.json");
-    ensureEmptyClaudeMcpConfig(emptyMcpConfigPath);
-    const args = [
-      "--permission-mode",
-      "bypassPermissions",
-      "--allowedTools",
-      allowedTools,
-      "--mcp-config",
-      emptyMcpConfigPath,
-      "--strict-mcp-config",
-      "--add-dir",
-      projectPath,
-      "--add-dir",
-      sessionDir,
-      "--name",
-      sessionName,
-    ];
-    if (normalizedToolProfile === "read") {
-      args.push("--disallowedTools", CLAUDE_READ_DISALLOWED_TOOLS);
-    }
-    if (model) {
-      args.push("--model", model);
-    }
-    if (reasoningEffort && VALID_CLAUDE_EFFORTS.has(reasoningEffort)) {
-      args.push("--effort", reasoningEffort);
-    }
-    return { command: partnerCommand, args, env: partnerSentinelEnv() };
-  }
-
-  const args = [
-    "-C",
-    projectPath,
-    "--sandbox",
-    "workspace-write",
-    "--add-dir",
-    sessionDir,
-    "--ask-for-approval",
-    "never",
-    "--no-alt-screen",
-    "-c",
-    'approval_policy="never"',
-  ];
-  if (model) {
-    args.push("--model", model);
-  }
-  if (reasoningEffort && VALID_CODEX_EFFORTS.has(reasoningEffort)) {
-    args.push("-c", `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
-  }
-  if (initialPrompt) {
-    args.push(initialPrompt);
-  }
-  return {
-    command: partnerCommand,
-    args,
-    env: { ...prepareCodexPartnerEnv(sessionDir), ...partnerSentinelEnv() },
-    usesInitialPrompt: Boolean(initialPrompt),
-  };
-}
-
-function prepareCodexPartnerEnv(sessionDir) {
-  const sourceHome =
-    process.env.CODEX_HOME ||
-    (process.env.HOME ? path.join(process.env.HOME, ".codex") : null);
-  const partnerHome = path.join(sessionDir, "codex-home");
-  fs.mkdirSync(partnerHome, { recursive: true });
-
-  if (sourceHome) {
-    copyIfMissing(path.join(sourceHome, "auth.json"), path.join(partnerHome, "auth.json"));
-    copyIfExists(path.join(sourceHome, "version.json"), path.join(partnerHome, "version.json"));
-  }
-
-  return { CODEX_HOME: partnerHome };
-}
-
-function ensureEmptyClaudeMcpConfig(configPath) {
-  if (fs.existsSync(configPath)) return;
-  fs.writeFileSync(configPath, JSON.stringify({ mcpServers: {} }, null, 2) + "\n");
-}
-
-function copyIfExists(sourcePath, targetPath) {
-  try {
-    if (fs.existsSync(sourcePath)) {
-      fs.copyFileSync(sourcePath, targetPath);
-    }
-  } catch {
-    // Missing auth is surfaced by the Codex CLI itself and captured from tmux.
-  }
-}
-
-function copyIfMissing(sourcePath, targetPath) {
-  try {
-    if (!fs.existsSync(targetPath)) {
-      copyIfExists(sourcePath, targetPath);
-    }
-  } catch {
-    // Missing auth is surfaced by the Codex CLI itself and captured from tmux.
-  }
-}
+// The hand-written per-agent buildInvocation() lived here until the adapter
+// registry replaced it. It is gone rather than kept as a reference, because it
+// had stopped being inert: its codex branch called a private
+// prepareCodexPartnerEnv() that created `<sessionDir>/codex-home` and copied
+// auth.json into it WITHOUT passing through assertManagedSessionPath() -- a
+// second credential-writing path that the containment boundary did not cover.
+// Its only remaining caller was the golden-snapshot equivalence gate, which had
+// already served its purpose: the snapshots now come from
+// buildInvocationFromAdapter() directly, so the same argv is still pinned with
+// one implementation instead of two.
 
 export async function runPartnerCommand({
   partnerAgent,
@@ -283,14 +159,31 @@ export async function runPartnerCommand({
   const resolvedAdapter = getAdapter(normalizedAgent);
   const engine = resolveEngine(resolvedAdapter, { requested: requestedEngine, log });
 
+  const turnId = `${tempPrefix || normalizedAgent}-${Date.now()}-${crypto
+    .randomBytes(4)
+    .toString("hex")}`;
+  // Containment is proven HERE, not later inside config isolation.
+  //
+  // This is the first write of the turn, and it happens ~60 lines before
+  // buildInvocationFromAdapter()/runHeadlessTurn() reach
+  // assertManagedSessionPath(). So an unvalidated sessionDir still got a
+  // `turns/<id>/prompt.md` -- the full prompt text -- written into it, and only
+  // then was the call refused. The refusal was correct and far too late: the
+  // audit that said "every credential-writing path is contained" missed that a
+  // prompt is written first, into a directory nobody had checked.
+  const turnDir = assertManagedSessionPath(sessionDir, path.join(sessionDir, "turns", turnId), {
+    fn: "runPartnerCommand turn directory",
+  });
+
+  // Only now: whether tmux happens to be installed is an ENVIRONMENT question,
+  // and it used to be asked first -- so on a machine without tmux an unmanaged
+  // session directory was refused with "tmux is required" instead of the
+  // containment error, and the boundary was effectively gated behind a probe.
+  // A security decision must not depend on what is on PATH.
   if (engine === "tmux-interactive" && !(await isTmuxAvailable())) {
     throw new Error("tmux is required for interactive partner sessions but was not found on PATH");
   }
 
-  const turnId = `${tempPrefix || normalizedAgent}-${Date.now()}-${crypto
-    .randomBytes(4)
-    .toString("hex")}`;
-  const turnDir = path.join(sessionDir, "turns", turnId);
   fs.mkdirSync(turnDir, { recursive: true });
 
   const promptPath = path.join(turnDir, "prompt.md");

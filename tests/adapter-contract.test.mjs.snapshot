@@ -87,8 +87,8 @@ exports[`argv for every adapter and engine 1`] = `
     "env": {
       "GOOSE_MODE": "auto",
       "GOOSE_THINKING_EFFORT": "off",
-      "GOOSE_PATH_ROOT": "<SESSION_DIR>/goose-root",
       "GOOSE_DISABLE_KEYRING": "1",
+      "GOOSE_PATH_ROOT": "<SESSION_DIR>/goose-root",
       "DUALOG_ROLE": "partner",
       "DUALOG_DEPTH": "1"
     }
@@ -171,9 +171,9 @@ exports[`argv for every adapter and engine 1`] = `
       "Completion protocol is mandatory: write result.md then done.json"
     ],
     "env": {
-      "OPENCODE_CONFIG_DIR": "<SESSION_DIR>/opencode-config",
       "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
       "XDG_DATA_HOME": "<SESSION_DIR>/opencode-data",
+      "OPENCODE_CONFIG_DIR": "<SESSION_DIR>/opencode-config",
       "DUALOG_ROLE": "partner",
       "DUALOG_DEPTH": "1"
     }

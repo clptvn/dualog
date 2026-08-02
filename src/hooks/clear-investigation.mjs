@@ -6,15 +6,21 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { readStdin } from "../platform.mjs";
+import { readHookPayload } from "../platform.mjs";
 
-const input = readStdin();
-let payload;
-try {
-  payload = JSON.parse(input);
-} catch {
+// PostToolUse: the call has already run, so blocking is meaningless. Failing
+// here is less severe than in mark-needs-investigation -- this hook only CLEARS
+// a marker, so a failed read leaves the guard armed rather than disarmed, which
+// errs safe. It still must not be silent: the read the operator just performed
+// will not count toward satisfying the investigation requirement.
+const { payload, outcome } = readHookPayload();
+if (outcome === "unreadable" || outcome === "invalid") {
+  process.stderr.write(
+    `dualog investigation cleaner: received ${outcome} hook input; this file read was not credited against the investigation requirement.\n`
+  );
   process.exit(0);
 }
+if (outcome !== "ok" || !payload) process.exit(0);
 
 const filePath = payload.tool_input?.file_path;
 if (!filePath) process.exit(0);

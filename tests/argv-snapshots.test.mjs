@@ -1,9 +1,23 @@
 // Golden argv snapshots.
 //
-// This file is the regression proof for the adapter-registry refactor. It
-// captures the exact command, argv, and env that the current per-agent
-// buildInvocation produces across the full input matrix. When argv construction
-// moves into data-driven adapter manifests, these snapshots must not move.
+// These capture the command, argv, and env that adapter resolution produces for
+// the claude and codex partners, across the matrix of caller-supplied inputs
+// that change them.
+//
+// They are NOT the full production invocation: a real turn also passes
+// `applyOperatorDefault: true`, plus `discoveredModels` and `allowUnknownModel`,
+// and the operator default alone appends a `model_reasoning_effort` flag that
+// appears in no snapshot here. Read a diff as "argv construction changed for
+// these inputs", not as "the partner CLI is now invoked differently in every
+// respect".
+//
+// They began as the equivalence proof for the adapter-registry refactor: a
+// hand-written per-agent builder and the data-driven one had to agree byte for
+// byte. That gate has been retired along with the hand-written builder, which
+// had stopped being harmless -- it wrote credentials through a path the
+// containment boundary did not cover. The SNAPSHOTS did not change when the
+// equivalence half was deleted, which is exactly the evidence that removing it
+// preserved behaviour.
 //
 // Regenerate deliberately with:  node --test --test-update-snapshots tests/argv-snapshots.test.mjs
 // A diff here means partner CLI invocation changed. That is either the point of
@@ -17,6 +31,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { clearRecursionSentinel } from "./helpers/sentinel.mjs";
+import { managedSession } from "./helpers/session.mjs";
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 
@@ -26,7 +41,7 @@ const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 // depth 2 -- a diff about the runner, not about argv construction.
 clearRecursionSentinel();
 
-// Point CODEX_HOME at a throwaway dir before importing: buildInvocation copies
+// Point CODEX_HOME at a throwaway dir before importing: config isolation seeds
 // auth.json out of it, and we must not touch the developer's real credentials.
 const FIXTURE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "argv-snapshot-home-"));
 fs.mkdirSync(path.join(FIXTURE_HOME, ".codex"), { recursive: true });
@@ -36,16 +51,14 @@ fs.writeFileSync(
 );
 process.env.CODEX_HOME = path.join(FIXTURE_HOME, ".codex");
 
-const { buildInvocation } = await import("../src/partner-invocation.mjs");
-
 const PROJECT_PATH = "/fixture/project";
-const SESSION_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "argv-snapshot-session-"));
+const { home: SESSION_HOME, dir: SESSION_DIR } = managedSession("argvsnap");
 const SESSION_NAME = "ccd-dialog-1700000000000-abcd1234-turn";
 const BOOTSTRAP = "Read the prompt file at:\n/fixture/session/turns/t1/prompt.md";
 
 process.on("exit", () => {
   fs.rmSync(FIXTURE_HOME, { recursive: true, force: true });
-  fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+  fs.rmSync(SESSION_HOME, { recursive: true, force: true });
 });
 
 // Absolute temp paths differ every run. Replace them with stable tokens so the
@@ -60,18 +73,38 @@ function stabilize(value) {
   );
 }
 
+const { buildInvocationFromAdapter } = await import("../src/adapters/argv.mjs");
+const { getAdapter, resetRegistry } = await import("../src/adapters/registry.mjs");
+
+// Isolate from any user- or project-level adapter overrides on this machine:
+// these snapshots describe the BUILT-IN manifests, and a local override that
+// merged into one by id would silently rewrite what they claim.
+resetRegistry();
+const registryOptions = {
+  cwd: REPO_ROOT,
+  env: { XDG_CONFIG_HOME: path.join(FIXTURE_HOME, "xdg"), XDG_CONFIG_DIRS: "" },
+};
+
 function invoke(overrides) {
-  const result = buildInvocation({
-    partnerCommand: overrides.partnerAgent === "claude" ? "claude" : "codex",
+  // Only the two agents whose argv these snapshots describe. This is NOT
+  // normalizeAgent's behaviour and must not be mistaken for it: a well-formed
+  // but unknown id passes through normalizeAgent verbatim and then makes
+  // getAdapter() throw. That contract is pinned in its own test file rather
+  // than smuggled in here.
+  const requested = overrides.partnerAgent ?? "codex";
+  const adapter = getAdapter(requested, registryOptions);
+
+  const result = buildInvocationFromAdapter(adapter, {
+    partnerCommand: requested === "claude" ? "claude" : "codex",
     projectPath: PROJECT_PATH,
     sessionDir: SESSION_DIR,
     sessionName: SESSION_NAME,
-    model: null,
-    reasoningEffort: null,
-    toolProfile: "read",
-    initialPrompt: null,
-    ...overrides,
+    model: overrides.model ?? null,
+    reasoningEffort: overrides.reasoningEffort ?? null,
+    toolProfile: overrides.toolProfile ?? "read",
+    initialPrompt: overrides.initialPrompt ?? null,
   });
+
   return stabilize({
     command: result.command,
     args: result.args,
@@ -142,11 +175,6 @@ const CASES = [
     },
   ],
 
-  // --- Agent normalization ----------------------------------------------
-  [
-    "unknown agent normalizes to codex",
-    { partnerAgent: "definitely-not-a-real-agent" },
-  ],
 ];
 
 for (const [name, overrides] of CASES) {
@@ -188,60 +216,6 @@ test("argv entries are all strings -- no undefined or null slipping through", ()
     }
   }
 });
-
-// ---------------------------------------------------------------------------
-// Equivalence gate.
-//
-// This is the safety argument for the whole adapter refactor: the data-driven
-// builder must reproduce the hand-written per-agent builder exactly, for every
-// case above. If this passes, swapping the call site is behavior-preserving.
-// ---------------------------------------------------------------------------
-
-const { buildInvocationFromAdapter } = await import("../src/adapters/argv.mjs");
-const { getAdapter, resetRegistry } = await import("../src/adapters/registry.mjs");
-
-// Isolate from any user- or project-level adapter overrides on this machine:
-// the equivalence claim is about the built-in manifests only.
-resetRegistry();
-const registryOptions = {
-  cwd: REPO_ROOT,
-  env: { XDG_CONFIG_HOME: path.join(FIXTURE_HOME, "xdg"), XDG_CONFIG_DIRS: "" },
-};
-
-function invokeViaAdapter(overrides) {
-  const requested = overrides.partnerAgent ?? "codex";
-  // Mirrors normalizeAgent's fallback: an unrecognized agent becomes codex.
-  const id = ["claude", "codex"].includes(requested) ? requested : "codex";
-  const adapter = getAdapter(id, registryOptions);
-
-  const result = buildInvocationFromAdapter(adapter, {
-    partnerCommand: requested === "claude" ? "claude" : "codex",
-    projectPath: PROJECT_PATH,
-    sessionDir: SESSION_DIR,
-    sessionName: SESSION_NAME,
-    model: overrides.model ?? null,
-    reasoningEffort: overrides.reasoningEffort ?? null,
-    toolProfile: overrides.toolProfile ?? "read",
-    initialPrompt: overrides.initialPrompt ?? null,
-  });
-
-  return stabilize({
-    command: result.command,
-    args: result.args,
-    env: result.env ?? null,
-    usesInitialPrompt: result.usesInitialPrompt ?? false,
-  });
-}
-
-for (const [name, overrides] of CASES) {
-  test(`adapter matches hand-written builder: ${name}`, () => {
-    assert.deepEqual(
-      invokeViaAdapter(overrides),
-      invoke(overrides),
-      `data-driven argv diverged from the hand-written builder for: ${name}`
-    );
-  });
-}
 
 test("every built-in adapter validates and records its source file", async () => {
   const { listAdapters } = await import("../src/adapters/registry.mjs");

@@ -41,7 +41,7 @@ Determine the git root and call `mcp__dualog__start_dialog` with:
 - `host_agent: "codex"`
 - `partner_agent: "claude"`
 - `max_rounds` only if explicitly requested
-- `reasoning_effort` only if explicitly requested; otherwise omit it so the server default of `high` is used
+- `reasoning_effort` only if explicitly requested; otherwise omit it so the model's own default is used (the server falls back to `high` only for models that declare no default of their own)
 - `model` only if explicitly requested
 - `partner_timeout_ms` if `timeout:*` was explicitly requested, or `1800000` if `effort:max` was explicitly requested without a timeout override
 - `subject_path`: the resolved plan file path
@@ -49,6 +49,16 @@ Determine the git root and call `mcp__dualog__start_dialog` with:
 - `problem_description`: a short summary such as `Implementation plan review for <path>. Claude Code will adversarially review feasibility, ordering, and completeness.`
 
 Save the returned `session_id`.
+
+**Verify what the server actually used.** The start response echoes `requested_model` / `requested_reasoning_effort` (what you passed) alongside `model` / `reasoning_effort` (what resolved). Compare the **requested** fields against your own call: if something you specified comes back as `null` there, that parameter never arrived and the session is running on settings you did not choose. End it and retry.
+
+Do **not** treat a difference between requested and resolved as a failure. That difference is normal and usually correct -- an adapter may translate an effort it names differently (goose maps a requested `xhigh` onto its own `max`), and omitting an effort deliberately resolves to the model's own default. Those cases are reported in the response's `notices` array as `effort_alias_applied` or `default_effort_applied`, and are working as intended.
+
+Read the three effort fields as three different questions. `requested_reasoning_effort` is what you asked for -- use it to check transport. `reasoning_effort` is the flag actually passed to the CLI, which is `null` when we deliberately pass none. **`effective_reasoning_effort` is what the turn will really run at**, including the model's own default when no flag is sent. For `gpt-5.6-sol` with effort omitted the response is `requested_reasoning_effort: null`, `reasoning_effort: null`, `effective_reasoning_effort: "low"` -- so read `effective_reasoning_effort`, not `reasoning_effort`, to know the runtime behavior.
+
+Ending is possible at this point specifically because the partner has not spoken yet: a session with no partner turns has no findings to abandon, so `end_dialog` is permitted. Once the partner has replied, the usual approval/round-budget gating applies.
+
+The server cannot catch a dropped parameter for you. A parameter the caller deliberately omitted and one lost in transit are identical on the wire, so the echoed values are the only place the difference is visible.
 
 ## Kick off the review
 

@@ -236,12 +236,23 @@ test("graceful shutdown escalates to SIGKILL instead of scheduling it", async (t
   assert.ok(Date.now() - started < 3000, "escalation should not wait on the 2s fire-and-forget timer");
 });
 
-test("a stubborn leaderless descendant is escalated and only then forgotten", async (t) => {
-  // The failure mode the cooperative single-process test cannot reach: the
-  // leader is GONE (so classification must come from the group) and the
-  // survivor IGNORES SIGTERM (so the record must not be dropped until KILL has
-  // actually worked). Signalling, scheduling an unref'd KILL, and unlinking
-  // immediately left this process alive and permanently unfindable.
+test("a leaderless group is retained, never signalled, because ownership is unprovable", async (t) => {
+  // This case used to assert the opposite -- that a leaderless group is
+  // recognizably ours and may be killed. The justification was POSIX fork()
+  // ("the child process ID also shall not match any active process group ID")
+  // plus the group-lifetime rule, which together seemed to make PGID reuse
+  // without a leader impossible.
+  //
+  // It is not impossible. Our group can lose its last member (so the id stops
+  // being active and becomes allocatable), an unrelated process can then take
+  // that pid and lead a NEW group, and that leader can exit leaving its own
+  // descendants. The result is a leaderless group N containing nothing of ours,
+  // indistinguishable from this fixture. The old assertion was therefore
+  // pinning a rule that authorizes killing strangers.
+  //
+  // The test process knows the descendant below is ours. The SWEEPER cannot
+  // know that from the persisted evidence, and this asserts what the sweeper is
+  // entitled to conclude -- not what we happen to know.
   const sessionDir = makeSession();
   t.after(() => fs.rmSync(sessionDir, { recursive: true, force: true }));
 
@@ -296,15 +307,15 @@ test("a stubborn leaderless descendant is escalated and only then forgotten", as
     return;
   }
 
-  assert.equal(signalled, 1, "a leaderless group must still be recognized as ours");
+  assert.equal(signalled, 0, "a leaderless group must not be signalled");
   assert.equal(
     isProcessAlive(kid),
-    false,
-    "a SIGTERM-ignoring descendant must be escalated to SIGKILL before the call returns"
+    true,
+    "and the descendant must survive: we cannot prove it is ours rather than a stranger's"
   );
   assert.equal(
     fs.existsSync(recordPath),
-    false,
-    "the record goes only once the group is proven dead"
+    true,
+    "the record is retained so a later sweep can decide with better evidence"
   );
 });

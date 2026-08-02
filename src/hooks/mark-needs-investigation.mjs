@@ -6,15 +6,21 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { dialogSessionDir, readStdin } from "../platform.mjs";
+import { resolveExistingSessionDir, readHookPayload } from "../platform.mjs";
 
-const input = readStdin();
-let payload;
-try {
-  payload = JSON.parse(input);
-} catch {
+// PostToolUse: the call has already run, so blocking is meaningless. But a
+// failed read is not harmless -- this hook arms the guard that runs later, and
+// skipping it silently disables that guard without a trace. Both failure
+// shapes ("unreadable" and "invalid") are reported; a clean empty read is not
+// a failure and stays quiet.
+const { payload, outcome } = readHookPayload();
+if (outcome === "unreadable" || outcome === "invalid") {
+  process.stderr.write(
+    `dualog investigation marker: received ${outcome} hook input; the downstream guard was not armed for this turn.\n`
+  );
   process.exit(0);
 }
+if (outcome !== "ok" || !payload) process.exit(0);
 
 // Claude Code passes tool_response as [{type, text}], but handle the raw
 // MCP shape (content: [{type, text}]) too for robustness.
@@ -36,7 +42,7 @@ if (!sessionId || !/^[\w-]+$/.test(sessionId)) process.exit(0);
 
 let partnerAgent = "codex";
 try {
-  const statusPath = path.join(dialogSessionDir(sessionId), "status.json");
+  const statusPath = path.join(resolveExistingSessionDir(sessionId), "status.json");
   if (fs.existsSync(statusPath)) {
     const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
     if (status?.partner_agent === "claude" || status?.partner_agent === "codex") {

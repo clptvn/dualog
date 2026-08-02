@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import { getAdapter, resetRegistry } from "../src/adapters/registry.mjs";
 import { negotiate } from "../src/adapters/negotiate.mjs";
 import { buildInvocationFromAdapter } from "../src/adapters/argv.mjs";
+import { managedSession } from "./helpers/session.mjs";
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const SERVER_SRC = fs.readFileSync(path.join(REPO_ROOT, "src/dialog-server.mjs"), "utf-8");
@@ -38,8 +39,8 @@ const adapter = (id) =>
 // An earlier version of this file used REPO_ROOT and quietly deposited live
 // credentials in the working tree on every run -- one `git add -A` away from
 // being committed.
-const SESSION_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-handoff-"));
-process.on("exit", () => fs.rmSync(SESSION_DIR, { recursive: true, force: true }));
+const { home: SESSION_HOME, dir: SESSION_DIR } = managedSession("handoff");
+process.on("exit", () => fs.rmSync(SESSION_HOME, { recursive: true, force: true }));
 
 /** A live, enumerable catalog that does NOT contain the requested id. */
 const CATALOG_WITHOUT = {

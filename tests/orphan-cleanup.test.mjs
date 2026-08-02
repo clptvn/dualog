@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 import { killTmuxServer } from "./helpers/tmux.mjs";
+import { managedSession } from "./helpers/session.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tmuxSocket = `codex-dialog-cleanup-test-${process.pid}`;
@@ -120,9 +121,7 @@ test(
       return;
     }
 
-    const sessionDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), "codex-dialog-orphan-cleanup-")
-    );
+    const { home: sessionHome, dir: sessionDir } = managedSession("orphancleanup");
     const fakeCodex = path.join(sessionDir, "fake-codex.sh");
     const runnerToken = "cleanup-regression-token";
     fs.writeFileSync(
@@ -203,7 +202,7 @@ test(
         runner.kill("SIGKILL");
       }
       await terminateCurrentPartnerTerminal(sessionDir).catch(() => {});
-      fs.rmSync(sessionDir, { recursive: true, force: true });
+      fs.rmSync(sessionHome, { recursive: true, force: true });
     });
 
     const terminal = await waitFor(() => {
@@ -243,9 +242,7 @@ test(
       return;
     }
 
-    const sessionDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), "codex-dialog-submission-cleanup-")
-    );
+    const { home: sessionHome, dir: sessionDir } = managedSession("submissioncleanup");
     const fakeClaude = path.join(sessionDir, "fake-claude.sh");
     const runnerToken = "submission-cleanup-token";
     fs.writeFileSync(
@@ -330,7 +327,7 @@ test(
         runner.kill("SIGKILL");
       }
       await terminateCurrentPartnerTerminal(sessionDir).catch(() => {});
-      fs.rmSync(sessionDir, { recursive: true, force: true });
+      fs.rmSync(sessionHome, { recursive: true, force: true });
     });
 
     const terminal = await waitFor(() => {

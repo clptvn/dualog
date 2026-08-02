@@ -539,9 +539,24 @@ function writeChildRecord(turnDir, child, command) {
           // "opencode" proves only that the recycled PID is running the same
           // program, not that it is this turn's process.
           command,
-          // The identity that actually distinguishes one PID N from the next.
-          // A PID is reused; a (pid, start time) pair is not. Read from the OS
-          // at spawn so a later sweep can demand an exact match.
+          // What distinguishes one PID N from the next -- imperfectly, and the
+          // imperfection is worth naming.
+          //
+          // This is `ps -o lstart=`, which formats to SECONDS. Two processes
+          // spawned milliseconds apart report identical values (verified), so a
+          // (pid, start time) pair is not mathematically unique and the earlier
+          // comment claiming it was overstated the data. What the pair rules out
+          // is a stale record colliding with an arbitrary future process:
+          // because lstart carries the full date, the old leader must die AND
+          // PID N be reassigned to a new leader BEFORE the original birth second
+          // elapses. Once the clock ticks over, no later reuse can compare equal.
+          //
+          // The residual is that one-second window. macOS exposes microseconds
+          // only through proc_pidinfo(PROC_PIDTBSDINFO); no unprivileged stock
+          // command prints them (`launchctl procinfo` needs root, `lsappinfo`
+          // covers LaunchServices apps only), so closing it means a native addon
+          // or FFI -- not worth the packaging surface for best-effort local
+          // orphan cleanup.
           start_time: readProcessStartTime(child.pid),
           started_at: new Date().toISOString(),
         },
@@ -584,14 +599,34 @@ function readProcessStartTime(pid) {
  */
 function identifyRecordedLeader(record) {
   const pid = record?.pid;
-  if (!Number.isSafeInteger(pid) || pid <= 0) return "no";
-  if (!isProcessAlive(pid)) return "no";
+  // "absent" and "not-ours" are BOTH negative, and collapsing them is a bug in
+  // both directions. Absent means the leader is gone, which is the whole
+  // premise of the group check that follows -- its descendants may still be
+  // running. Not-ours means a live process was inspected and disqualified, and
+  // that verdict is final: re-asking the group about the very same pid would
+  // hand back a second opinion on a question already settled.
+  if (!Number.isSafeInteger(pid) || pid <= 0) return "absent";
+  if (!isProcessAlive(pid)) return "absent";
 
   // Strongest available signal: PID plus OS start time.
   if (record.start_time) {
     const current = readProcessStartTime(pid);
-    if (current) return current === record.start_time ? "yes" : "no";
-    return "unknown"; // ps unavailable or denied
+    if (!current) return "unknown"; // ps unavailable or denied
+    if (current !== record.start_time) return "not-ours";
+
+    // A start-time match is the authorization. The command line is consulted
+    // only as a NEGATIVE discriminator on top of it -- never as identity, since
+    // a wrapper or exec can legitimately change argv, and matching "node"
+    // proves nothing. Used one-directionally like this it can only narrow the
+    // same-birth-second residual above: a definitive mismatch downgrades to
+    // "not ours", which declines to kill. That errs toward leaving an orphan
+    // rather than signalling a stranger, which is the correct direction for a
+    // best-effort sweep.
+    const commandLine = readProcessCommandLine(pid);
+    if (commandLine && typeof record.command === "string" && record.command) {
+      if (!commandLine.includes(record.command)) return "not-ours";
+    }
+    return "yes";
   }
 
   // Older record with no start time. The command name alone cannot authorize a
@@ -601,7 +636,7 @@ function identifyRecordedLeader(record) {
   if (!commandLine) return "unknown";
   return typeof record.command === "string" && commandLine.includes(record.command)
     ? "unknown"
-    : "no";
+    : "not-ours";
 }
 
 /**
@@ -646,9 +681,12 @@ function readProcessGroupMembers(pgid) {
  * a detached launcher whose child outlived it by design.
  *
  * PGID is reused just as PID is, so group membership alone cannot authorize a
- * kill either. A member that STARTED BEFORE this turn did cannot be ours, so
- * the record's own timestamp is the discriminator: a recycled group is made of
- * processes older than the record, a real orphan of processes no older than it.
+ * kill either. The only discriminator that survives scrutiny is the LEADER's
+ * birth time, compared against the record's -- not member ages. "A recycled
+ * group is made of processes older than the record" was the earlier rule here
+ * and it is false in the direction that matters: a group recycled after the
+ * record was written contains members strictly NEWER than it, so age-based
+ * reasoning authorizes killing strangers.
  *
  * Three-valued for the same reason as the leader check.
  */
@@ -672,15 +710,11 @@ function identifyRecordedGroup(record) {
   // Whether a LEADER is present is what distinguishes our surviving descendants
   // from a group whose id has been reused.
   //
-  // A process's pgid equals its own pid exactly when it leads the group, and
-  // reusing a group id REQUIRES some new process to take that pid and become a
-  // leader. So:
+  // A process's pgid equals its own pid exactly when it leads the group, so:
   //
   //   leader present -> this may be a new group wearing our number. Its start
   //                     time settles it, and a mismatch means "not ours".
-  //   leader absent  -> the id cannot have been recycled, because recycling
-  //                     would have produced one. What is left are the
-  //                     descendants our dead leader spawned.
+  //   leader absent  -> UNPROVABLE. See below.
   //
   // "Any member newer than the record" was the obvious rule and it is wrong in
   // exactly the direction that matters: every member of a recycled group is
@@ -691,7 +725,31 @@ function identifyRecordedGroup(record) {
     return leader.startTime === record.start_time ? "yes" : "no";
   }
 
-  return "yes";
+  // A leaderless group used to return "yes" here, justified by POSIX fork()
+  // ("The child process ID also shall not match any active process group ID")
+  // plus §3.283 on group lifetime. That argument is WRONG, and this sequence is
+  // the counterexample -- every step of it legal:
+  //
+  //   1. our group N loses its last member, so group N stops being active,
+  //      while headless-child.json survives because the runner died first;
+  //   2. PID N is now allocatable. An unrelated process takes it and leads a
+  //      NEW group N;
+  //   3. that leader exits, leaving its own descendants behind;
+  //   4. group N now has members and no leader -- and none of them are ours.
+  //
+  // The fork() rule only reserves N while some group N is ACTIVE. A stale JSON
+  // record does not keep a group active, and a newly created group going
+  // leaderless is ordinary. So "leader absent" proves nothing about ownership,
+  // and there is no birth time left to compare because the process that had one
+  // is gone.
+  //
+  // "unknown" therefore: retain the record, signal nothing. That leaks a
+  // genuinely orphaned descendant rather than risking an unrelated one, which
+  // is the only defensible default when the evidence cannot distinguish them.
+  // Recovering those descendants needs an identity the kernel owns -- a dualog
+  // supervisor that stays group leader while any CLI descendant lives, or a
+  // cgroup -- not a sharper reading of the standard.
+  return "unknown";
 }
 
 /**
@@ -701,7 +759,20 @@ function identifyRecordedProcess(record) {
   const leader = identifyRecordedLeader(record);
   if (leader === "yes") return "yes";
 
-  // The leader is gone or unrecognizable -- ask the group before giving up.
+  // A live leader that was INSPECTED AND DISQUALIFIED is final, and must not be
+  // re-litigated by the group check.
+  //
+  // On the ordinary Unix shape the recorded pid and pgid are the same number,
+  // so identifyRecordedGroup() finds that very process as the group leader and
+  // authorizes on its start time alone -- silently overriding the command-line
+  // mismatch that just disqualified it. The group check exists to find
+  // DESCENDANTS of a leader we can no longer see, not to give a second opinion
+  // on the leader itself.
+  //
+  // "absent" is the opposite case and must fall through: a leader that is gone
+  // is the entire premise of asking about its group.
+  if (leader === "not-ours") return "no";
+
   const group = identifyRecordedGroup(record);
   if (group === "yes") return "yes";
   if (leader === "unknown" || group === "unknown") return "unknown";
@@ -717,11 +788,17 @@ function identifyRecordedProcess(record) {
  * case -- no handler runs, and the child is left with no handle anywhere -- plus
  * a runner that crashed hard enough to skip its own cleanup.
  *
- * PID reuse is the hazard that shapes this. isSessionRunnerAlive() already
- * refuses to treat a recycled PID as a live runner by checking the process's
- * command line, and a stale child record is if anything more likely to have been
- * recycled, so the same proof is required here: no command-line match, no
- * signal. An unrecognized PID is not killed, only forgotten.
+ * PID reuse is the hazard that shapes this, and the proof is BIRTH TIME, not a
+ * command line. A recorded pid is signalled only when the live process's
+ * `lstart` equals the one captured at spawn; the command line is consulted
+ * afterwards purely as a negative discriminator, because argv is mutable and a
+ * match proves nothing. (An earlier version of this comment claimed "no
+ * command-line match, no signal", which described neither the code nor a sound
+ * rule.)
+ *
+ * A record we cannot classify is RETAINED, not forgotten -- discarding it
+ * throws away the only handle to a possibly-live orphan. It is dropped only
+ * once its group is proven gone.
  *
  * Returns the number of processes actually signalled.
  */

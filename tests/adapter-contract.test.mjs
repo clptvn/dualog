@@ -18,15 +18,14 @@ import { buildInvocationFromAdapter } from "../src/adapters/argv.mjs";
 import { negotiate } from "../src/adapters/negotiate.mjs";
 import { isReady, isIdlePrompt, isBlocked } from "../src/tui/markers.mjs";
 import { clearRecursionSentinel } from "./helpers/sentinel.mjs";
+import { managedSession } from "./helpers/session.mjs";
 
 // These tests assert the sentinel's baseline ("depth 1 for a partner spawned by
 // a non-partner"). That claim is only about the code when the baseline is ours,
 // so drop any depth inherited from a dualog partner running this suite.
 clearRecursionSentinel();
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-contract-"));
-const SESSION_DIR = path.join(ROOT, "session");
-fs.mkdirSync(SESSION_DIR, { recursive: true });
+const { home: ROOT, dir: SESSION_DIR } = managedSession("contract");
 process.on("exit", () => fs.rmSync(ROOT, { recursive: true, force: true }));
 
 // Isolate from any adapters this developer has installed locally.

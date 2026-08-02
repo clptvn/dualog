@@ -9,6 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { sentinelFreeEnv } from "./helpers/sentinel.mjs";
 import { killTmuxServer } from "./helpers/tmux.mjs";
+import { managedSession } from "./helpers/session.mjs";
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const SERVER_PATH = path.join(REPO_ROOT, "src", "dialog-server.mjs");
@@ -126,9 +127,7 @@ for (const { hostAgent, partnerAgent, readyBanner } of [
         return;
       }
 
-      const sessionDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), `codex-dialog-sentinel-${partnerAgent}-`)
-      );
+      const { home: sessionHome, dir: sessionDir } = managedSession(`sentinel-${partnerAgent}`);
       const envDump = path.join(sessionDir, "partner-env.txt");
       const fakeCli = path.join(sessionDir, `fake-${partnerAgent}.sh`);
       fs.writeFileSync(
@@ -185,7 +184,7 @@ for (const { hostAgent, partnerAgent, readyBanner } of [
       t.after(async () => {
         if (runner.exitCode == null && runner.signalCode == null) runner.kill("SIGKILL");
         await terminateCurrentPartnerTerminal(sessionDir).catch(() => {});
-        fs.rmSync(sessionDir, { recursive: true, force: true });
+        fs.rmSync(sessionHome, { recursive: true, force: true });
       });
 
       const dumped = await waitFor(() =>

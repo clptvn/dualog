@@ -70,6 +70,18 @@ Call `mcp__dualog__start_dialog` with:
 
 Save the returned `session_id`.
 
+**Verify what the server actually used.** The start response echoes `requested_model` / `requested_reasoning_effort` (what you passed) alongside `model` / `reasoning_effort` (what resolved), plus `tool_profile`. Compare the **requested** fields against your own call: if something you specified comes back as `null` there, that parameter never arrived and the session is running on settings you did not choose. End it and retry.
+
+`tool_profile` matters most here, and it has no requested/resolved split: this skill exists to have Claude EDIT files, so a session that came back `tool_profile: "read"` will produce a partner that discusses the work instead of doing it.
+
+Do **not** treat a difference between requested and resolved effort as a failure. An adapter may translate an effort it names differently, and an omitted effort resolves to the model's own default; both are reported in the response's `notices` array (`effort_alias_applied`, `default_effort_applied`) and are working as intended.
+
+Use `requested_reasoning_effort` to check transport, and **`effective_reasoning_effort`** — not `reasoning_effort` — to know what the turn will actually run at. `reasoning_effort` is only the flag passed to the CLI, and is `null` whenever we deliberately pass none and let the model's own default apply.
+
+Ending is possible at this point specifically because the partner has not spoken yet: a session with no partner turns has no findings to abandon, so `end_dialog` is permitted. Once Claude has replied, the usual gating applies.
+
+The server cannot catch a dropped parameter for you. A parameter the caller deliberately omitted and one lost in transit are identical on the wire, so the echoed values are the only place the difference is visible.
+
 ## First message to Claude
 
 Send one `mcp__dualog__send_message` with this structure:

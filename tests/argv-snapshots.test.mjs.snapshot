@@ -382,28 +382,3 @@ exports[`argv: codex / valid effort 1`] = `
   "usesInitialPrompt": false
 }
 `;
-
-exports[`argv: unknown agent normalizes to codex 1`] = `
-{
-  "command": "codex",
-  "args": [
-    "-C",
-    "/fixture/project",
-    "--sandbox",
-    "workspace-write",
-    "--add-dir",
-    "<SESSION_DIR>",
-    "--ask-for-approval",
-    "never",
-    "--no-alt-screen",
-    "-c",
-    "approval_policy=\\"never\\""
-  ],
-  "env": {
-    "CODEX_HOME": "<SESSION_DIR>/codex-home",
-    "DUALOG_ROLE": "partner",
-    "DUALOG_DEPTH": "1"
-  },
-  "usesInitialPrompt": false
-}
-`;

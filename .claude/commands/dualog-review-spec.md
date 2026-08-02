@@ -154,20 +154,32 @@ At the end, set the machine-readable verdict on its own line:
 
 Save the returned `session_id`.
 
+**Verify what the server actually used.** The start response echoes `requested_model` / `requested_reasoning_effort` (what you passed) alongside `model` / `reasoning_effort` (what resolved). Compare the **requested** fields against your own call: if something you specified comes back as `null` there, that parameter never arrived and the session is running on settings you did not choose. End it and retry.
+
+Do **not** treat a difference between requested and resolved as a failure. That difference is normal and usually correct -- an adapter may translate an effort it names differently (goose maps a requested `xhigh` onto its own `max`), and omitting an effort deliberately resolves to the model's own default. Those cases are reported in the response's `notices` array as `effort_alias_applied` or `default_effort_applied`, and are working as intended.
+
+Read the three effort fields as three different questions. `requested_reasoning_effort` is what you asked for -- use it to check transport. `reasoning_effort` is the flag actually passed to the CLI, which is `null` when we deliberately pass none. **`effective_reasoning_effort` is what the turn will really run at**, including the model's own default when no flag is sent. For `gpt-5.6-sol` with effort omitted the response is `requested_reasoning_effort: null`, `reasoning_effort: null`, `effective_reasoning_effort: "low"` -- so read `effective_reasoning_effort`, not `reasoning_effort`, to know the runtime behavior.
+
+Ending is possible at this point specifically because the partner has not spoken yet: a session with no partner turns has no findings to abandon, so `end_dialog` is permitted. Once the partner has replied, the usual approval/round-budget gating applies.
+
+The server cannot catch a dropped parameter for you. A parameter the caller deliberately omitted and one lost in transit are identical on the wire, so the echoed values are the only place the difference is visible.
+
 Then use `send_message` to ask Codex to review the current spec snapshot as your first message to kick off the dialog.
 
 ---
 
 ## PHASE 2: WAIT FOR INITIAL REVIEW (Monitor)
 
-Instead of sleep-polling `check_messages`, arm a **Monitor** that fires one notification the moment Codex writes its review. Messages are appended as JSON lines to `~/.claude/dialogs/<session_id>/conversation.jsonl`, so a tailed grep is the wake-up signal.
+Instead of sleep-polling `check_messages`, arm a **Monitor** that fires one notification the moment Codex writes its review. Messages are appended as JSON lines to `<dialog_dir>/conversation.jsonl`, where `<dialog_dir>` is the **`dialog_dir` returned by the start call**, so a tailed grep is the wake-up signal.
 
 **Monitor command** (replace `<SESSION_ID>` with the actual session id):
 
 ```bash
-tail -F -n 0 "$HOME/.claude/dialogs/<SESSION_ID>/conversation.jsonl" 2>/dev/null | \
+tail -F -n 0 "<dialog_dir>/conversation.jsonl" 2>/dev/null | \
   grep -m 1 --line-buffered -E '"from":"(codex|system)"'
 ```
+
+Use the literal `dialog_dir` value from the start response. Sessions moved from `~/.claude/dialogs` to `~/.dualog/sessions`; a hardcoded root tails a path that will never be created for a new session, so the Monitor sits until its full timeout instead of firing.
 
 `grep -m 1` exits after the first match, so the Monitor produces exactly one notification per wait and then stops cleanly.
 

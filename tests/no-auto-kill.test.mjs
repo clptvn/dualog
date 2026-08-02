@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 import { killTmuxServer } from "./helpers/tmux.mjs";
+import { managedSession } from "./helpers/session.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tmuxSocket = `codex-dialog-test-${process.pid}`;
@@ -52,7 +53,7 @@ test("runner shutdown preserves an active tmux pane until explicit termination",
     return;
   }
 
-  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-dialog-no-auto-kill-"));
+  const { home: sessionHome, dir: sessionDir } = managedSession("noautokill");
   const fakeCodex = path.join(sessionDir, "fake-codex.sh");
   fs.writeFileSync(
     fakeCodex,
@@ -95,7 +96,7 @@ test("runner shutdown preserves an active tmux pane until explicit termination",
   t.after(async () => {
     if (runner.exitCode == null && runner.signalCode == null) runner.kill("SIGKILL");
     await terminateCurrentPartnerTerminal(sessionDir).catch(() => {});
-    fs.rmSync(sessionDir, { recursive: true, force: true });
+    fs.rmSync(sessionHome, { recursive: true, force: true });
   });
 
   const terminal = await waitFor(() => {

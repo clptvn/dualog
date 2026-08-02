@@ -17,10 +17,14 @@ import { buildInvocationFromAdapter, resolveContext } from "../src/adapters/argv
 import { negotiate } from "../src/adapters/negotiate.mjs";
 import { isEnumerable, modelIds, resolveModelEntry } from "../src/adapters/schema.mjs";
 import { resolveDiscovery } from "../src/adapters/discovery.mjs";
+import { managedSession } from "./helpers/session.mjs";
 
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-enforcement-"));
-const SESSION_DIR = path.join(ROOT, "session");
-fs.mkdirSync(SESSION_DIR, { recursive: true });
+// This file asserts against the machine's REAL codex model cache in one
+// case, so the HOME redirect must not quietly move that cache out of reach
+// and turn a live assertion into a silent skip.
+const { home: ROOT, dir: SESSION_DIR } = managedSession("enforcement", {
+  keepAdapterSeeds: [{ env: "CODEX_HOME", dir: ".codex" }],
+});
 
 // Seed directories the isolation step reads from, so nothing here can reach the
 // developer's real credentials.
@@ -513,8 +517,11 @@ function runQwen(sessionDir, reasoningEffort) {
   });
 }
 
+// Each case needs its own session, and it must be a session the containment
+// assertion recognizes: a direct child of the sessions root under this file's
+// throwaway HOME, named like a real session id.
 function freshSession(name) {
-  const dir = path.join(ROOT, name);
+  const dir = path.join(ROOT, ".dualog", "sessions", `dialog-${name}-0000`);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }

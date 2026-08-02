@@ -6,22 +6,33 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { dialogSessionDir, readStdin } from "../platform.mjs";
+import { resolveExistingSessionDir, readHookPayload } from "../platform.mjs";
 
-const input = readStdin();
-let payload;
-try {
-  payload = JSON.parse(input);
-} catch {
-  process.exit(0);
+// A gate that cannot UNDERSTAND its input must not wave the call through.
+//
+// Three failing shapes, two answers. "unreadable" means the budget expired with
+// nothing arriving (transient EAGAIN is already retried inside
+// readHookPayload, so this is not a momentary blip). "invalid" means bytes
+// arrived but are not valid JSON -- a truncated or corrupted write. In both the
+// hook cannot evaluate the decision it exists to make, so it blocks: exit 2 is
+// the direction a safety check should fail. Only a clean EMPTY read is benign,
+// because there is genuinely nothing to check.
+const { payload, outcome } = readHookPayload();
+if (outcome === "unreadable" || outcome === "invalid") {
+  process.stderr.write(
+    `BLOCKED: the dualog investigation guard received ${outcome} hook input, so it cannot verify ` +
+      "this call. Retry; if this persists, check that the hook payload is being piped intact.\n"
+  );
+  process.exit(2);
 }
+if (outcome !== "ok" || !payload) process.exit(0);
 
 const sessionId = payload.tool_input?.session_id;
 if (!sessionId || !/^[\w-]+$/.test(sessionId)) process.exit(0);
 
 let partnerDisplay = "Codex";
 try {
-  const statusPath = path.join(dialogSessionDir(sessionId), "status.json");
+  const statusPath = path.join(resolveExistingSessionDir(sessionId), "status.json");
   if (fs.existsSync(statusPath)) {
     const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
     partnerDisplay = status?.partner_agent === "claude" ? "Claude" : "Codex";

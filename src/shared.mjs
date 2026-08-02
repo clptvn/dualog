@@ -5,7 +5,27 @@ import { dialogsDir, legacyDialogsDir, resolveExistingSessionDir } from "./platf
 export const DIALOGS_DIR = dialogsDir();
 export const LEGACY_DIALOGS_DIR = legacyDialogsDir();
 export { resolveExistingSessionDir };
-fs.mkdirSync(DIALOGS_DIR, { recursive: true });
+
+// Creating the sessions root at import time is deliberate -- everything below
+// assumes it exists -- but it must not be able to take down the process before
+// any caller's error handling is in place.
+//
+// Six modules import this at the top of the file, three of them process entry
+// points, and the hook scripts import it before their own try/catch exists. An
+// unwritable or non-directory HOME therefore surfaced as an unhandled
+// module-load exception rather than as the clean exit(0)/exit(2) contract the
+// hooks otherwise maintain. (os.homedir() itself is not the hazard: with HOME
+// unset it falls back to the passwd entry rather than throwing.)
+//
+// A failure here is still fatal for anything that needs to WRITE a session, but
+// it now fails at the point of use, with context, instead of at import.
+try {
+  fs.mkdirSync(DIALOGS_DIR, { recursive: true });
+} catch {
+  // Deliberately swallowed. Readers (hooks inspecting an existing session) can
+  // still work; writers will fail on their own operation with a better message
+  // than a stack trace from an import side effect.
+}
 // Agent ids are validated structurally here, not against the adapter registry.
 // This file is copied into the user-level hooks directory by the installer and
 // must stay dependency-light -- importing the registry would drag zod and the
@@ -213,6 +233,31 @@ export function computeReviewStatus(status, messages, options = {}) {
   const hardCap = status?.hard_cap ?? maxRounds + 5;
   const partnerMessages = messages.filter((m) => m.from === partnerAgent);
   const hardCapReached = partnerMessages.length >= hardCap;
+
+  // A session the partner has never spoken in can always be abandoned.
+  //
+  // The gate exists to stop a host walking away from findings it does not like.
+  // Before the first partner turn there are no findings, so there is nothing to
+  // walk away from -- and refusing here strands the caller in a session they
+  // just discovered is misconfigured (a dropped model/effort parameter is only
+  // visible in the start response, which arrives before any turn). Without this
+  // the documented "end it and retry" recovery is impossible to perform, and
+  // the only exit is killing the runner from a shell.
+  if (partnerMessages.length === 0) {
+    return {
+      schema_version: REVIEW_STATUS_SCHEMA_VERSION,
+      state: "in_progress",
+      approved: false,
+      close_allowed: true,
+      close_allowed_reason: "no_partner_turns",
+      verdict: null,
+      source: "none",
+      source_message_id: null,
+      partner_agent: partnerAgent,
+      allows_approve_verdict: allowsApproveVerdict,
+      hard_cap_reached: hardCapReached,
+    };
+  }
 
   let verdictSignal = null;
   for (let i = partnerMessages.length - 1; i >= 0; i--) {
