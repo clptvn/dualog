@@ -54,6 +54,7 @@ import {
   sleepSync,
 } from "./platform.mjs";
 import { probeGroup, probeProcess, probeRecordedProcess } from "./process-probe.mjs";
+import { probeDirectoryInUse } from "./directory-usage.mjs";
 import { probeTmuxSessionSync } from "./tmux-runtime.mjs";
 
 const LEASE_SCHEMA_VERSION = 1;
@@ -415,8 +416,34 @@ export function leasePath(lease, candidate, { fn = "leasePath" } = {}) {
  * `spawning` lease with no identity does, even though nothing can be shown to
  * be running.
  */
-export function proveLeaseReleasable(meta, { now = Date.now() } = {}) {
+export function proveLeaseReleasable(meta, { now = Date.now(), dir = null } = {}) {
   const keep = (reason) => ({ removable: false, reason });
+
+  /**
+   * Every `removable` answer passes through here.
+   *
+   * Process identity reasons about LINEAGE, and lineage is what a determined
+   * child escapes -- setsid() leaves the group, a forked launcher's child gets
+   * reparented, Windows has no group. So the last question before authorizing a
+   * deletion is not "whose process was this" but "is anything using this
+   * directory", which the kernel can answer whatever the ancestry. A setsid()
+   * child holding the home is visible to that; it is invisible to every identity
+   * check in this file.
+   */
+  const releasable = () => {
+    if (!dir) return { removable: true, reason: null };
+    const usage = probeDirectoryInUse(dir);
+    if (usage === "in-use") return keep("a process still has this directory open");
+    if (usage === "unknown") {
+      // Windows, where handle enumeration needs native code. Deletion is still
+      // safe there because the platform refuses to remove a directory anything
+      // has open -- removeLeaseDirectory does not force past that.
+      return process.platform === "win32"
+        ? { removable: true, reason: null }
+        : keep("whether this directory is in use could not be determined");
+    }
+    return { removable: true, reason: null };
+  };
   if (!meta || typeof meta !== "object") return keep("lease metadata is unreadable");
 
   const state = meta.state;
@@ -432,7 +459,7 @@ export function proveLeaseReleasable(meta, { now = Date.now() } = {}) {
     const owner = probeOwner(meta);
     if (owner === "alive") return keep(`the owning runner (pid ${meta.runner_pid}) is still alive`);
     if (owner !== "absent") return keep(`the owning runner could not be probed (${owner})`);
-    return { removable: true, reason: null };
+    return releasable();
   }
 
   if (state === "released") {
@@ -451,7 +478,7 @@ export function proveLeaseReleasable(meta, { now = Date.now() } = {}) {
         return keep(`a released lease's consumer could not be probed (${verdict})`);
       }
     }
-    return { removable: true, reason: null };
+    return releasable();
   }
 
   // `spawning` or `active`: a consumer may exist. Its identity decides.
@@ -511,7 +538,7 @@ export function proveLeaseReleasable(meta, { now = Date.now() } = {}) {
         );
       }
     }
-    return { removable: true, reason: null };
+    return releasable();
   }
 
   // `spawning` with no identity: the unavoidable crash window. A spawn may have
@@ -521,7 +548,7 @@ export function proveLeaseReleasable(meta, { now = Date.now() } = {}) {
   if (sameBoot === false) {
     // A previous boot. Nothing it started can still exist, which is what makes
     // conservative retention self-healing rather than permanent.
-    return { removable: true, reason: null };
+    return releasable();
   }
   if (sameBoot === null) {
     return keep("the lease records no usable boot identity, so a spawn cannot be ruled out");
@@ -660,6 +687,11 @@ export function removeLeaseDirectory(dir) {
   if (!isValidLeaseId(id)) {
     throw new Error(`removeLeaseDirectory: ${JSON.stringify(id)} is not a lease id`);
   }
+  // THE LAST GUARD, at the one place every deletion goes through. Callers check
+  // this too, for a legible receipt; this is what makes it unskippable.
+  if (probeDirectoryInUse(resolved) === "in-use") {
+    throw new Error(`removeLeaseDirectory: ${resolved} is still open by a running process`);
+  }
   const stat = fs.lstatSync(resolved);
   if (stat.isSymbolicLink()) {
     throw new Error(`removeLeaseDirectory: ${resolved} is a symbolic link, not a lease`);
@@ -667,7 +699,11 @@ export function removeLeaseDirectory(dir) {
   if (!stat.isDirectory()) {
     throw new Error(`removeLeaseDirectory: ${resolved} is not a directory`);
   }
-  fs.rmSync(resolved, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  // `force` suppresses "does not exist", not "is busy". On Windows the platform
+  // refuses to remove a directory any process has open, and that refusal is the
+  // whole safety story there -- so the error propagates rather than being
+  // retried into submission.
+  fs.rmSync(resolved, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
 }
 
 /**
@@ -749,7 +785,7 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
     return finishRelease(dir, metaPath, record.value);
   }
 
-  const verdict = proveLeaseReleasable(record.value);
+  const verdict = proveLeaseReleasable(record.value, { dir });
   if (!verdict.removable) return { released: false, reason: verdict.reason };
   return finishRelease(dir, metaPath, record.value);
 }
@@ -987,7 +1023,7 @@ export function sweepLeases({
       }
       continue;
     }
-    const verdict = proveLeaseReleasable(record.value);
+    const verdict = proveLeaseReleasable(record.value, { dir });
     if (!verdict.removable) {
       receipt.retained.push({ dir, reason: verdict.reason });
       continue;

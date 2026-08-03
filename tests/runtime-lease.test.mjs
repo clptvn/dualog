@@ -1315,6 +1315,145 @@ test("a partner that outlives its pane keeps its lease until it really exits", a
   assert.equal(fs.existsSync(lease.dir), false);
 });
 
+test("a setsid descendant keeps the lease, though no identity check can see it", async (t) => {
+  // THE FINDING THAT BLOCKED THIS CHANGE, closed without a supervisor.
+  //
+  // Every identity-based answer reasons about LINEAGE, and lineage is exactly
+  // what this child escapes: it calls setsid(), so it is in no process group we
+  // recorded, and when its launcher exits it is reparented away entirely. A
+  // process-tree supervisor is the usual fix and needs cgroups or a Job Object.
+  //
+  // Asking the kernel about the DIRECTORY instead answers the question that
+  // actually governs deletion, and ancestry cannot hide from it.
+  if (process.platform === "win32") {
+    t.skip("Windows blocks removal of an open directory in the platform itself");
+    return;
+  }
+
+  const lease = newLease();
+  const home = path.join(lease.dir, "codex-home");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "auth.json"), '{"token":"held-by-a-descendant"}');
+
+  // Detached AND setsid: no group we know, and reparented once its shell exits.
+  const escapee = spawn("/bin/sh", ["-c", `cd ${JSON.stringify(home)} && exec sleep 30`], {
+    detached: true,
+    stdio: "ignore",
+  });
+  escapee.unref();
+  t.after(() => {
+    try {
+      process.kill(-escapee.pid, "SIGKILL");
+    } catch {}
+    try {
+      process.kill(escapee.pid, "SIGKILL");
+    } catch {}
+  });
+  await new Promise((resolve) => setTimeout(resolve, 700));
+
+  // The consumer we RECORDED is gone -- every identity check says "release".
+  transitionLease(lease, "active", {
+    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session", pane_pid: 999999 },
+  });
+
+  const verdict = releaseLease(lease);
+  assert.equal(verdict.released, false, "a descendant holding the home must keep the lease");
+  assert.match(verdict.reason, /still has this directory open/);
+  assert.equal(
+    fs.readFileSync(path.join(home, "auth.json"), "utf-8"),
+    '{"token":"held-by-a-descendant"}',
+    "and the credential it is using must survive"
+  );
+
+  // The sweep reaches the same conclusion, and reports it rather than acting.
+  const receipt = sweepLeases({ apply: true });
+  assert.ok(receipt.retained.some((r) => r.dir === lease.dir));
+  assert.equal(fs.existsSync(lease.dir), true);
+
+  // Once it really is gone, so is the lease.
+  try {
+    process.kill(-escapee.pid, "SIGKILL");
+  } catch {}
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline && releaseLease(lease).released === false) {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  assert.equal(fs.existsSync(lease.dir), false, "and it is reclaimed once nothing holds it");
+});
+
+test("usage that cannot be determined retains, and never reads as free", (t) => {
+  // The probe needs /proc or lsof. Where neither is reachable -- a stripped
+  // container, a restricted PATH -- the answer is `unknown`, and on a platform
+  // that does not enforce this itself that must retain. Reading it as "free"
+  // would turn a missing tool into permission to delete a live partner's home.
+  if (process.platform === "win32") {
+    t.skip("Windows answers unknown by design and relies on the platform");
+    return;
+  }
+  const script = `
+    process.env.PATH = "";
+    const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-nolsof-"));
+    Promise.all([
+      import(${JSON.stringify(new URL("../src/directory-usage.mjs", import.meta.url).href)}),
+      import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}),
+    ]).then(([usage, lease]) => {
+      const verdict = lease.proveLeaseReleasable(
+        { state: "active", consumer: { kind: "headless", pid: 999999, pgid: 999999 } },
+        { dir }
+      );
+      console.log(JSON.stringify({
+        usage: usage.probeDirectoryInUse(dir),
+        removable: verdict.removable,
+        reason: verdict.reason,
+      }));
+    });
+  `;
+  const out = JSON.parse(execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim());
+  assert.equal(out.usage, "unknown", "precondition: neither /proc nor lsof reachable");
+  assert.equal(out.removable, false, "an undeterminable directory must not be deleted");
+  assert.match(out.reason, /could not be determined/);
+});
+
+test("the removal choke point refuses a directory in use, whatever the caller believed", async (t) => {
+  // Callers check usage for a legible receipt; this is what makes it
+  // unskippable. A future path that forgets the check still cannot delete a home
+  // out from under a running process.
+  if (process.platform === "win32") {
+    t.skip("Windows enforces this in the platform");
+    return;
+  }
+  const lease = newLease();
+  const home = path.join(lease.dir, "codex-home");
+  fs.mkdirSync(home, { recursive: true });
+
+  const holder = spawn("/bin/sh", ["-c", `cd ${JSON.stringify(home)} && exec sleep 30`], {
+    detached: true,
+    stdio: "ignore",
+  });
+  holder.unref();
+  t.after(() => {
+    try {
+      process.kill(-holder.pid, "SIGKILL");
+    } catch {}
+  });
+  await new Promise((resolve) => setTimeout(resolve, 700));
+
+  assert.throws(
+    () => removeLeaseDirectory(lease.dir),
+    /still open by a running process/,
+    "the choke point must refuse regardless of what the caller decided"
+  );
+  assert.equal(fs.existsSync(home), true);
+
+  try {
+    process.kill(-holder.pid, "SIGKILL");
+  } catch {}
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  fs.rmSync(lease.dir, { recursive: true, force: true });
+  fs.rmSync(lease.metaPath, { force: true });
+});
+
 // --- the property all of it exists for ----------------------------------------
 
 test("a partner's credentials land in the lease and never in the session archive", async () => {
