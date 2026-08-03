@@ -227,10 +227,8 @@ export function extractStdoutResult(adapter, stdout) {
 }
 
 /**
- * Run one partner turn headlessly and return its final message.
- */
-/**
- * Run one headless turn, releasing its runtime lease however it ends.
+ * Run one partner turn headlessly and return its final message, releasing its
+ * runtime lease however it ends.
  *
  * The wrapper exists for the `finally`: this function has a dozen exit paths --
  * timeout, cancellation, five distinct completion diagnoses -- and the credential

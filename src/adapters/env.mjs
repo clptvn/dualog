@@ -176,7 +176,7 @@ function assertSettingVariable(adapter, field, key, dirsField) {
   throw new Error(
     `Adapter "${adapter.id}": ${field}.${key} names a filesystem location, which ` +
       `must be declared under ${dirsField} so the rendered path is proven to be ` +
-      `inside the session.`
+      `inside this turn's runtime lease.`
   );
 }
 
