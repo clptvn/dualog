@@ -573,15 +573,21 @@ function probeOwner(meta) {
  *     and a launcher which forks and exits reads as absent.
  *
  * In both cases a descendant could still hold the isolated home when the lease
- * is released. This is not a regression introduced by leases -- the pre-existing
- * headless orphan reaping has the identical boundary -- and closing it properly
- * needs a Job Object on Windows and a supervisor process on Unix, which is an
- * architectural change rather than a check. Recorded here so the next person
- * reads this as a known edge rather than as an oversight.
+ * is released. Closing it properly needs a Job Object on Windows and a
+ * supervisor process on Unix -- an architectural change rather than a check.
  *
- * The blast radius is bounded by what a released lease actually is: a partner
- * CLI whose config home vanishes fails its own turn. It does not affect the
- * user's real credentials, which are never moved, only copied from.
+ * ON THE BLAST RADIUS, corrected. This comment used to say the cost was bounded
+ * to "that partner's own turn fails", and that was too comfortable. The one case
+ * that actually occurred -- a codex process outliving its pane and rewriting its
+ * home -- produced an unattributable directory on EVERY turn, which nothing
+ * could reclaim. It was not a self-contained failure; it accumulated. That case
+ * is now closed at the source (pane_pid), and the recreated-directory case is
+ * handled by tombstones, but the general shape is a real limitation and the
+ * honest summary is: deleting a live descendant's home is a behaviour the
+ * pre-lease design did not have.
+ *
+ * What remains bounded is the credential itself. The user's real auth is never
+ * moved, only copied from, so nothing here can damage the source.
  */
 function probeConsumer(consumer) {
   if (consumer.kind === "tmux") {
