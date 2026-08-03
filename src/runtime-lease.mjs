@@ -598,8 +598,24 @@ function probeOwner(meta) {
  *     and a launcher which forks and exits reads as absent.
  *
  * In both cases a descendant could still hold the isolated home when the lease
- * is released. Closing it properly needs a Job Object on Windows and a
- * supervisor process on Unix -- an architectural change rather than a check.
+ * is released. Closing it properly needs a Job Object on Windows and a cgroup
+ * on Linux; macOS has neither, and once a process calls setsid() there is no
+ * supported unprivileged way to identify it as ours.
+ *
+ * DECIDED, NOT OVERLOOKED. This was reviewed at length and shipped deliberately.
+ * The reasoning, recorded so it does not get relitigated from scratch:
+ *
+ * A supervisor answers "is a process from this turn still alive". It does NOT
+ * stop that process from reading auth.json and keeping the token in memory. So a
+ * process that read the credential has it either way -- supervised or not -- and
+ * the supervisor changes only whether the DIRECTORY survives. Handing a readable
+ * credential to a partner is inherent to the job: it has to authenticate.
+ *
+ * What a supervisor would genuinely buy is narrower than it first appears:
+ * not deleting a directory a live descendant still needs, and not leaving a
+ * recreated one behind. Both real, both bounded, neither a disclosure. Weighed
+ * against native dependencies on two platforms and no benefit at all on the one
+ * this ships from, the residual was accepted.
  *
  * ON THE BLAST RADIUS, corrected. This comment used to say the cost was bounded
  * to "that partner's own turn fails", and that was too comfortable. The one case
