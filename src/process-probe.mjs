@@ -6,6 +6,8 @@
 // happen. The DECISIONS stay separate: a live session runner blocks the scratch
 // sweep but must not block reclaiming a completed turn's lease.
 
+import { execFileSync } from "child_process";
+
 /**
  * `isProcessAlive()` is not usable at this boundary.
  *
@@ -26,6 +28,49 @@ export function probeProcess(pid) {
     if (err.code === "EPERM") return "alive";
     return "unknown";
   }
+}
+
+/**
+ * When a process was born, to second granularity, or null.
+ *
+ * `kill(pid, 0)` answers "something has this pid", not "the thing I recorded
+ * still has it". After a crash and pid reuse an unrelated long-lived process
+ * makes an old lease look alive indefinitely -- which retains a credential copy
+ * forever, the failure this whole design exists to bound.
+ *
+ * `ps -o lstart` is second-granular, so two processes started within the same
+ * second are indistinguishable. That residual is real and documented here rather
+ * than papered over: it makes reuse detection very likely, not certain, and it
+ * errs toward "still alive", which retains.
+ */
+export function processStartTime(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf-8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Is the process we RECORDED still running -- not merely something with its pid?
+ *
+ * `absent` when the pid is gone, or when it is held by something born at a
+ * different time. Anything unverifiable stays `alive`, because retaining a
+ * credential copy is the safe error and deleting a live partner's home is not.
+ */
+export function probeRecordedProcess(pid, recordedStartTime) {
+  const verdict = probeProcess(pid);
+  if (verdict !== "alive") return verdict;
+  if (!recordedStartTime) return "alive";
+  const current = processStartTime(pid);
+  if (!current) return "alive";
+  return current === recordedStartTime ? "alive" : "absent";
 }
 
 export function probeGroup(pgid) {

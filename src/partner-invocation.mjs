@@ -22,7 +22,7 @@ import {
   releaseLease,
   transitionLease,
 } from "./runtime-lease.mjs";
-import { probeProcess } from "./process-probe.mjs";
+import { probeProcess, processStartTime } from "./process-probe.mjs";
 import { resolveDiscoveryForValidation } from "./adapters/resolve-for-validation.mjs";
 import { getAdapter, tryGetAdapter } from "./adapters/registry.mjs";
 import {
@@ -435,7 +435,13 @@ export async function runPartnerCommand({
           // The pane's process as well as the pane. Releasing on the session alone
           // demonstrably reclaimed the home while the partner was still shutting
           // down, and it then recreated the directory to flush its cache.
-          consumer: { kind: "tmux", session_name: sessionName, pane_pid: handle.panePid ?? null },
+          consumer: {
+          kind: "tmux",
+          session_name: sessionName,
+          pane_pid: handle.panePid ?? null,
+          // Qualifies the pid against reuse; see probeRecordedProcess.
+          pane_started_at: handle.panePid ? processStartTime(handle.panePid) : null,
+        },
         });
       }
       state = writeTerminalState(

@@ -353,6 +353,69 @@ test("a closed pane does not prove the partner process exited", (t) => {
   );
 });
 
+test("a reused pid does not keep a lease alive forever", async () => {
+  // `kill(pid, 0)` answers "something has this pid", not "the thing I recorded
+  // still has it". After a crash and pid reuse, an unrelated long-lived process
+  // made an old lease look alive indefinitely -- retaining a credential copy
+  // permanently, which is the failure this whole design exists to bound. The
+  // recorded generation is what tells the two apart.
+  const { processStartTime } = await import("../src/process-probe.mjs");
+  const mine = processStartTime(process.pid);
+  assert.ok(mine, "this platform must be able to report a process start time");
+
+  for (const consumer of [
+    { kind: "tmux", session_name: "dualog-lease-test-no-such-session", pane_pid: process.pid },
+    { kind: "headless", pid: process.pid, pgid: process.pid },
+  ]) {
+    // Same pid, the generation we recorded: alive, so the lease is kept.
+    const key = consumer.kind === "tmux" ? "pane_started_at" : "started_at";
+    assert.equal(
+      proveLeaseReleasable({ state: "active", consumer: { ...consumer, [key]: mine } }).removable,
+      false,
+      `${consumer.kind}: the recorded process is still running`
+    );
+
+    // Same pid, a DIFFERENT generation: the pid was reused, so the consumer we
+    // recorded is gone and its lease may be reclaimed.
+    assert.equal(
+      proveLeaseReleasable({
+        state: "active",
+        consumer: { ...consumer, [key]: "Thu Jan  1 00:00:00 1970" },
+      }).removable,
+      true,
+      `${consumer.kind}: a reused pid must not retain the lease`
+    );
+
+    // No generation recorded -- a lease written before this existed -- falls back
+    // to the pid alone, which retains. Previous behaviour, not a new gap.
+    assert.equal(
+      proveLeaseReleasable({ state: "active", consumer }).removable,
+      false,
+      `${consumer.kind}: a legacy record still resolves on the pid`
+    );
+  }
+});
+
+test("a generation that cannot be read retains, rather than reading as reuse", () => {
+  // The reuse check needs `ps`. Where that is unavailable -- a restricted host,
+  // a stripped container -- an unreadable generation must NOT be taken as proof
+  // the pid was recycled, because that verdict deletes a live partner's home.
+  // Unverifiable resolves to "still running", the same direction every other
+  // unknown in this module takes.
+  const script = `
+    process.env.PATH = "";
+    import(${JSON.stringify(new URL("../src/process-probe.mjs", import.meta.url).href)}).then((m) => {
+      console.log(JSON.stringify({
+        startTime: m.processStartTime(process.pid),
+        verdict: m.probeRecordedProcess(process.pid, "Thu Jan  1 00:00:00 1970"),
+      }));
+    });
+  `;
+  const out = JSON.parse(execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim());
+  assert.equal(out.startTime, null, "precondition: ps must be unreachable in the child");
+  assert.equal(out.verdict, "alive", "an unverifiable generation must not authorize deletion");
+});
+
 test("a lease whose consumer is proven absent is removable", () => {
   assert.equal(
     proveLeaseReleasable({

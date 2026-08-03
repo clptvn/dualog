@@ -14,6 +14,7 @@ import path from "path";
 import { spawn, execFileSync } from "child_process";
 import { buildInvocationFromAdapter } from "../adapters/argv.mjs";
 import { releaseLease, transitionLease } from "../runtime-lease.mjs";
+import { processStartTime } from "../process-probe.mjs";
 import { readCompletion } from "./completion.mjs";
 import { resolveDiscoveryForValidation } from "../adapters/resolve-for-validation.mjs";
 import { isProcessAlive } from "../shared.mjs";
@@ -360,6 +361,8 @@ async function runHeadlessTurnInner({
         // The group, not just the pid: a TERM-ignoring descendant keeps the CLI
         // that holds our credentials open after the direct child is gone.
         pgid: process.platform === "win32" ? null : (child.pid ?? null),
+        // Qualifies the pid against reuse; see probeRecordedProcess.
+        started_at: child.pid ? processStartTime(child.pid) : null,
       },
     });
   }

@@ -53,7 +53,7 @@ import {
   runtimeDir,
   sleepSync,
 } from "./platform.mjs";
-import { probeGroup, probeProcess } from "./process-probe.mjs";
+import { probeGroup, probeProcess, probeRecordedProcess } from "./process-probe.mjs";
 import { probeTmuxSessionSync } from "./tmux-runtime.mjs";
 
 const LEASE_SCHEMA_VERSION = 1;
@@ -599,12 +599,15 @@ function probeConsumer(consumer) {
     // existed carry no pane_pid; for those the session remains the only
     // available evidence, which is the previous behaviour rather than a new gap.
     if (consumer.pane_pid == null) return "absent";
-    const pane = probeProcess(consumer.pane_pid);
+    // The RECORDED process, not merely its pid: after a crash and pid reuse an
+    // unrelated long-lived process would otherwise make this lease look alive
+    // forever, retaining a credential copy permanently.
+    const pane = probeRecordedProcess(consumer.pane_pid, consumer.pane_started_at ?? null);
     if (pane === "invalid") return "unknown";
     return pane;
   }
   if (consumer.kind === "headless") {
-    const pidVerdict = probeProcess(consumer.pid);
+    const pidVerdict = probeRecordedProcess(consumer.pid, consumer.started_at ?? null);
     if (pidVerdict === "invalid") return "unknown";
     if (pidVerdict !== "absent") return pidVerdict;
     if (process.platform === "win32") return "absent";
