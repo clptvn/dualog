@@ -604,7 +604,15 @@ function probeConsumer(consumer) {
     // answers the question the session name cannot. Records written before this
     // existed carry no pane_pid; for those the session remains the only
     // available evidence, which is the previous behaviour rather than a new gap.
-    if (consumer.pane_pid == null) return "absent";
+    if (consumer.pane_pid == null) {
+      // A pane we KNOW existed and could not identify is UNKNOWN, not absent.
+      // Only a record written before pane identities existed may fall back to
+      // the session name -- and even then only because that is the behaviour it
+      // was written under, never because session absence proves anything about
+      // the process.
+      if (consumer.pane_pid_unavailable === true) return "unknown";
+      return "absent";
+    }
     // The RECORDED process, not merely its pid: after a crash and pid reuse an
     // unrelated long-lived process would otherwise make this lease look alive
     // forever, retaining a credential copy permanently.
@@ -714,11 +722,22 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
     // settles. One probe reads that as "no pane, safe to delete" and removes the
     // home the pane is about to start against. The settle is short because the
     // gap being covered is the server acting on a command it already has.
+    // A PROCESS HANDLE IS REQUIRED, not just a session name.
+    //
+    // In `spawning` the tmux consumer may be nothing but the name recorded
+    // before new-session ran. Session absence there is not evidence: the server
+    // is a separate process from the client we drove, so a client that timed out
+    // or was killed can still have handed the command over, and the pane can
+    // appear after any number of probes. Only a pane we identified -- and can
+    // therefore watch exit -- lets the owner take this shortcut; everything else
+    // falls through to the boot-scoped retention below.
+    const spawnConsumer = record.value.consumer ?? {};
     const failedSpawn =
       record.value.state === "spawning" &&
-      probeConsumer(record.value.consumer ?? {}) === "absent" &&
-      (sleepSync(SPAWN_SETTLE_MS),
-      probeConsumer(record.value.consumer ?? {}) === "absent");
+      spawnConsumer.kind === "tmux" &&
+      Number.isSafeInteger(spawnConsumer.pane_pid) &&
+      probeConsumer(spawnConsumer) === "absent" &&
+      (sleepSync(SPAWN_SETTLE_MS), probeConsumer(spawnConsumer) === "absent");
     if (preSpawn || failedSpawn) {
       return finishRelease(dir, metaPath, record.value);
     }
@@ -746,7 +765,19 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
  * what the directory was lived inside the directory.
  */
 function finishRelease(dir, metaPath, meta) {
-  removeLeaseDirectory(dir);
+  // THE RECORD IS PERSISTED BEFORE THE DESTRUCTIVE STEP, not after it.
+  //
+  // Removing first left a window: a crash or a failed write between the rmSync
+  // and the tombstone leaves no sibling record at all, and if a late consumer
+  // then recreates the home the sweep sees a valid-looking lease directory with
+  // no metadata -- unattributable, therefore retained forever. That is exactly
+  // the attribution the tombstone redesign exists to preserve, lost to the order
+  // of two statements.
+  //
+  // Writing first is safe in the other direction: a crash after the record and
+  // before the removal leaves a `released` record WITH its directory, which is
+  // the state the sweep already handles -- it re-probes the recorded consumer
+  // and reclaims only if that consumer is gone.
   try {
     writeJsonAtomic(metaPathFor(dir), {
       ...meta,
@@ -755,14 +786,15 @@ function finishRelease(dir, metaPath, meta) {
       released_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     });
-    // A legacy in-directory record went with the directory; nothing to clean.
-    if (metaPath !== metaPathFor(dir)) {
-      try {
-        fs.unlinkSync(metaPath);
-      } catch {}
-    }
   } catch {
     // A tombstone we cannot write costs attributability later, never safety now.
+  }
+  removeLeaseDirectory(dir);
+  // A legacy in-directory record went with the directory; nothing to clean.
+  if (metaPath !== metaPathFor(dir)) {
+    try {
+      fs.unlinkSync(metaPath);
+    } catch {}
   }
   return { released: true, reason: null };
 }

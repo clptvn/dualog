@@ -299,6 +299,38 @@ test("a started session reports the process running in its pane", async (t) => {
   assert.equal(await probeTmuxSession(handle.sessionName), "absent");
 });
 
+test("a pane whose process could not be read is marked, not left ambiguous", async (t) => {
+  // `panePid: null` from a FAILED query and `panePid` absent from an old record
+  // look identical downstream, so the failure has to say so. Without the marker,
+  // a live pane we could not identify is judged on its session name alone --
+  // which is what let a partner outlive its pane and lose its home.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-nopid-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stub = path.join(dir, "tmux");
+  fs.writeFileSync(
+    stub,
+    `#!/bin/sh
+case "$*" in
+  *pane_pid*) echo "cannot read pane_pid" >&2; exit 1;;
+  *pane_id*)  echo "%0"; exit 0;;
+  *)          exit 0;;
+esac
+`
+  );
+  fs.chmodSync(stub, 0o755);
+  withTmuxBinary(t, stub);
+
+  const handle = await startTmuxSession({
+    sessionName: "dualog-nopid",
+    cwd: dir,
+    command: "irrelevant",
+    args: [],
+    env: {},
+  });
+  assert.equal(handle.panePid, null);
+  assert.equal(handle.panePidUnavailable, true, "a failed capture must be recorded as such");
+});
+
 test("a spawn that fails after the pane exists still yields the pane's process", async (t) => {
   // The pane is created by `new-session`; everything after it is fallible setup.
   // If one of those queries fails, the pane is LIVE and the caller is about to

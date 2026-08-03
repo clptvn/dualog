@@ -439,6 +439,9 @@ export async function runPartnerCommand({
           kind: "tmux",
           session_name: sessionName,
           pane_pid: handle.panePid ?? null,
+          // Distinguishes "we could not identify this pane" from "this record
+          // predates pane identities"; see probeConsumer.
+          pane_pid_unavailable: handle.panePidUnavailable === true,
           // Qualifies the pid against reuse; see probeRecordedProcess.
           pane_started_at: handle.panePid ? processStartTime(handle.panePid) : null,
         },
@@ -582,7 +585,12 @@ export async function runPartnerCommand({
       if (lease && !handle && err?.panePid) {
         try {
           transitionLease(lease, "spawning", {
-            consumer: { kind: "tmux", session_name: err.sessionName, pane_pid: err.panePid },
+            consumer: {
+              kind: "tmux",
+              session_name: err.sessionName,
+              pane_pid: err.panePid,
+              pane_pid_unavailable: err.panePidUnavailable === true,
+            },
           });
         } catch {
           // Best effort; the release below still refuses without a proof.

@@ -416,6 +416,33 @@ test("a generation that cannot be read retains, rather than reading as reuse", (
   assert.equal(out.verdict, "alive", "an unverifiable generation must not authorize deletion");
 });
 
+test("a pane we could not identify is not the same as one that never had an identity", () => {
+  // Both record `pane_pid: null`, and they mean opposite things.
+  //
+  // A record written BEFORE pane identities existed falls back to the session
+  // name -- the behaviour it was written under. A pane we KNOW existed and
+  // merely failed to identify must not do that, because session absence has
+  // never proven the process exited: that is the production incident, and it
+  // needs no descendant and no setsid() to happen.
+  const unidentified = proveLeaseReleasable({
+    state: "active",
+    consumer: {
+      kind: "tmux",
+      session_name: "dualog-lease-test-no-such-session",
+      pane_pid: null,
+      pane_pid_unavailable: true,
+    },
+  });
+  assert.equal(unidentified.removable, false, "an unidentified pane must retain its lease");
+  assert.match(unidentified.reason, /could not be probed/);
+
+  const legacy = proveLeaseReleasable({
+    state: "active",
+    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session", pane_pid: null },
+  });
+  assert.equal(legacy.removable, true, "a pre-pane_pid record still resolves on the session");
+});
+
 test("a lease whose consumer is proven absent is removable", () => {
   assert.equal(
     proveLeaseReleasable({
@@ -856,10 +883,33 @@ test("a runner can clean up after its own failed pre-spawn turn", () => {
   // because the sweep's rule for that state is deliberately boot-scoped.
   const failed = newLease();
   transitionLease(failed, "spawning", {
-    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+    // A pane we IDENTIFIED and then watched fail. The pid is what makes this a
+    // proof rather than a guess.
+    consumer: {
+      kind: "tmux",
+      session_name: "dualog-lease-test-no-such-session",
+      pane_pid: 999999,
+    },
   });
   assert.equal(releaseLease(failed).released, true, "the owner may reclaim its own failed spawn");
   assert.equal(fs.existsSync(failed.dir), false);
+
+  // But NOT on a session name alone. In `spawning` the name may have been
+  // recorded before new-session ran, and the tmux server is a separate process
+  // from the client we drove -- so a client that timed out can still have handed
+  // the command over and the pane can appear after any number of probes.
+  const nameless = newLease();
+  transitionLease(nameless, "spawning", {
+    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+  });
+  const refusedNameless = releaseLease(nameless);
+  assert.equal(
+    refusedNameless.released,
+    false,
+    "session absence is not proof when no pane process was ever identified"
+  );
+  fs.rmSync(nameless.dir, { recursive: true, force: true });
+  fs.rmSync(nameless.metaPath, { force: true });
 
   // But not one whose pane actually came up -- that is a live consumer.
   const live = newLease();
@@ -1181,7 +1231,7 @@ test("every exit from a partner turn releases its lease, and only on proof", () 
   const settled = leaseSrc.match(/sleepSync\(SPAWN_SETTLE_MS\)/g) || [];
   assert.equal(settled.length, 1, "the failed-spawn shortcut must settle before its second probe");
   assert.equal(
-    (leaseSrc.match(/probeConsumer\(record\.value\.consumer \?\? \{\}\) === "absent"/g) || []).length,
+    (leaseSrc.match(/probeConsumer\(spawnConsumer\) === "absent"/g) || []).length,
     2,
     "and must probe on both sides of that settle"
   );

@@ -127,15 +127,23 @@ export async function startTmuxSession({ sessionName, cwd, command, args, env })
   // survivable -- the caller still gets a handle, just without the stronger
   // identity.
   let panePid = null;
+  let panePidUnavailable = false;
   try {
     const raw = (
       await runTmux(["display-message", "-p", "-t", paneTarget, "#{pane_pid}"])
     ).stdout.trim();
     const parsed = Number.parseInt(raw, 10);
     if (Number.isSafeInteger(parsed) && parsed > 0) panePid = parsed;
+    else panePidUnavailable = true;
   } catch {
-    // Recorded as unknown rather than fabricated; see probeConsumer.
+    panePidUnavailable = true;
   }
+  // A FAILED capture is recorded as such, not left to look like a record from
+  // before pane_pid existed. Those two are indistinguishable by the value alone
+  // -- both are null -- but they mean opposite things: a legacy record falls back
+  // to the session name, while a pane we KNOW exists and could not identify must
+  // never let session absence stand in for the process having exited. That is
+  // the production incident with no descendant and no setsid() required.
 
   try {
     await configureTmuxSession(sessionName);
@@ -147,6 +155,7 @@ export async function startTmuxSession({ sessionName, cwd, command, args, env })
       paneTarget,
       paneId,
       panePid,
+      panePidUnavailable,
       cwd,
       command,
       args: [...args],
@@ -159,6 +168,7 @@ export async function startTmuxSession({ sessionName, cwd, command, args, env })
     // returned -- so a caller holding a credential lease needs the process to
     // probe, not just the session name it is about to stop trusting.
     err.panePid = panePid;
+    err.panePidUnavailable = panePidUnavailable;
     err.sessionName = sessionName;
     throw err;
   }
