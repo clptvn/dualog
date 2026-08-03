@@ -209,6 +209,22 @@ export function staticEnv(adapter, ctx) {
   // Static RELOCATIONS, contained like every other directory a partner is given.
   // Merged after settings so a proven path cannot be displaced by an unproven
   // one, matching the order prepareConfigIsolation uses.
+  return { ...out, ...containedRelocations(adapter, ctx) };
+}
+
+/**
+ * The adapter's static relocations, each proven inside this turn's boundary.
+ *
+ * Exported so buildInvocationFromAdapter can merge these LAST, after every
+ * settings map from every source. Within staticEnv they already come after
+ * `env`, but the launch environment also merges configIsolation's settings
+ * afterwards -- and a key present in both `dirs` and `configIsolation.extraEnv`
+ * therefore resolved to the UNCONTAINED one. The schema now rejects that
+ * collision; re-applying the proven values at the end means the safe value wins
+ * even if a future map is added and the collision check is not extended to it.
+ */
+export function containedRelocations(adapter, ctx) {
+  const out = {};
   for (const [key, template] of Object.entries(adapter.dirs ?? {})) {
     const value = renderOptional(template, ctx, adapter, `dirs.${key}`);
     if (value == null) continue;

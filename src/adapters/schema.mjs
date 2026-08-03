@@ -935,19 +935,55 @@ export const AdapterManifest = z
       }
     }
 
-    if (m.configIsolation) {
-      const isolation = m.configIsolation;
-      // Both maps are merged into the same overlay, so one key in two of them is
-      // a silent precedence question rather than a configuration.
-      for (const key of Object.keys(isolation.dirs)) {
-        if (key in isolation.extraEnv) {
-          fail(
-            `configIsolation.dirs.${key} is also declared in configIsolation.extraEnv; ` +
-              "a variable is either a relocation or a setting, not both",
-            ["configIsolation", "dirs", key]
-          );
+    // ALL FOUR overlay maps are checked against each other, not just the two
+    // pairs that share a parent.
+    //
+    // Checking only `dirs` vs `extraEnv` and `dirs` vs `env` left a live hole:
+    // a key in TOP-LEVEL `dirs` and in `configIsolation.extraEnv` passed
+    // validation, and since buildInvocationFromAdapter merges staticEnv before
+    // isolationEnv, the contained relocation was silently replaced by the
+    // uncontained setting. Demonstrated with `dirs: {FOO: "{{scratchDir}}/data"}`
+    // and `configIsolation.extraEnv: {FOO: "pwned-config"}`: the partner
+    // received the bare relative path, which it resolves against its own working
+    // directory. Any key declared twice is a precedence question the manifest
+    // did not intend to ask.
+    const overlayMaps = [
+      { field: "env", map: m.env, path: ["env"] },
+      { field: "dirs", map: m.dirs, path: ["dirs"] },
+      ...(m.configIsolation
+        ? [
+            {
+              field: "configIsolation.dirs",
+              map: m.configIsolation.dirs,
+              path: ["configIsolation", "dirs"],
+            },
+            {
+              field: "configIsolation.extraEnv",
+              map: m.configIsolation.extraEnv,
+              path: ["configIsolation", "extraEnv"],
+            },
+          ]
+        : []),
+    ];
+    for (let i = 0; i < overlayMaps.length; i++) {
+      for (let j = i + 1; j < overlayMaps.length; j++) {
+        const a = overlayMaps[i];
+        const b = overlayMaps[j];
+        for (const key of Object.keys(a.map)) {
+          if (key in b.map) {
+            fail(
+              `${a.field}.${key} is also declared in ${b.field}; every one of these ` +
+                "maps is merged into the same launch environment, so a key in two of " +
+                "them silently resolves to whichever is merged last",
+              [...a.path, key]
+            );
+          }
         }
       }
+    }
+
+    if (m.configIsolation) {
+      const isolation = m.configIsolation;
       // Same rule the runtime enforces for extraEnv, and for the same reason:
       // the primary variable is set from the one value proven contained, and
       // nothing may redefine it.
@@ -959,16 +995,6 @@ export const AdapterManifest = z
             ["configIsolation", field, isolation.env]
           );
         }
-      }
-    }
-
-    for (const key of Object.keys(m.dirs)) {
-      if (key in m.env) {
-        fail(
-          `dirs.${key} is also declared in env; a variable is either a relocation ` +
-            "or a setting, not both",
-          ["dirs", key]
-        );
       }
     }
 

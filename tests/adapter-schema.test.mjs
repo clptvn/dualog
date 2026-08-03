@@ -396,7 +396,53 @@ test("a variable cannot be both a relocation and a setting", () => {
         baseManifest({ env: { FAKE_SETTING: "1" }, dirs: { FAKE_SETTING: "{{sessionDir}}/d" } }),
         "/f.json"
       ),
-    /is also declared in env/
+    /is also declared in/
+  );
+
+  // FOUND IN REVIEW. The pairwise checks covered dirs-vs-extraEnv and
+  // dirs-vs-env but NOT top-level dirs against configIsolation.extraEnv -- and
+  // because staticEnv merged before isolationEnv, the contained relocation was
+  // silently replaced by the uncontained setting. Demonstrated end to end: the
+  // partner received "pwned-config", a bare relative path it resolves against
+  // its own working directory, despite the manifest declaring a relocation.
+  // The name is deliberately one the path-variable backstop does NOT recognise,
+  // since that is the case where nothing else would catch it.
+  assert.throws(
+    () =>
+      parseManifest(
+        baseManifest({
+          dirs: { FOO: "{{sessionDir}}/data" },
+          configIsolation: { ...isolationBase, extraEnv: { FOO: "pwned-config" } },
+        }),
+        "/f.json"
+      ),
+    /is also declared in/,
+    "a key in top-level dirs and configIsolation.extraEnv must be refused"
+  );
+
+  // The remaining pairs, so this is an ALL-PAIRS rule rather than the two that
+  // happened to be written first.
+  assert.throws(
+    () =>
+      parseManifest(
+        baseManifest({
+          env: { FOO: "1" },
+          configIsolation: { ...isolationBase, dirs: { FOO: "{{sessionDir}}/d" } },
+        }),
+        "/f.json"
+      ),
+    /is also declared in/
+  );
+  assert.throws(
+    () =>
+      parseManifest(
+        baseManifest({
+          env: { FOO: "1" },
+          configIsolation: { ...isolationBase, extraEnv: { FOO: "2" } },
+        }),
+        "/f.json"
+      ),
+    /is also declared in/
   );
 });
 

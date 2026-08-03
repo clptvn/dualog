@@ -98,7 +98,10 @@ test("a lease is created private, attributable, and pointed at before anything i
   assert.equal(m.session_id, path.basename(SESSION_DIR));
   assert.equal(m.turn_dir, turnDir);
   assert.equal(m.runner_pid, process.pid);
-  assert.ok(m.boot?.host);
+  // `boot` is recorded when it CAN be established. A restricted host raises
+  // EPERM from os.uptime(), where null is the documented answer -- asserting a
+  // host unconditionally would fail there for the right behaviour.
+  assert.ok(m.boot === null || typeof m.boot.host === "string");
 
   // And discoverable from the durable side by an opaque id, nothing more.
   const pointer = JSON.parse(fs.readFileSync(path.join(turnDir, "runtime-lease.json"), "utf-8"));
@@ -198,12 +201,25 @@ test("a lease mid-spawn is not mistaken for one whose consumer exited", (t) => {
   assert.equal(midSpawn.removable, false, "a live runner mid-spawn must keep its lease");
   assert.match(midSpawn.reason, /still spawning/);
 
-  // The counterweight, or the fix would just retain forever: once the runner is
-  // gone and the consumer never appeared, nothing is coming.
+  // A DEAD runner with no pane is still not proof, which the first version of
+  // this fix got wrong. startTmuxSession() creates the pane via an execFile
+  // child that is not the runner and outlives a SIGKILLed one, so both probes
+  // read absent while a helper is a millisecond from creating the pane.
+  // Deleting there hands the partner a home that no longer exists.
+  const crashed = proveLeaseReleasable({ ...spawning, runner_pid: 999999 });
+  assert.equal(crashed.removable, false, "a spawn helper may still be in flight on this boot");
+  assert.match(crashed.reason, /in flight/);
+
+  // The counterweight, or this would retain forever: no helper and no pane
+  // survives a reboot, so a previous boot settles it.
   assert.equal(
-    proveLeaseReleasable({ ...spawning, runner_pid: 999999 }).removable,
+    proveLeaseReleasable({
+      ...spawning,
+      runner_pid: 999999,
+      boot: { host: os.hostname(), bootedAtEpoch: 1 },
+    }).removable,
     true,
-    "a dead runner that never reached `active` releases the lease"
+    "a previous boot's abandoned spawn is reclaimable"
   );
 
   // And `active` is unaffected: it is written only after the process-creating
@@ -272,15 +288,32 @@ test("a lease whose consumer is proven absent is removable", () => {
   );
 });
 
-test("an unprobeable consumer retains, rather than reading as absent", () => {
+test("a consumer record with no usable identity retains, and heals on reboot", () => {
+  // A record is written BEFORE the thing it describes exists, so "there is a
+  // consumer object" and "there is something to probe" are different questions.
+  // Conflating them left a kind-only headless record -- what the headless engine
+  // writes before spawn() -- probing `unknown` forever: it never reached the
+  // boot check, so it survived reboots and any host without a boot identity.
   for (const consumer of [
     { kind: "tmux", session_name: "" },
     { kind: "headless", pid: null, pgid: null },
+    { kind: "headless" },
     { kind: "something-a-future-version-writes" },
   ]) {
-    const verdict = proveLeaseReleasable({ state: "active", consumer });
-    assert.equal(verdict.removable, false, JSON.stringify(consumer));
-    assert.match(verdict.reason, /could not be probed/);
+    const onThisBoot = proveLeaseReleasable({ state: "spawning", consumer, boot: bootIdentity() });
+    assert.equal(onThisBoot.removable, false, JSON.stringify(consumer));
+
+    // ...but it is now reachable by the boot check, which is what makes the
+    // conservative retention self-healing rather than permanent.
+    assert.equal(
+      proveLeaseReleasable({
+        state: "spawning",
+        consumer,
+        boot: { host: os.hostname(), bootedAtEpoch: 1 },
+      }).removable,
+      true,
+      `${JSON.stringify(consumer)} must be reclaimable after a reboot`
+    );
   }
 });
 
@@ -518,6 +551,42 @@ test("removal refuses anything that is not a lease", (t) => {
   }
 });
 
+test("deletion revalidates the root itself, not just what its caller checked", () => {
+  // The parent comparison inside removeLeaseDirectory is LEXICAL: it says the
+  // path is spelled under the runtime root, not that it resolves there. A root
+  // swapped for a symlink after the caller validated it would therefore send
+  // rmSync into whatever the link points at, judging the target only on whether
+  // its leaf name looks like a lease id. So the deleting operation re-proves the
+  // root itself.
+  const script = `
+    const os = require("node:os"), fs = require("node:fs"), path = require("node:path");
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-dellink-"));
+    const victim = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-delvictim-"));
+    process.env.HOME = home; process.env.USERPROFILE = home;
+    process.env.HOMEDRIVE = ""; process.env.HOMEPATH = home;
+    const id = "c".repeat(32);
+    // A directory in the victim with a perfectly valid lease name.
+    fs.mkdirSync(path.join(victim, id), { recursive: true });
+    fs.mkdirSync(path.join(home, ".dualog"), { recursive: true });
+    fs.symlinkSync(victim, path.join(home, ".dualog", "runtime"));
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      let refused = false, message = null;
+      try {
+        m.removeLeaseDirectory(path.join(home, ".dualog", "runtime", id));
+      } catch (err) { refused = true; message = err.message.split("\\n")[0]; }
+      console.log(JSON.stringify({
+        refused,
+        message,
+        targetSurvives: fs.existsSync(path.join(victim, id)),
+      }));
+    });
+  `;
+  const out = JSON.parse(execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim());
+  assert.equal(out.refused, true, "removal through a linked root must be refused");
+  assert.match(out.message, /symbolic link/);
+  assert.equal(out.targetSurvives, true, "and the link target must be untouched");
+});
+
 test("releasing takes the credentials with it", () => {
   const lease = newLease();
   transitionLease(lease, "projecting");
@@ -549,6 +618,26 @@ test("a runner can clean up after its own failed pre-spawn turn", () => {
   const { released } = releaseLease(lease);
   assert.equal(released, true, "the owner may reclaim its own pre-spawn lease");
   assert.equal(fs.existsSync(lease.dir), false);
+
+  // A FAILED SPAWN too, once the consumer is provably absent. The owner has
+  // awaited its own spawn call by the time it releases, so unlike a third-party
+  // sweep it knows no helper of its own is still in flight. Without this, a
+  // failed startTmuxSession() retained its credentials until the next reboot,
+  // because the sweep's rule for that state is deliberately boot-scoped.
+  const failed = newLease();
+  transitionLease(failed, "spawning", {
+    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+  });
+  assert.equal(releaseLease(failed).released, true, "the owner may reclaim its own failed spawn");
+  assert.equal(fs.existsSync(failed.dir), false);
+
+  // But not one whose pane actually came up -- that is a live consumer.
+  const live = newLease();
+  transitionLease(live, "spawning", {
+    consumer: { kind: "headless", pid: process.pid, pgid: process.pid },
+  });
+  assert.equal(releaseLease(live).released, false, "a spawn that succeeded is not reclaimable");
+  fs.rmSync(live.dir, { recursive: true, force: true });
 
   // The counterweight: this must be about being the OWNER, not about being any
   // process that asks. A lease belonging to a different, live runner is refused.

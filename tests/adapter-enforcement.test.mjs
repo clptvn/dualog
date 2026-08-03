@@ -591,6 +591,41 @@ test("a seeded settings file that is not JSON is refused, not overwritten", () =
   assert.equal(fs.readFileSync(settingsPath, "utf-8"), "{ not json");
 });
 
+test("a contained relocation wins the merge even if a colliding setting exists", () => {
+  // The schema now rejects a key declared in two overlay maps, so this shape is
+  // unreachable through a real manifest -- which is exactly why the ORDERING
+  // needs its own test. It is the layer that held when the collision check had a
+  // gap: a top-level `dirs` entry and a `configIsolation.extraEnv` entry sharing
+  // a name resolved to whichever merged last, and staticEnv merging first meant
+  // the UNCONTAINED settings value won. The name is one the path-variable
+  // backstop does not recognise, so nothing else would catch it.
+  //
+  // Built by mutating a PARSED manifest rather than by parsing this shape, since
+  // parseManifest correctly refuses it.
+  const turn = freshTurn("merge-order");
+  const adapter = {
+    ...adapterFor("qwen"),
+    dirs: { FOO: "{{scratchDir}}/contained" },
+  };
+  adapter.configIsolation = {
+    ...adapter.configIsolation,
+    extraEnv: { ...adapter.configIsolation.extraEnv, FOO: "pwned-config" },
+  };
+
+  const { env } = buildInvocationFromAdapter(adapter, {
+    projectPath: "/fixture/project",
+    sessionDir: turn.sessionDir,
+    scratchDir: turn.scratchDir,
+    initialPrompt: "hi",
+  });
+
+  assert.equal(
+    env.FOO,
+    path.join(turn.scratchDir, "contained"),
+    "the proven relocation must be the last word, not the uncontained setting"
+  );
+});
+
 // --- Consistency between the two entry points -----------------------------
 
 test("negotiate and the argv builder never disagree about a turn", () => {

@@ -10,6 +10,7 @@ import os from "os";
 import {
   applyEffortSettingsFile,
   applyMcpSuppression,
+  containedRelocations,
   prepareConfigIsolation,
   partnerSentinelEnv,
   staticEnv,
@@ -492,7 +493,20 @@ export function buildInvocationFromAdapter(adapter, options) {
     args,
     // Sentinel last: nothing an adapter declares may override the recursion
     // guard, since that is the one protection every partner depends on.
-    env: { ...staticEnv(adapter, ctx), ...isolationEnv, ...partnerSentinelEnv() },
+    // Contained relocations merge LAST, after every settings map.
+    //
+    // The schema rejects a key declared in two overlay maps, so this should be
+    // unreachable -- but it is the layer that held when that check had a gap:
+    // a top-level `dirs` entry and a `configIsolation.extraEnv` entry sharing a
+    // name resolved to whichever merged later, and `staticEnv` merging first
+    // meant the UNCONTAINED settings value won over the proven one. Ordering it
+    // this way makes the safe value the last word regardless.
+    env: {
+      ...staticEnv(adapter, ctx),
+      ...isolationEnv,
+      ...containedRelocations(adapter, ctx),
+      ...partnerSentinelEnv(),
+    },
     usesInitialPrompt:
       adapter.promptDelivery[engine] === "argv" && isSet(ctx.initialPrompt),
     engine,

@@ -304,8 +304,15 @@ export function proveLeaseReleasable(meta, { now = Date.now() } = {}) {
   if (state === "released") return { removable: true, reason: null };
 
   // `spawning` or `active`: a consumer may exist. Its identity decides.
-  const consumer = meta.consumer;
-  if (consumer && typeof consumer === "object") {
+  //
+  // A consumer RECORD without a usable identity is not an identity -- it is the
+  // identity-less case wearing an object. The headless engine writes
+  // `{kind: "headless"}` before spawn() and fills in the pid after, so a crash
+  // in between left a record that probed `unknown` forever: it never reached the
+  // boot check below, so it was retained across reboots and on any host where a
+  // boot identity cannot be established. Falling through fixes that.
+  const consumer = hasUsableIdentity(meta.consumer) ? meta.consumer : null;
+  if (consumer) {
     const verdict = probeConsumer(consumer);
     if (verdict === "alive") return keep("the lease's consumer is still running");
     if (verdict !== "absent") {
@@ -337,6 +344,21 @@ export function proveLeaseReleasable(meta, { now = Date.now() } = {}) {
       if (owner !== "absent") {
         return keep(`a spawn may be in progress and the owning runner could not be probed (${owner})`);
       }
+      // OWNER GONE, CONSUMER ABSENT -- and that is still not proof.
+      //
+      // startTmuxSession() creates the pane by running tmux through an
+      // execFile child, which is NOT the runner and outlives a SIGKILLed one.
+      // Kill the runner in that window and both probes read absent while a
+      // helper is about to create the pane; deleting here hands the partner a
+      // home that no longer exists. Nothing observable distinguishes "the
+      // helper died too" from "the helper is a millisecond away", so on this
+      // boot the answer is retain. A previous boot settles it: no helper and no
+      // pane survives a reboot.
+      if (isSameBoot(meta.boot) !== false) {
+        return keep(
+          "the owning runner is gone but a spawn helper it started may still be in flight on this boot"
+        );
+      }
     }
     return { removable: true, reason: null };
   }
@@ -354,6 +376,27 @@ export function proveLeaseReleasable(meta, { now = Date.now() } = {}) {
     return keep("the lease records no usable boot identity, so a spawn cannot be ruled out");
   }
   return keep("a spawn may have begun and no consumer identity was recorded");
+}
+
+/**
+ * Does this consumer record actually name something probeable?
+ *
+ * A record is written BEFORE the thing it describes exists -- that is what makes
+ * the state machine a conservative upper bound -- so "there is a consumer object"
+ * and "there is something to probe" are different questions, and treating them
+ * as one is how a kind-only headless record came to be retained forever.
+ */
+function hasUsableIdentity(consumer) {
+  if (!consumer || typeof consumer !== "object") return false;
+  if (consumer.kind === "tmux") {
+    return typeof consumer.session_name === "string" && consumer.session_name.length > 0;
+  }
+  if (consumer.kind === "headless") {
+    return Number.isSafeInteger(consumer.pid) && consumer.pid > 0;
+  }
+  // A kind this version does not know cannot be probed, so it is not an
+  // identity. The boot check still reclaims it after a restart.
+  return false;
 }
 
 function probeOwner(meta) {
@@ -421,6 +464,16 @@ export function removeLeaseDirectory(dir) {
   if (path.dirname(resolved) !== path.resolve(runtimeDir())) {
     throw new Error(`removeLeaseDirectory: ${resolved} is not directly under the runtime root`);
   }
+  // Re-prove the ROOT here, in the operation that deletes, rather than trusting
+  // a check made by whoever called us. The parent comparison above is lexical --
+  // it says the path is SPELLED under the runtime root, not that it resolves
+  // there -- so a root swapped for a symlink after the caller validated it would
+  // send this rmSync into whatever the link points at, judging its target only
+  // on whether the leaf name looks like a lease id.
+  assertManagedRootPath(runtimeDir(), {
+    fn: "removeLeaseDirectory",
+    label: "runtime root",
+  });
   if (!isValidLeaseId(id)) {
     throw new Error(`removeLeaseDirectory: ${JSON.stringify(id)} is not a lease id`);
   }
@@ -465,7 +518,15 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
   // owner is the authority on whether it is giving up.
   if (record.state === "valid" && record.value.runner_pid === process.pid) {
     const preSpawn = ["allocated", "projecting", "ready"].includes(record.value.state);
-    if (preSpawn) {
+    // `spawning` too, but only once the consumer is provably absent. The owner
+    // has AWAITED its own spawn call by the time it releases, so unlike a
+    // third-party sweep it knows no helper of its own is still in flight -- which
+    // is the only thing that made "owner gone + consumer absent" unsafe. Without
+    // this, a failed startTmuxSession() retained its lease until the next reboot.
+    const failedSpawn =
+      record.value.state === "spawning" &&
+      probeConsumer(record.value.consumer ?? {}) === "absent";
+    if (preSpawn || failedSpawn) {
       removeLeaseDirectory(dir);
       return { released: true, reason: null };
     }
