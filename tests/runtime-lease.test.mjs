@@ -1301,6 +1301,35 @@ test("a release that cannot persist its tombstone keeps the directory", () => {
   fs.rmSync(lease.metaPath, { force: true });
 });
 
+test("a never-created marker record is reaped too, not kept forever", () => {
+  // FOUND IN REVIEW. The marker exists precisely because these leases have no
+  // consumer to probe -- and the expiry branch demanded one, so every projection
+  // failure and every missing-binary turn left a permanent metadata file. The
+  // credentials went; the bookkeeping accumulated.
+  for (const state of ["projecting", "spawning"]) {
+    const lease = newLease();
+    if (state === "spawning") {
+      transitionLease(lease, "spawning", {
+        consumer: { kind: "headless", spawn_outcome: "failed" },
+      });
+    } else {
+      transitionLease(lease, "projecting");
+    }
+
+    assert.equal(releaseLease(lease).released, true, state);
+    assert.equal(fs.existsSync(lease.dir), false, `${state}: the directory goes`);
+    assert.equal(fs.existsSync(lease.metaPath), true, `${state}: the marker remains for now`);
+
+    // Fresh: kept, in case a late recreation needs attributing.
+    sweepLeases({ apply: true });
+    assert.equal(fs.existsSync(lease.metaPath), true, `${state}: not reaped while fresh`);
+
+    // Aged out: reaped, because the owner proved there was never a consumer.
+    sweepLeases({ apply: true, now: Date.now() + 25 * 60 * 60 * 1000 });
+    assert.equal(fs.existsSync(lease.metaPath), false, `${state}: reaped once spent`);
+  }
+});
+
 test("a spent lease record is eventually reaped, once its directory is gone", () => {
   // Tombstones are metadata, not credentials, so age IS the right measure for
   // them -- otherwise the runtime root fills with records of turns long past.

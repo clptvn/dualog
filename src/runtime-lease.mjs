@@ -1014,8 +1014,16 @@ export function sweepLeases({
       // consumer it names is proven gone -- and a record naming nothing
       // probeable is kept, because it can never earn that proof.
       const consumer = held.value.consumer;
-      if (!hasUsableIdentity(consumer)) continue;
-      if (probeConsumer(consumer) !== "absent") continue;
+      // The safe no-consumer case, honoured here as it is everywhere else.
+      // Without this, a marker record -- written when the owner PROVED nothing
+      // was ever started -- had no probeable consumer, failed the check below,
+      // and could never be reaped. Every projection failure and every
+      // missing-binary turn then left a permanent metadata file behind: the
+      // credentials went, the bookkeeping accumulated forever.
+      if (held.value.consumer_never_created !== true) {
+        if (!hasUsableIdentity(consumer)) continue;
+        if (probeConsumer(consumer) !== "absent") continue;
+      }
       if (!apply) {
         receipt.removed.push({ dir, applied: false, reason: "spent lease record" });
         continue;
