@@ -569,6 +569,19 @@ export async function runPartnerCommand({
           log(`Failed to terminate ${partnerDisplay} tmux session: ${cleanupErr.message}`);
         }
       }
+      // A spawn that failed AFTER the pane existed carries the pane's process out
+      // with the error. Record it before releasing: without it the lease is judged
+      // on the session name alone, and a session teardown does not prove the
+      // process it ran has exited -- which is the whole reason pane_pid exists.
+      if (lease && !handle && err?.panePid) {
+        try {
+          transitionLease(lease, "spawning", {
+            consumer: { kind: "tmux", session_name: err.sessionName, pane_pid: err.panePid },
+          });
+        } catch {
+          // Best effort; the release below still refuses without a proof.
+        }
+      }
       // Every exit from this function releases the lease if it can. A failed turn
       // has exactly the same credential copy on disk as a successful one, and it
       // is the failure paths -- not the happy path -- that left 176 of them behind.

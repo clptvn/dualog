@@ -419,13 +419,31 @@ test("the identity-less spawning window retains on this boot and heals on the ne
   });
   assert.equal(afterReboot.removable, true);
 
-  // A lease from another machine is not ours to reason about at all.
+  // A lease from another machine is not ours to reason about at all -- so it is
+  // UNKNOWN, and unknown retains. This used to answer "removable", which reads a
+  // foreign record as permission to delete; on a synced or shared home that is a
+  // deletion authorized by a fact about someone else's machine.
   const otherHost = proveLeaseReleasable({
     state: "spawning",
     consumer: null,
     boot: { host: "some-other-host", id: "boot-elsewhere", precise: true },
   });
-  assert.equal(otherHost.removable, true, "another host's boot cannot be running our spawn");
+  assert.equal(otherHost.removable, false, "another host's record establishes nothing about ours");
+
+  // And a HOSTNAME RENAME is not a reboot: boot_id and kern.boottime are
+  // untouched by one, so the id has to decide before the host is consulted.
+  const currentBoot = bootIdentity();
+  if (currentBoot?.precise) {
+    assert.equal(
+      proveLeaseReleasable({
+        state: "spawning",
+        consumer: null,
+        boot: { ...currentBoot, host: `${currentBoot.host}-renamed` },
+      }).removable,
+      false,
+      "a renamed host with the same boot id is still this boot"
+    );
+  }
 
   // And no boot identity at all is not evidence of anything.
   const noBoot = proveLeaseReleasable({ state: "spawning", consumer: null, boot: null });
@@ -879,6 +897,45 @@ test("a tombstone identifies what to check; it does not authorize deletion", (t)
   fs.rmSync(lease.metaPath, { force: true });
 });
 
+test("releasing a tombstoned lease re-probes too, not only the sweep", () => {
+  // FOUND IN REVIEW. sweepLeases() re-probed a released record, but
+  // releaseLease() fell through to proveLeaseReleasable(), where `released` was
+  // immediately removable. A failed tmux turn calls the owner cleanup TWICE --
+  // the turn's catch and the setup envelope -- so if a late pane recreated the
+  // directory between those two calls, the second deleted it without checking
+  // the recorded consumer. Both paths must apply the same rule.
+  const lease = newLease();
+  fs.writeFileSync(
+    lease.metaPath,
+    JSON.stringify({
+      schema_version: 1,
+      lease_id: lease.id,
+      state: "released",
+      released_at: new Date().toISOString(),
+      consumer: { kind: "headless", pid: process.pid, pgid: process.pid },
+    })
+  );
+
+  const refused = releaseLease(lease);
+  assert.equal(refused.released, false, "a released record whose consumer is alive must retain");
+  assert.match(refused.reason, /running again/);
+  assert.equal(fs.existsSync(lease.dir), true);
+
+  // And once that consumer really is gone, it goes.
+  fs.writeFileSync(
+    lease.metaPath,
+    JSON.stringify({
+      schema_version: 1,
+      lease_id: lease.id,
+      state: "released",
+      released_at: new Date().toISOString(),
+      consumer: { kind: "headless", pid: 999999, pgid: 999999 },
+    })
+  );
+  assert.equal(releaseLease(lease).released, true);
+  fs.rmSync(lease.metaPath, { force: true });
+});
+
 test("unreadable metadata retains, with no ownership shortcut", () => {
   // The counterweight to the above: ownership establishes that this process
   // allocated the path, never that nothing is using what is there now.
@@ -1039,6 +1096,16 @@ test("every exit from a partner turn releases its lease, and only on proof", () 
     src,
     /if \(partnerExited\) \{\s*\n\s*releaseLeaseQuietly\(lease, log\);/,
     "the release must be gated on the partner having exited"
+  );
+
+  // A spawn that failed after the pane existed carries the pane's process out
+  // with the error, and that identity must be RECORDED before the release --
+  // otherwise the lease is judged on the session name alone, and a session
+  // teardown does not prove the process it ran has exited.
+  assert.match(
+    src,
+    /if \(lease && !handle && err\?\.panePid\) \{[\s\S]{0,400}pane_pid: err\.panePid/,
+    "a failed spawn must record the carried pane process before releasing"
   );
 
   // The failed-spawn shortcut probes TWICE across a settle: the tmux SERVER is a

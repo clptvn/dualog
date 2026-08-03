@@ -99,29 +99,54 @@ export function buildTmuxSessionName(sessionId, label) {
 export async function startTmuxSession({ sessionName, cwd, command, args, env }) {
   await prepareTmuxServer();
   const payload = buildTmuxShellPayload({ command, args, env });
-  await runTmux(["new-session", "-d", "-s", sessionName, "-c", cwd, payload]);
+  try {
+    await runTmux(["new-session", "-d", "-s", sessionName, "-c", cwd, payload]);
+  } catch (err) {
+    // The CLIENT failed; the SERVER may still act on what it was handed. A
+    // timed-out client is SIGKILLed, and tmux processes commands it already has,
+    // so "new-session threw" does not mean no pane will exist. Killing the name
+    // is the only way to make that true, and it is ordered after the create, so
+    // the server applies them in that order.
+    await runTmux(["kill-session", "-t", `=${sessionName}`], { allowFailure: true });
+    throw err;
+  }
+  const paneTarget = `${sessionName}:0.0`;
+
+  // THE PROCESS IDENTITY IS CAPTURED FIRST, before anything else that can fail.
+  //
+  // A tmux session going away does not prove the program it was running has
+  // exited -- a partner CLI flushes caches during shutdown, after its pane is
+  // gone -- so whatever decides "is this partner finished" needs a handle on the
+  // process. The shell payload `exec`s into the CLI, so pane_pid IS that process.
+  //
+  // Order matters as much as the value. This used to run after
+  // configureTmuxSession() and the pane_id query, so a failure in either left a
+  // LIVE pane whose process was never recorded; cleanup then fell back to
+  // session-only probes and could remove the home while that process ran. It is
+  // now the first thing asked after the pane exists, and a failure to read it is
+  // survivable -- the caller still gets a handle, just without the stronger
+  // identity.
+  let panePid = null;
+  try {
+    const raw = (
+      await runTmux(["display-message", "-p", "-t", paneTarget, "#{pane_pid}"])
+    ).stdout.trim();
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isSafeInteger(parsed) && parsed > 0) panePid = parsed;
+  } catch {
+    // Recorded as unknown rather than fabricated; see probeConsumer.
+  }
+
   try {
     await configureTmuxSession(sessionName);
-    const paneTarget = `${sessionName}:0.0`;
     const paneId = (
       await runTmux(["display-message", "-p", "-t", paneTarget, "#{pane_id}"])
     ).stdout.trim();
-    // The PROCESS in the pane, not just the pane.
-    //
-    // A tmux session going away does not prove the program it was running has
-    // exited, and that gap is observable: a partner CLI flushes caches during
-    // shutdown, after its pane is gone. Anything deciding "is this partner
-    // finished" needs a handle on the process, and the shell payload `exec`s
-    // into the CLI, so pane_pid IS that process rather than a wrapper.
-    const panePid = Number.parseInt(
-      (await runTmux(["display-message", "-p", "-t", paneTarget, "#{pane_pid}"])).stdout.trim(),
-      10
-    );
     return {
       sessionName,
       paneTarget,
       paneId,
-      panePid: Number.isSafeInteger(panePid) && panePid > 0 ? panePid : null,
+      panePid,
       cwd,
       command,
       args: [...args],
@@ -129,7 +154,12 @@ export async function startTmuxSession({ sessionName, cwd, command, args, env })
       startedAt: new Date().toISOString(),
     };
   } catch (err) {
-    await runTmux(["kill-session", "-t", sessionName], { allowFailure: true });
+    await runTmux(["kill-session", "-t", `=${sessionName}`], { allowFailure: true });
+    // Carry the identity out with the failure. The pane EXISTED -- new-session
+    // returned -- so a caller holding a credential lease needs the process to
+    // probe, not just the session name it is about to stop trusting.
+    err.panePid = panePid;
+    err.sessionName = sessionName;
     throw err;
   }
 }

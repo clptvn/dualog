@@ -299,6 +299,46 @@ test("a started session reports the process running in its pane", async (t) => {
   assert.equal(await probeTmuxSession(handle.sessionName), "absent");
 });
 
+test("a spawn that fails after the pane exists still yields the pane's process", async (t) => {
+  // The pane is created by `new-session`; everything after it is fallible setup.
+  // If one of those queries fails, the pane is LIVE and the caller is about to
+  // release a credential lease -- so the identity has to survive the failure,
+  // and it has to be captured before the fallible part rather than after it.
+  //
+  // Driven by a stub tmux so the failure lands exactly where it needs to.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-spawnfail-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stub = path.join(dir, "tmux");
+  fs.writeFileSync(
+    stub,
+    `#!/bin/sh
+case "$*" in
+  *pane_pid*) echo 4242; exit 0;;
+  *pane_id*)  echo "pane_id query failed" >&2; exit 1;;
+  *)          exit 0;;
+esac
+`
+  );
+  fs.chmodSync(stub, 0o755);
+  withTmuxBinary(t, stub);
+
+  await assert.rejects(
+    () =>
+      startTmuxSession({
+        sessionName: "dualog-spawnfail",
+        cwd: dir,
+        command: "irrelevant",
+        args: [],
+        env: {},
+      }),
+    (err) => {
+      assert.equal(err.panePid, 4242, "the pane's process must come out with the failure");
+      assert.equal(err.sessionName, "dualog-spawnfail");
+      return true;
+    }
+  );
+});
+
 // --- what the classifier tells a driver --------------------------------------
 
 test("unprovable liveness is not reported as a dead pane", () => {

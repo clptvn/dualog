@@ -210,8 +210,18 @@ export function isSameBoot(recorded, current = bootIdentity()) {
   // -- unknown, therefore retained -- which costs self-healing on hosts with no
   // OS boot identity and never costs a live turn its credentials.
   if (recorded.precise === true && current.precise === true) {
-    if (recorded.host !== current.host) return false;
-    return recorded.id === current.id;
+    // THE BOOT ID DECIDES, and it is checked FIRST.
+    //
+    // Putting the hostname test ahead of it made a rename read as a reboot: a
+    // DHCP lease change leaves Linux `boot_id` and macOS `kern.boottime`
+    // untouched, but `host !== host` returned `false` -- the verdict that
+    // authorizes deletion -- so an identity-less lease could be reclaimed on the
+    // current boot with its child still alive.
+    if (recorded.id === current.id) return true;
+    // Different ids on the same host is a genuine reboot. Different ids on a
+    // DIFFERENT host says nothing about ours, so it is unknown rather than
+    // false.
+    return recorded.host === current.host ? false : null;
   }
 
   // The wall-clock epoch is still compared, but only to answer `true`: two
@@ -425,7 +435,24 @@ export function proveLeaseReleasable(meta, { now = Date.now() } = {}) {
     return { removable: true, reason: null };
   }
 
-  if (state === "released") return { removable: true, reason: null };
+  if (state === "released") {
+    // A TOMBSTONE IS RE-PROBED HERE TOO, not only in the sweep.
+    //
+    // "Released" records that the consumer was proven gone at some past moment.
+    // Between then and now a late pane can have started -- a tmux client killed
+    // after handing `new-session` to the server -- and a failed turn calls the
+    // owner cleanup twice, so the second call would delete a directory the first
+    // one released and something has since recreated. The sweep already
+    // re-probed; this is the same rule, in the path the owner actually takes.
+    if (hasUsableIdentity(meta.consumer)) {
+      const verdict = probeConsumer(meta.consumer);
+      if (verdict === "alive") return keep("a released lease's consumer is running again");
+      if (verdict !== "absent") {
+        return keep(`a released lease's consumer could not be probed (${verdict})`);
+      }
+    }
+    return { removable: true, reason: null };
+  }
 
   // `spawning` or `active`: a consumer may exist. Its identity decides.
   //
