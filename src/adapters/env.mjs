@@ -153,7 +153,10 @@ export function prepareConfigIsolation(adapter, ctx) {
  * statement after it was made. There is no legitimate reason to set it twice.
  */
 function assertNotIsolationVariable(adapter, isolation, field, key) {
-  if (key !== isolation.env) return;
+  // Case-folded: environment names are case-insensitive on Windows, so `foo`
+  // and `FOO` are one variable there and the second would silently replace the
+  // value proven to be inside the lease.
+  if (String(key).toUpperCase() !== String(isolation.env).toUpperCase()) return;
   throw new Error(
     `Adapter "${adapter.id}": ${field} may not redefine ${isolation.env}; ` +
       `that variable is set from configIsolation.dir, which is the value proven ` +

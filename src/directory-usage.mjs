@@ -26,7 +26,7 @@
 
 import fs from "fs";
 import path from "path";
-import { execFileSync } from "child_process";
+import { execFileSync, spawnSync } from "child_process";
 
 const LSOF_TIMEOUT_MS = 5000;
 
@@ -100,27 +100,36 @@ function probeViaProc(dir) {
  */
 function probeViaLsof(dir) {
   try {
-    const out = execFileSync("lsof", ["-w", "-F", "pn", "+D", dir], {
+    // NO `-w`. It suppresses lsof's warnings -- including "can't opendir",
+    // which is exactly how an INCOMPLETE scan came to look like a clean
+    // no-match. Reproduced: a lease containing an unreadable subdirectory with a
+    // held file beneath it answered `free`, and the removal then unlinked that
+    // held file before failing on the non-empty parent. On POSIX, unlink
+    // succeeds on open files, so this probe is the only thing standing between a
+    // live process and its credentials; it has to see what it could not read.
+    const proc = spawnSync("lsof", ["-F", "pn", "+D", dir], {
       encoding: "utf-8",
       timeout: LSOF_TIMEOUT_MS,
-      stdio: ["ignore", "pipe", "pipe"],
     });
-    return hasForeignProcess(out) ? "in-use" : "free";
-  } catch (err) {
-    // lsof exits 1 when it simply found nothing, which is the common case for a
-    // finished turn. It also exits 1 for some partial-permission runs, so treat
-    // a clean empty result as free and anything else as unknown.
-    if (err?.status === 1) {
-      const out = typeof err.stdout === "string" ? err.stdout : "";
-      if (hasForeignProcess(out)) return "in-use";
-      // Exit 1 means "found nothing" AND "could not fully look" -- lsof uses it
-      // for both. Only a clean, empty, error-free run is evidence of `free`;
-      // anything it complained about leaves the question open.
-      const noise = typeof err.stderr === "string" ? err.stderr.trim() : "";
-      return noise ? "unknown" : "free";
-    }
+    return classifyLsof(proc);
+  } catch {
     return "unknown";
   }
+}
+
+/**
+ * lsof exit 1 means BOTH "found nothing" and "could not fully look".
+ *
+ * Only a run that found nothing AND complained about nothing is evidence of
+ * `free`. Any warning, any spawn failure, any timeout leaves the question open.
+ */
+function classifyLsof(proc) {
+  if (!proc || proc.error) return "unknown";
+  const out = typeof proc.stdout === "string" ? proc.stdout : "";
+  if (hasForeignProcess(out)) return "in-use";
+  if (proc.status !== 0 && proc.status !== 1) return "unknown";
+  const noise = typeof proc.stderr === "string" ? proc.stderr.trim() : "";
+  return noise ? "unknown" : "free";
 }
 
 /** Any process other than this one, in lsof's field-mode output. */

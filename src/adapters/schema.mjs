@@ -1005,10 +1005,16 @@ export const AdapterManifest = z
       for (let j = i + 1; j < overlayMaps.length; j++) {
         const a = overlayMaps[i];
         const b = overlayMaps[j];
+        // CASE-FOLDED. Environment names are case-insensitive on Windows, so
+        // `FOO` in one map and `foo` in another are one variable there -- and
+        // they passed validation as two, producing an overlay whose effective
+        // value was no longer guaranteed to be the contained relocation.
+        const foldedB = new Map(Object.keys(b.map).map((k) => [k.toUpperCase(), k]));
         for (const key of Object.keys(a.map)) {
-          if (key in b.map) {
+          if (foldedB.has(key.toUpperCase())) {
             fail(
-              `${a.field}.${key} is also declared in ${b.field}; every one of these ` +
+              `${a.field}.${key} is also declared in ${b.field} (as ` +
+                `${foldedB.get(key.toUpperCase())}); every one of these ` +
                 "maps is merged into the same launch environment, so a key in two of " +
                 "them silently resolves to whichever is merged last",
               [...a.path, key]
@@ -1024,7 +1030,10 @@ export const AdapterManifest = z
       // the primary variable is set from the one value proven contained, and
       // nothing may redefine it.
       for (const field of ["dirs", "extraEnv"]) {
-        if (isolation.env in isolation[field]) {
+        const collides = Object.keys(isolation[field]).some(
+          (key) => key.toUpperCase() === isolation.env.toUpperCase()
+        );
+        if (collides) {
           fail(
             `configIsolation.${field} may not redefine ${isolation.env}; that ` +
               "variable is set from configIsolation.dir",

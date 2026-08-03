@@ -1115,6 +1115,119 @@ test("a spawn the owner watched fail is not the same as one that may have happen
   assert.equal(fs.existsSync(observed.dir), false);
 });
 
+test("an incomplete usage scan is not a free one", (t) => {
+  // REPRODUCED BY THE REVIEWER, against code I had just written. `lsof -w`
+  // suppresses warnings -- including "can't opendir" -- so a lease containing an
+  // unreadable subdirectory with a held file beneath it answered `free`, and the
+  // removal then UNLINKED that held file before failing on the non-empty parent.
+  // On POSIX, unlink succeeds on open files, so this probe is the only thing
+  // between a live process and its credentials.
+  if (process.platform !== "darwin") {
+    t.skip("exercises the lsof path specifically");
+    return;
+  }
+  const lease = newLease();
+  const deep = path.join(lease.dir, "codex-home", "deep");
+  fs.mkdirSync(deep, { recursive: true });
+  const held = path.join(deep, "auth.json");
+  fs.writeFileSync(held, '{"token":"held"}');
+
+  const holder = spawn("/bin/sh", ["-c", `exec 9<${JSON.stringify(held)}; sleep 20`], {
+    detached: true,
+    stdio: "ignore",
+  });
+  holder.unref();
+  t.after(() => {
+    try {
+      fs.chmodSync(deep, 0o755);
+    } catch {}
+    try {
+      process.kill(-holder.pid, "SIGKILL");
+    } catch {}
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+    fs.rmSync(lease.metaPath, { force: true });
+  });
+  execFileSync("sh", ["-c", "sleep 0.6"]);
+  fs.chmodSync(deep, 0o000);
+
+  transitionLease(lease, "active", {
+    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session", pane_pid: 999999 },
+  });
+  const verdict = releaseLease(lease);
+  assert.equal(verdict.released, false, "a scan that could not look everywhere must retain");
+  fs.chmodSync(deep, 0o755);
+  assert.equal(fs.existsSync(held), true, "and the held credential must still be there");
+});
+
+test("a released record with no probeable consumer is retained", () => {
+  // Falling through to the usage check here let a null, partial, or unknown-kind
+  // consumer authorize deletion whenever usage happened to be `free` -- and
+  // usage cannot see a process that closed the file and kept the token. Only an
+  // owner that PROVED nothing was ever started may reclaim without one.
+  for (const consumer of [null, {}, { kind: "something-future" }, { kind: "headless" }]) {
+    const verdict = proveLeaseReleasable({ state: "released", consumer });
+    assert.equal(verdict.removable, false, JSON.stringify(consumer));
+    assert.match(verdict.reason, /no consumer that can be probed/);
+  }
+
+  // The exception, and it is explicit rather than inferred.
+  assert.equal(
+    proveLeaseReleasable({ state: "released", consumer: null, consumer_never_created: true })
+      .removable,
+    true,
+    "an owner-proven never-started lease may be reclaimed without a consumer"
+  );
+});
+
+test("a pre-spawn release records that nothing was ever started", () => {
+  // The tombstone rule is "no probeable consumer means retain". A lease released
+  // BEFORE anything spawned legitimately has none -- so the owner records that
+  // explicitly, rather than the reaper inferring it from an absence.
+  const lease = newLease();
+  transitionLease(lease, "projecting");
+  assert.equal(releaseLease(lease).released, true);
+
+  const tombstone = JSON.parse(fs.readFileSync(lease.metaPath, "utf-8"));
+  assert.equal(tombstone.state, "released");
+  assert.equal(
+    tombstone.consumer_never_created,
+    true,
+    "an owner that watched nothing start must say so on the record"
+  );
+
+  // Which is what lets a recreated directory be reclaimed here and nowhere else.
+  fs.mkdirSync(path.join(lease.dir, "codex-home"), { recursive: true });
+  const receipt = sweepLeases({ apply: true });
+  assert.ok(receipt.removed.some((r) => r.dir === lease.dir));
+  fs.rmSync(lease.metaPath, { force: true });
+});
+
+test("the sweep keeps a recreated directory whose record names no probeable consumer", () => {
+  // Same rule as proveLeaseReleasable, in the branch that acts on a live
+  // directory. Without it, a null or partial consumer record authorized deleting
+  // a recreated home whenever the usage probe happened to answer `free`.
+  const lease = newLease();
+  fs.writeFileSync(
+    lease.metaPath,
+    JSON.stringify({
+      schema_version: 1,
+      lease_id: lease.id,
+      state: "released",
+      released_at: new Date().toISOString(),
+      consumer: { kind: "something-a-future-version-writes" },
+    })
+  );
+  fs.mkdirSync(path.join(lease.dir, "codex-home"), { recursive: true });
+
+  const receipt = sweepLeases({ apply: true });
+  const retained = receipt.retained.find((r) => r.dir === lease.dir);
+  assert.ok(retained, "a record with no probeable consumer must retain its directory");
+  assert.match(retained.reason, /no probeable consumer/);
+  assert.equal(fs.existsSync(lease.dir), true);
+  fs.rmSync(lease.dir, { recursive: true, force: true });
+  fs.rmSync(lease.metaPath, { force: true });
+});
+
 test("a tombstone is not aged out until its consumer is proven gone", () => {
   // FOUND IN REVIEW. Expiring on elapsed time alone re-opened the hole the
   // sibling record closed: a consumer keeps a token, touches nothing for a day,

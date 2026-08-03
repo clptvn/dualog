@@ -375,7 +375,22 @@ async function runHeadlessTurnInner({
       detached: process.platform !== "win32",
     });
   }
-  if (lease) {
+  // NODE DOES NOT THROW FOR A MISSING BINARY. spawn() returns a ChildProcess
+  // with no pid and emits `error` asynchronously, so the synchronous catch above
+  // never fires for the commonest failure there is. Claiming `active` here would
+  // record an identity-less consumer that the reaper then retains for the whole
+  // boot -- a typo in a manifest holding a credential copy until reboot.
+  if (lease && child.pid == null) {
+    child.once("error", () => {
+      try {
+        transitionLease(lease, "spawning", {
+          consumer: { kind: "headless", spawn_outcome: "failed" },
+        });
+      } catch {
+        // The release still refuses without a proof.
+      }
+    });
+  } else if (lease) {
     transitionLease(lease, "active", {
       consumer: {
         kind: "headless",

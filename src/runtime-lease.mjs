@@ -468,8 +468,15 @@ export function proveLeaseReleasable(meta, { now = Date.now(), dir = null } = {}
       if (verdict !== "absent") {
         return keep(`a released lease's consumer could not be probed (${verdict})`);
       }
+      return releasable();
     }
-    return releasable();
+    // NO PROBEABLE CONSUMER. Falling through to the usage check here let a null,
+    // partial, or unknown-kind consumer record authorize deletion whenever usage
+    // happened to be `free` -- and usage cannot see a process that closed the
+    // file and kept the token. Only an owner that PROVED no consumer was ever
+    // created may reclaim without one.
+    if (meta.consumer_never_created === true) return releasable();
+    return keep("a released lease records no consumer that can be probed");
   }
 
   // `spawning` or `active`: a consumer may exist. Its identity decides.
@@ -797,7 +804,8 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
       probeConsumer(spawnConsumer) === "absent" &&
       (sleepSync(SPAWN_SETTLE_MS), probeConsumer(spawnConsumer) === "absent");
     if (preSpawn || failedSpawn || observedSpawnFailure) {
-      return finishRelease(dir, metaPath, record.value);
+      // The owner watched: nothing was started, or the spawn it watched failed.
+      return finishRelease(dir, metaPath, { ...record.value, consumer_never_created: true });
     }
   }
 
@@ -1049,6 +1057,11 @@ export function sweepLeases({
           });
           continue;
         }
+      } else if (record.value.consumer_never_created !== true) {
+        // Same rule as proveLeaseReleasable: without a probeable consumer, only
+        // an owner-proven "nothing was ever started" authorizes reclaiming.
+        receipt.retained.push({ dir, reason: "released, but records no probeable consumer" });
+        continue;
       }
       if (!apply) {
         receipt.removed.push({ dir, applied: false, reason: "recreated after the lease was released" });

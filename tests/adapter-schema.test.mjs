@@ -537,6 +537,33 @@ test("a variable cannot be both a relocation and a setting", () => {
   );
 });
 
+test("collisions are detected case-insensitively, as Windows resolves them", () => {
+  // Environment names are case-insensitive on Windows, so `FOO` in one map and
+  // `foo` in another are ONE variable there -- and they passed validation as
+  // two, producing an overlay whose effective value was no longer guaranteed to
+  // be the contained relocation.
+  assert.throws(
+    () =>
+      parseManifest(
+        baseManifest({ dirs: { FOO: "{{sessionDir}}/data" }, env: { foo: "1" } }),
+        "/f.json"
+      ),
+    /is also declared in/,
+    "dirs.FOO and env.foo are the same variable on Windows"
+  );
+  assert.throws(
+    () =>
+      parseManifest(
+        baseManifest({
+          configIsolation: { ...isolationBase, extraEnv: { fake_home: "pwned-config" } },
+        }),
+        "/f.json"
+      ),
+    /may not redefine FAKE_HOME|names a filesystem location/,
+    "a differently-cased spelling of the isolation variable must be refused"
+  );
+});
+
 test("neither map may redefine the isolation variable", () => {
   for (const field of ["dirs", "extraEnv"]) {
     assert.throws(

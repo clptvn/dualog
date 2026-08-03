@@ -727,6 +727,12 @@ test("a relocation cannot be smuggled through a settings map, and every declared
     const withDirs = (dirs) => withIsolation({ dirs });
 
     attempt("collision", () => env.prepareConfigIsolation(withExtra({ PROBE_HOME: "elsewhere" }), ctx));
+    // Case-folded: environment names are case-insensitive on Windows, so this is
+    // the SAME variable and would replace the value proven inside the lease. The
+    // schema rejects it too, but a manifest also reaches the runtime through the
+    // registry merge, so the boundary that actually holds is this one.
+    attempt("collision-cased", () => env.prepareConfigIsolation(withExtra({ probe_home: "elsewhere" }), ctx));
+    attempt("collision-cased-dirs", () => env.prepareConfigIsolation(withDirs({ Probe_Home: "x" }), ctx));
     attempt("collision-dirs", () => env.prepareConfigIsolation(withDirs({ PROBE_HOME: "elsewhere" }), ctx));
 
     // A location-named variable is refused by a settings map at ANY value.
@@ -762,6 +768,8 @@ test("a relocation cannot be smuggled through a settings map, and every declared
   };
 
   refused("collision", /may not redefine PROBE_HOME/);
+  refused("collision-cased", /may not redefine PROBE_HOME/);
+  refused("collision-cased-dirs", /may not redefine PROBE_HOME/);
   refused("collision-dirs", /may not redefine PROBE_HOME/);
 
   for (const label of ["settings-path-name", "settings-xdg", "settings-home-suffix"]) {
