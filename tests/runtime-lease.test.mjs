@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 
 import { managedSession } from "./helpers/session.mjs";
 
@@ -971,6 +971,74 @@ test("every exit from a partner turn releases its lease, and only on proof", () 
     /\} finally \{[\s\S]{0,400}releaseLease\(lease\)/,
     "the headless engine has a dozen exit paths, so its release must be in a finally"
   );
+});
+
+test("a partner that outlives its pane keeps its lease until it really exits", async (t) => {
+  // THE PRODUCTION INCIDENT, reproduced end to end against a real tmux server.
+  //
+  // codex flushes its models cache during shutdown, after its pane has closed.
+  // Releasing on the tmux verdict alone deleted the home mid-shutdown, and the
+  // partner then recreated it -- leaving a directory with a valid lease name and
+  // no metadata that nothing could reclaim. This drives the same shape: a
+  // process that survives its pane by a beat and writes into its home.
+  if (spawnSync("tmux", ["-V"], { stdio: "ignore" }).status !== 0) {
+    t.skip("tmux is not installed");
+    return;
+  }
+  const { startTmuxSession, terminateTmuxSession } = await import("../src/tmux-runtime.mjs");
+  const { probeProcess } = await import("../src/process-probe.mjs");
+
+  const socket = `dualog-lease-outlive-${process.pid}`;
+  const previousSocket = process.env.DUALOG_TMUX_SOCKET;
+  process.env.DUALOG_TMUX_SOCKET = socket;
+  t.after(() => {
+    spawnSync("tmux", ["-L", socket, "kill-server"], { stdio: "ignore" });
+    if (previousSocket === undefined) delete process.env.DUALOG_TMUX_SOCKET;
+    else process.env.DUALOG_TMUX_SOCKET = previousSocket;
+  });
+
+  const lease = newLease();
+  const home = path.join(lease.dir, "codex-home");
+  fs.mkdirSync(home, { recursive: true });
+
+  // Ignores the pane going away, then writes into its home -- exactly what a
+  // cache flush during shutdown looks like from the outside.
+  const script = path.join(lease.dir, "fake-partner.sh");
+  fs.writeFileSync(
+    script,
+    `#!/bin/sh\ntrap '' TERM HUP\nsleep 2\necho '{}' > ${JSON.stringify(path.join(home, "models_cache.json"))}\n`
+  );
+  fs.chmodSync(script, 0o755);
+
+  const handle = await startTmuxSession({
+    sessionName: `dualog-outlive-${process.pid}`,
+    cwd: lease.dir,
+    command: script,
+    args: [],
+    env: {},
+  });
+  assert.ok(handle.panePid, "the pane's process must be identified");
+  transitionLease(lease, "active", {
+    consumer: { kind: "tmux", session_name: handle.sessionName, pane_pid: handle.panePid },
+  });
+
+  // Take the pane down. The tmux SESSION goes; the process does not.
+  await terminateTmuxSession(handle);
+  if (probeProcess(handle.panePid) === "alive") {
+    const premature = releaseLease(lease);
+    assert.equal(premature.released, false, "a partner still running must keep its home");
+    assert.match(premature.reason, /still running/);
+    assert.equal(fs.existsSync(home), true, "and the home it is about to write to must survive");
+  }
+
+  // Once it is genuinely gone, the lease goes with it.
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline && probeProcess(handle.panePid) !== "absent") {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(probeProcess(handle.panePid), "absent", "the fake partner should have exited by now");
+  assert.equal(releaseLease(lease).released, true);
+  assert.equal(fs.existsSync(lease.dir), false);
 });
 
 // --- the property all of it exists for ----------------------------------------
