@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 
 import { managedSession } from "./helpers/session.mjs";
 
@@ -182,6 +182,43 @@ test("a pre-spawn lease is removable only once its owner is gone", (t) => {
   }
 });
 
+test("a lease mid-spawn is not mistaken for one whose consumer exited", (t) => {
+  // FOUND IN REVIEW. The tmux identity is recorded BEFORE startTmuxSession(),
+  // so between those two statements the session name is legitimately absent --
+  // the pane does not exist YET. Reading that as "the consumer finished" let a
+  // concurrent sweep delete the lease, with its freshly seeded credentials,
+  // while the partner was still launching against it.
+  const spawning = {
+    state: "spawning",
+    runner_pid: liveProcess(t),
+    boot: bootIdentity(),
+    consumer: { kind: "tmux", session_name: "dualog-lease-test-not-created-yet" },
+  };
+  const midSpawn = proveLeaseReleasable(spawning);
+  assert.equal(midSpawn.removable, false, "a live runner mid-spawn must keep its lease");
+  assert.match(midSpawn.reason, /still spawning/);
+
+  // The counterweight, or the fix would just retain forever: once the runner is
+  // gone and the consumer never appeared, nothing is coming.
+  assert.equal(
+    proveLeaseReleasable({ ...spawning, runner_pid: 999999 }).removable,
+    true,
+    "a dead runner that never reached `active` releases the lease"
+  );
+
+  // And `active` is unaffected: it is written only after the process-creating
+  // call returned, so there the consumer definitely existed.
+  assert.equal(
+    proveLeaseReleasable({
+      state: "active",
+      runner_pid: liveProcess(t),
+      consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+    }).removable,
+    true,
+    "an active lease whose pane is gone is still removable while its runner lives"
+  );
+});
+
 test("a lease with a live consumer is never removable", () => {
   const live = { state: "active", consumer: { kind: "headless", pid: process.pid, pgid: process.pid } };
   const verdict = proveLeaseReleasable(live);
@@ -290,6 +327,101 @@ test("a state this version does not understand blocks", () => {
     assert.match(verdict.reason, /not one this version understands/);
   }
   assert.equal(proveLeaseReleasable(null).removable, false);
+});
+
+test("a symlinked managed ROOT is refused, not just a symlinked leaf", () => {
+  // FOUND IN REVIEW, and the same defect as the symlinked session directory
+  // fixed previously -- one level up. assertNoSymlinkComponents() walks DOWNWARD
+  // from the session or lease directory, so neither root was ever inspected;
+  // `path.resolve` does not resolve links and the parent comparison is a string
+  // test. Planting `~/.dualog/runtime` as a link was accepted and writes landed
+  // in the link target.
+  const script = `
+    const os = require("node:os"), fs = require("node:fs"), path = require("node:path");
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-rootlink-"));
+    const victim = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-victim-"));
+    process.env.HOME = home; process.env.USERPROFILE = home;
+    process.env.HOMEDRIVE = ""; process.env.HOMEPATH = home;
+    import(${JSON.stringify(new URL("../src/platform.mjs", import.meta.url).href)}).then((m) => {
+      const out = [];
+      // Both roots, and both SHAPES: the root itself linked, and an ANCESTOR of
+      // it linked with a real directory inside. The second is what the component
+      // walk is for -- checking only the root would pass a real runtime
+      // directory sitting inside a symlinked .dualog one.
+      for (const [label, rootRel, leafName, linkAt] of [
+        ["runtime", path.join(".dualog", "runtime"), "a".repeat(32), path.join(".dualog", "runtime")],
+        ["sessions", path.join(".dualog", "sessions"), "dialog-x-0000", path.join(".dualog", "sessions")],
+        ["runtime-via-ancestor", path.join(".dualog", "runtime"), "a".repeat(32), ".dualog"],
+        ["sessions-via-ancestor", path.join(".dualog", "sessions"), "dialog-x-0000", ".dualog"],
+      ]) {
+        // Each case starts from a clean ~/.dualog: an earlier case leaves it
+        // behind as a real directory, and the ancestor cases need to put a link
+        // exactly where that directory is.
+        const dualog = path.join(home, ".dualog");
+        if (fs.existsSync(dualog) || fs.lstatSync(dualog, { throwIfNoEntry: false })) {
+          const st = fs.lstatSync(dualog, { throwIfNoEntry: false });
+          if (st && st.isSymbolicLink()) fs.unlinkSync(dualog);
+          else if (st) fs.rmSync(dualog, { recursive: true, force: true });
+        }
+        const root = path.join(home, rootRel);
+        const link = path.join(home, linkAt);
+        fs.mkdirSync(path.dirname(link), { recursive: true });
+        fs.symlinkSync(victim, link);
+        fs.mkdirSync(root, { recursive: true });
+        const container = path.join(root, leafName);
+        fs.mkdirSync(container, { recursive: true });
+        const assertFn = label.startsWith("runtime")
+          ? m.assertManagedLeasePath
+          : m.assertManagedSessionPath;
+        try {
+          assertFn(container, path.join(container, "codex-home"));
+          out.push({ label, refused: false });
+        } catch (err) {
+          out.push({ label, refused: true, message: err.message.split("\\n")[0] });
+        }
+        // unlink, NOT rm: the link must go, its target must not.
+        fs.unlinkSync(link);
+        for (const leftover of fs.readdirSync(victim)) {
+          fs.rmSync(path.join(victim, leftover), { recursive: true, force: true });
+        }
+      }
+      // The whole point -- the victim must still be there, and empty of ours
+      // only if the assertion refused before anything was created.
+      out.push({ victimSurvives: fs.existsSync(victim) });
+      console.log(JSON.stringify(out));
+    });
+  `;
+  const stdout = execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" });
+  const results = JSON.parse(stdout.trim());
+  const roots = results.filter((r) => r.label);
+  assert.equal(roots.length, 4, "both roots, linked directly and via an ancestor");
+  for (const r of roots) {
+    assert.equal(r.refused, true, `a symlinked ${r.label} root must be refused`);
+    assert.match(r.message, /symbolic link/, r.label);
+  }
+  assert.equal(results.at(-1).victimSurvives, true, "the link target is never touched");
+});
+
+test("boot identity reports unavailable rather than throwing", () => {
+  // FOUND IN REVIEW, on a restricted host: os.uptime() raises
+  // `uv_uptime returned EPERM` rather than returning something unusable, and it
+  // propagated out of allocateLease() -- so no lease-backed adapter could start
+  // there at all. An unavailable identity only costs the self-healing of
+  // identity-less spawning leases, which is a retention, not a failure.
+  const script = `
+    const os = require("node:os");
+    os.uptime = () => { throw new Error("uv_uptime returned EPERM"); };
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const identity = m.bootIdentity();
+      // And a lease must still allocate, with the identity recorded as absent.
+      const verdict = m.proveLeaseReleasable({ state: "spawning", consumer: null, boot: identity });
+      console.log(JSON.stringify({ identity, removable: verdict.removable, reason: verdict.reason }));
+    });
+  `;
+  const out = JSON.parse(execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim());
+  assert.equal(out.identity, null, "an unobtainable boot identity is null, not an exception");
+  assert.equal(out.removable, false, "and without one, conservative retention still applies");
+  assert.match(out.reason, /no usable boot identity/);
 });
 
 // --- removal -------------------------------------------------------------------
@@ -460,6 +592,27 @@ test("a partner's credentials land in the lease and never in the session archive
     '{"token":"a-token-no-process-carries"}',
     "the partner still gets the credentials it needs"
   );
+
+  // The copy's mode is PINNED, not inherited. copyFileSync reproduces the
+  // source's permissions, so a user whose real auth.json is world-readable was
+  // getting a world-readable copy -- it landed at 0600 in the live run only
+  // because that particular source happened to be 0600.
+  if (process.platform !== "win32") {
+    fs.chmodSync(path.join(seedHome, "auth.json"), 0o644);
+    const second = newLease();
+    buildInvocationFromAdapter(getAdapter("codex"), {
+      projectPath: "/fixture/project",
+      sessionDir: SESSION_DIR,
+      scratchDir: second.dir,
+      sessionName: "dlg-lease-probe-2",
+      initialPrompt: "hi",
+    });
+    assert.equal(
+      fs.statSync(path.join(second.dir, "codex-home", "auth.json")).mode & 0o777,
+      0o600,
+      "a world-readable source must not produce a world-readable credential copy"
+    );
+  }
 
   // And the archive holds none of it.
   assert.equal(fs.existsSync(path.join(SESSION_DIR, "codex-home")), false);

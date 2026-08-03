@@ -312,6 +312,38 @@ test("a settings map may not carry a location-named variable", () => {
   }
 });
 
+test("known location variables are refused even when their suffix reads as a toggle", () => {
+  // FOUND IN REVIEW. `_CONFIG` was excluded outright so that
+  // OPENCODE_DISABLE_PROJECT_CONFIG (a boolean) would validate -- which let
+  // KUBECONFIG and DOCKER_CONFIG through, both of which name directories a
+  // partner resolves relative to its own working directory when given a bare
+  // value. The ambiguous suffixes now default to "location" and the real
+  // toggles are named explicitly.
+  for (const key of ["KUBECONFIG", "DOCKER_CONFIG", "GIT_DIR", "GNUPGHOME", "CARGO_HOME", "AWS_CONFIG_FILE"]) {
+    assert.throws(
+      () => parseManifest(baseManifest({ env: { [key]: "pwned-config" } }), "/f.json"),
+      /names a filesystem location/,
+      `${key} must be refused in a settings map`
+    );
+  }
+
+  // The suffix rule has to stand on its own, not lean on the explicit list: an
+  // adapter for a CLI nobody here has run will use names nobody has listed.
+  for (const key of ["MYCLI_DATA", "MYCLI_CACHE", "MYCLI_CONFIG", "MYCLI_FILE"]) {
+    assert.throws(
+      () => parseManifest(baseManifest({ env: { [key]: "pwned-config" } }), "/f.json"),
+      /names a filesystem location/,
+      `${key} must be caught by the suffix rule, with no list entry to rely on`
+    );
+  }
+
+  // The counterweight: the real toggle that forced the original exclusion must
+  // still validate, or the rule is unshippable.
+  assert.doesNotThrow(() =>
+    parseManifest(baseManifest({ env: { OPENCODE_DISABLE_PROJECT_CONFIG: "1" } }), "/f.json")
+  );
+});
+
 test("a settings map may not carry a location-shaped value", () => {
   for (const value of ["{{sessionDir}}/data", "/etc", "~/x", "./rel", "../up"]) {
     assert.throws(

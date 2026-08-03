@@ -45,10 +45,72 @@ const Template = z.string();
  * a trailing `_CONFIG` names a feature far more often than a directory.
  */
 const PATH_VARIABLE_NAME =
-  /^XDG_|_(HOME|DIR|DIRS|PATH|ROOT)$|^(HOME|PATH|TMPDIR|TMP|TEMP|USERPROFILE|APPDATA|LOCALAPPDATA)$/;
+  /^XDG_|_(HOME|DIR|DIRS|PATH|ROOT|CONFIG|CACHE|DATA|FILE)$|^(HOME|PATH|TMPDIR|TMP|TEMP|USERPROFILE|APPDATA|LOCALAPPDATA)$/;
 
+/**
+ * Names that ARE locations despite matching a suffix this list treats as a
+ * feature toggle, and names that are toggles despite ending in one.
+ *
+ * `_CONFIG` and `_DATA` are genuinely ambiguous: `KUBECONFIG` and
+ * `DOCKER_CONFIG` name directories, while `OPENCODE_DISABLE_PROJECT_CONFIG` is
+ * a boolean. Suffix matching cannot separate those, so the ambiguous suffixes
+ * are treated as locations by default and the real toggles are named here.
+ * Erring toward "location" is the safe direction: the cost is a manifest author
+ * getting a clear message telling them to use `dirs`, versus a partner CLI
+ * resolving a relative path against the user's project.
+ */
+const SETTING_NAME_EXCEPTIONS = new Set([
+  "OPENCODE_DISABLE_PROJECT_CONFIG",
+]);
+
+/**
+ * Names known to be locations that the pattern above would otherwise miss.
+ * Append-only; each entry is a variable some CLI reads as a filesystem path.
+ */
+const KNOWN_PATH_VARIABLES = new Set([
+  "KUBECONFIG",
+  "DOCKER_CONFIG",
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_CONFIG",
+  "GIT_CONFIG_GLOBAL",
+  "GNUPGHOME",
+  "SSH_AUTH_SOCK",
+  "NPM_CONFIG_PREFIX",
+  "NODE_PATH",
+  "PYTHONPATH",
+  "CARGO_HOME",
+  "RUSTUP_HOME",
+  "GOPATH",
+  "GOMODCACHE",
+  "AWS_CONFIG_FILE",
+  "AWS_SHARED_CREDENTIALS_FILE",
+  "CLOUDSDK_CONFIG",
+  "NETRC",
+]);
+
+/**
+ * Is this variable name one a CLI reads as a filesystem location?
+ *
+ * WHAT THIS IS AND IS NOT. It is a backstop that catches the accidental case
+ * loudly, at load, with a message naming the entry. It is NOT a complete
+ * enumeration and cannot become one -- an adapter for a CLI nobody here has run
+ * may read any name it likes as a directory, and no list written in advance
+ * covers that.
+ *
+ * The actual guarantee is `dirs`: a path declared there is proven inside the
+ * turn's lease before anything is created at it, whatever it is called. A
+ * manifest that puts a location in a settings map under an unrecognised name
+ * with a bare relative value still slips through -- so the residual is that
+ * such a value is resolved by the partner against its own working directory.
+ * A manifest already chooses which BINARY runs, so this is not the weakest link
+ * in that threat model, but it is stated rather than papered over.
+ */
 export function isPathVariableName(name) {
-  return PATH_VARIABLE_NAME.test(String(name));
+  const key = String(name);
+  if (SETTING_NAME_EXCEPTIONS.has(key)) return false;
+  if (KNOWN_PATH_VARIABLES.has(key)) return true;
+  return PATH_VARIABLE_NAME.test(key);
 }
 
 /**

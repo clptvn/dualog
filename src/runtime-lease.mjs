@@ -46,6 +46,7 @@ import path from "path";
 
 import {
   assertManagedLeasePath,
+  assertManagedRootPath,
   isValidLeaseId,
   leaseDir,
   runtimeDir,
@@ -85,9 +86,20 @@ export const LEASE_STATES = [
 const BOOT_TOLERANCE_SECONDS = 120;
 
 export function bootIdentity() {
-  const uptime = os.uptime();
-  if (!Number.isFinite(uptime) || uptime < 0) return null;
-  return { host: os.hostname(), bootedAtEpoch: Math.round(Date.now() / 1000 - uptime) };
+  // Both calls can THROW, not merely return something unusable: a restricted
+  // host raises `uv_uptime returned EPERM` from os.uptime(), which propagated
+  // out of allocateLease() and made every lease-backed adapter unstartable
+  // there. This function is documented to answer "cannot be established" with
+  // null, and it has to actually do that -- an unavailable boot identity only
+  // costs the self-healing of identity-less spawning leases, which is a
+  // retention, not a failure.
+  try {
+    const uptime = os.uptime();
+    if (!Number.isFinite(uptime) || uptime < 0) return null;
+    return { host: os.hostname(), bootedAtEpoch: Math.round(Date.now() / 1000 - uptime) };
+  } catch {
+    return null;
+  }
 }
 
 /** Same machine, same boot? `null` when either side cannot be established. */
@@ -165,7 +177,11 @@ export function allocateLease({ sessionId, turnId, agent, engine, turnDir, runne
     throw new Error("allocateLease: turnDir is required");
   }
 
+  // BEFORE the mkdir: `recursive: true` would happily create through a
+  // symlinked `~/.dualog`, and every later per-path assertion measures against
+  // a root it has already been redirected by.
   const root = runtimeDir();
+  assertManagedRootPath(root, { fn: "allocateLease", label: "runtime root" });
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   // mkdir's mode is masked by the umask, so an existing or freshly created root
   // can still be group/world readable. Say it explicitly.
@@ -285,8 +301,37 @@ export function proveLeaseReleasable(meta, { now = Date.now() } = {}) {
   if (consumer && typeof consumer === "object") {
     const verdict = probeConsumer(consumer);
     if (verdict === "alive") return keep("the lease's consumer is still running");
-    if (verdict === "absent") return { removable: true, reason: null };
-    return keep(`the lease's consumer could not be probed (${verdict})`);
+    if (verdict !== "absent") {
+      return keep(`the lease's consumer could not be probed (${verdict})`);
+    }
+
+    // ABSENT MEANS DIFFERENT THINGS IN THE TWO STATES.
+    //
+    // In `active` it is proof the consumer finished: that state is written only
+    // after the process-creating call RETURNED, so the pane or process
+    // definitely existed and is now gone.
+    //
+    // In `spawning` it is ambiguous, and reading it as proof was a real defect.
+    // The tmux identity is deliberately recorded BEFORE startTmuxSession() --
+    // that is what removes the identity-less crash window -- so between those
+    // two statements the session name is legitimately absent because the pane
+    // has not been created YET. A sweep landing in that window found "consumer
+    // absent", deleted the lease with its freshly seeded credentials, and left
+    // the partner launching against a home that no longer existed.
+    //
+    // So a spawning lease additionally requires its OWNER to be gone. A live
+    // runner mid-spawn keeps it; a dead runner that never reached `active` means
+    // nothing is coming.
+    if (state === "spawning") {
+      const owner = probeOwner(meta);
+      if (owner === "alive") {
+        return keep("the owning runner is still spawning this lease's consumer");
+      }
+      if (owner !== "absent") {
+        return keep(`a spawn may be in progress and the owning runner could not be probed (${owner})`);
+      }
+    }
+    return { removable: true, reason: null };
   }
 
   // `spawning` with no identity: the unavoidable crash window. A spawn may have
@@ -314,6 +359,29 @@ function probeOwner(meta) {
   return verdict;
 }
 
+/**
+ * Is this lease's consumer still running?
+ *
+ * KNOWN LIMITATION, stated rather than implied. The process group is the widest
+ * boundary reachable without a supervisor, and it is not the same thing as "no
+ * descendant survives":
+ *
+ *   - a child that calls setsid() leaves the group and becomes invisible here;
+ *   - on Windows there is no group at all. The headless engine spawns with
+ *     `detached: false` there, so the direct pid is the only handle that exists,
+ *     and a launcher which forks and exits reads as absent.
+ *
+ * In both cases a descendant could still hold the isolated home when the lease
+ * is released. This is not a regression introduced by leases -- the pre-existing
+ * headless orphan reaping has the identical boundary -- and closing it properly
+ * needs a Job Object on Windows and a supervisor process on Unix, which is an
+ * architectural change rather than a check. Recorded here so the next person
+ * reads this as a known edge rather than as an oversight.
+ *
+ * The blast radius is bounded by what a released lease actually is: a partner
+ * CLI whose config home vanishes fails its own turn. It does not affect the
+ * user's real credentials, which are never moved, only copied from.
+ */
 function probeConsumer(consumer) {
   if (consumer.kind === "tmux") {
     if (typeof consumer.session_name !== "string" || !consumer.session_name) return "unknown";
@@ -421,6 +489,15 @@ export function readTurnLease(turnDir) {
 export function sweepLeases({ apply = false } = {}) {
   const root = runtimeDir();
   const receipt = { root, removed: [], retained: [], errors: [] };
+
+  // This function DELETES directory trees, so it must prove the root it is
+  // enumerating is the one we own and not a link pointing at someone's data.
+  try {
+    assertManagedRootPath(root, { fn: "sweepLeases", label: "runtime root" });
+  } catch (err) {
+    receipt.errors.push({ path: root, error: err.message });
+    return receipt;
+  }
 
   let entries;
   try {

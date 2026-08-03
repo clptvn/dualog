@@ -233,6 +233,11 @@ export function assertManagedSessionPath(sessionDir, candidate, { fn = "assertMa
     );
   }
 
+  // The root the session was matched against must itself be real, or the
+  // "direct child of a root we chose" proof above is a statement about strings
+  // rather than about where writes land.
+  assertManagedRoot(underCurrent ? current : legacy, fn, "sessions root");
+
   const resolvedCandidate = path.resolve(candidate);
   if (!isLexicallyInside(resolvedSession, resolvedCandidate) || resolvedCandidate === resolvedSession) {
     throw new Error(
@@ -252,6 +257,32 @@ export function assertManagedSessionPath(sessionDir, candidate, { fn = "assertMa
   assertRealDirectory(resolvedSession, fn, "session directory");
   assertNoSymlinkComponents(resolvedSession, resolvedCandidate, fn);
   return resolvedCandidate;
+}
+
+/**
+ * The MANAGED ROOT itself, and everything we own above it, must be real.
+ *
+ * assertNoSymlinkComponents() walks DOWNWARD from the session or lease
+ * directory, so nothing ever inspected `~/.dualog`, `~/.dualog/sessions` or
+ * `~/.dualog/runtime`. Planting either root as a symlink therefore passed every
+ * check -- the lexical parent comparison is a string test, and `path.resolve`
+ * does not resolve links -- and writes followed it. Demonstrated: with
+ * `~/.dualog/runtime` linked elsewhere, a lease path was accepted and its
+ * `codex-home` resolved inside the link target. That is the same defect as the
+ * symlinked session directory, one level up.
+ *
+ * The walk starts at the HOME DIRECTORY, not at `/`. A home behind a symlink is
+ * the user's own arrangement and common enough that rejecting it would break
+ * legitimate setups; `.dualog` and below is what dualog creates and therefore
+ * what it can insist on.
+ */
+function assertManagedRoot(root, fn, label) {
+  const resolved = path.resolve(root);
+  const home = path.resolve(homeDir());
+  if (isLexicallyInside(home, resolved)) {
+    assertNoSymlinkComponents(home, resolved, `${fn} (${label})`);
+  }
+  assertRealDirectory(resolved, fn, label);
 }
 
 /**
@@ -319,6 +350,8 @@ export function assertManagedLeasePath(leasePath, candidate, { fn = "assertManag
     );
   }
 
+  assertManagedRoot(root, fn, "runtime root");
+
   const resolvedCandidate = path.resolve(candidate);
   if (!isLexicallyInside(resolvedLease, resolvedCandidate) || resolvedCandidate === resolvedLease) {
     throw new Error(
@@ -340,6 +373,19 @@ export function assertManagedLeasePath(leasePath, candidate, { fn = "assertManag
  * destination in a single step. Manifests are user-supplyable, so this is an
  * input boundary rather than a typo check.
  */
+/**
+ * Prove a managed root is safe to create in or delete from.
+ *
+ * Exported for the two callers that touch a root DIRECTLY rather than through a
+ * contained path: lease allocation (which mkdirs the root) and the lease sweep
+ * (which enumerates and removes beneath it). Both would otherwise follow a
+ * symlinked root before any per-path assertion could run.
+ */
+export function assertManagedRootPath(root, { fn = "assertManagedRootPath", label = "managed root" } = {}) {
+  assertManagedRoot(root, fn, label);
+  return path.resolve(root);
+}
+
 export function assertSeedFileName(name, { fn = "assertSeedFileName" } = {}) {
   if (typeof name !== "string" || !name) {
     throw new Error(`${fn}: seed name must be a non-empty string, received ${typeof name}.`);

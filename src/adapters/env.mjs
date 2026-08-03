@@ -328,7 +328,19 @@ export function applyMcpSuppression(adapter, ctx) {
 
 function copyIfExists(sourcePath, targetPath) {
   try {
-    if (fs.existsSync(sourcePath)) fs.copyFileSync(sourcePath, targetPath);
+    if (!fs.existsSync(sourcePath)) return;
+    fs.copyFileSync(sourcePath, targetPath);
+    // Pin the mode rather than inherit it. copyFileSync reproduces the SOURCE's
+    // permissions, so a user whose real auth.json is 0644 got a 0644 copy --
+    // observed landing at 0600 here only because the source happened to be
+    // 0600. Every seed is config or credential material that only this turn's
+    // partner reads, so 0600 is correct for all of them and does not need the
+    // schema to say which are secret.
+    try {
+      fs.chmodSync(targetPath, 0o600);
+    } catch {
+      // A filesystem without POSIX modes; the 0700 lease still contains it.
+    }
   } catch {
     // Missing or unreadable auth is surfaced by the partner CLI itself and
     // captured from its terminal, which gives a far better message than
