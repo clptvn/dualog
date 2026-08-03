@@ -122,7 +122,22 @@ export function isPathVariableName(name) {
  * merely contains a slash. A base URL (`https://...`) is not a location; a value
  * built from {{sessionDir}} is.
  */
-const LOCATION_TEMPLATE = /\{\{(sessionDir|home|projectPath|configHome|isolatedDir)\}\}/;
+// `scratchDir` was missing here for one release and it was the WORST omission of
+// the set: it is the variable every relocation is supposed to be built from, so
+// a settings entry like `CUSTOM_STATE: "{{scratchDir}}/../../../outside"` under
+// an unrecognised name passed validation and reached the partner uncontained.
+// Introduced by adding scratchDir to the context without revisiting this list --
+// which is the argument for deriving it from the context keys rather than
+// restating them.
+const LOCATION_CONTEXT_KEYS = [
+  "scratchDir",
+  "sessionDir",
+  "home",
+  "projectPath",
+  "configHome",
+  "isolatedDir",
+];
+const LOCATION_TEMPLATE = new RegExp(`\\{\\{(${LOCATION_CONTEXT_KEYS.join("|")})\\}\\}`);
 
 export function looksLikeLocation(template) {
   const text = String(template);

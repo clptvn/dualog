@@ -557,18 +557,70 @@ test("the sweep refuses to enumerate a symlinked runtime root", () => {
   assert.match(out.errors.join(" "), /symbolic link/);
 });
 
+test("boot identity prefers what the OS tracks over wall-clock arithmetic", () => {
+  const identity = bootIdentity();
+  assert.ok(identity, "this host must be able to identify its boot");
+  assert.equal(typeof identity.host, "string");
+
+  // Both platforms this runs on expose a real boot identity -- /proc/.../boot_id
+  // on Linux, kern.boottime on macOS -- so falling back to wall-clock arithmetic
+  // here is a regression, not an environment difference.
+  if (process.platform === "linux" || process.platform === "darwin") {
+    assert.equal(identity.precise, true, `${process.platform} must yield a precise boot identity`);
+    assert.ok(
+      identity.source === "boot-id" || identity.source === "kern.boottime",
+      `unexpected boot identity source: ${identity.source}`
+    );
+  }
+
+  if (identity.precise) {
+    // Exact, so two identities compare by value and an NTP correction cannot
+    // make one boot look like two.
+    assert.ok(identity.id, "a precise identity must carry an id");
+    assert.equal(isSameBoot({ ...identity }), true);
+    assert.equal(isSameBoot({ ...identity, id: `${identity.id}-different` }), false);
+  }
+
+  // Whatever the source, the wall-clock epoch is carried too -- a lease recorded
+  // before precise identities existed has only that field, and without a
+  // counterpart to compare against it would answer `null` forever and never heal.
+  assert.ok(Number.isFinite(identity.bootedAtEpoch));
+  assert.equal(
+    isSameBoot({ host: identity.host, bootedAtEpoch: identity.bootedAtEpoch }),
+    true,
+    "a legacy record from this boot must still resolve as this boot"
+  );
+
+  // AND the tolerance has to absorb a clock correction. At 120s it did not: a
+  // suspend or an NTP step made a live lease look like a previous boot, which is
+  // the verdict that authorizes deletion.
+  assert.equal(
+    isSameBoot({ host: identity.host, bootedAtEpoch: identity.bootedAtEpoch - 600 }),
+    true,
+    "ten minutes of clock movement is not a reboot"
+  );
+  assert.equal(
+    isSameBoot({ host: identity.host, bootedAtEpoch: 1 }),
+    false,
+    "but a genuinely ancient record is a previous boot"
+  );
+});
+
 test("boot identity reports unavailable rather than throwing", () => {
   // FOUND IN REVIEW, on a restricted host: os.uptime() raises
   // `uv_uptime returned EPERM` rather than returning something unusable, and it
   // propagated out of allocateLease() -- so no lease-backed adapter could start
   // there at all. An unavailable identity only costs the self-healing of
   // identity-less spawning leases, which is a retention, not a failure.
+  // Everything unavailable at once: uptime raises EPERM (the reviewer's host),
+  // PATH is emptied so sysctl cannot be found, and /proc does not exist here.
   const script = `
     const os = require("node:os");
     os.uptime = () => { throw new Error("uv_uptime returned EPERM"); };
+    process.env.PATH = "";
     import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
       const identity = m.bootIdentity();
-      // And a lease must still allocate, with the identity recorded as absent.
+      // And a lease must still be judgeable, with the identity recorded absent.
       const verdict = m.proveLeaseReleasable({ state: "spawning", consumer: null, boot: identity });
       console.log(JSON.stringify({ identity, removable: verdict.removable, reason: verdict.reason }));
     });
@@ -826,8 +878,18 @@ test("every exit from a partner turn releases its lease, and only on proof", () 
   );
   assert.equal(
     releases.length,
-    3,
-    "a rejected turn, a completed turn, and a failed turn each release the lease"
+    4,
+    "a rejected turn, a completed turn, a failed turn, and a failed SETUP each release"
+  );
+
+  // The fourth is the setup envelope. Credentials are projected before the
+  // turn's own try/catch, so a rendering or config-write error escaped both
+  // release paths -- and since the runner survives a failed turn, that
+  // projection then sat on disk until the whole session ended.
+  assert.match(
+    src,
+    /\} catch \(setupErr\) \{\s*\n\s*releaseLeaseQuietly\(lease, log\);\s*\n\s*throw setupErr;/,
+    "the pre-pane setup must release before rethrowing"
   );
 
   // EXACTLY ONE site may assert absence rather than prove it: the rejected turn,
@@ -843,8 +905,8 @@ test("every exit from a partner turn releases its lease, and only on proof", () 
   assert.match(src, /releaseLeaseQuietly\(lease, log, \{ consumerAbsent: true \}\)/);
   assert.equal(
     (src.match(/releaseLeaseQuietly\(lease, log\);/g) || []).length,
-    2,
-    "the completed and failed paths must both prove rather than assert"
+    3,
+    "the completed, failed and setup paths must all prove rather than assert"
   );
 
   // And the completed path waits for the pane's PROCESS before reclaiming.

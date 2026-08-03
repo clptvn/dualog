@@ -39,6 +39,7 @@
 // would lie -- and the accounting is what a person reads when deciding whether
 // this machine is clean.
 
+import { execFileSync } from "child_process";
 import crypto from "crypto";
 import fs from "fs";
 import os from "os";
@@ -69,45 +70,111 @@ export const LEASE_STATES = [
 ];
 
 /**
- * Identify this boot, so a conservatively-retained lease can eventually heal.
+ * WHY A BOOT IDENTITY EXISTS AT ALL.
  *
  * The `spawning` window is unavoidable: there is no portable proof that a
  * spawn() did not happen, so a lease that dies there must be retained. Without
  * an escape hatch that retention is PERMANENT, and "a crash cannot make a
- * credential projection permanent" would be false.
- *
- * A boot identity closes it. No tmux pane and no child process from a previous
- * boot can still be running, so an identity-less `spawning` lease from an
- * earlier boot is removable. Derived from os.uptime() because that is portable;
- * compared with a tolerance because the subtraction drifts by a fraction of a
- * second between calls, and a bucketed value would differ across a bucket edge
- * within a single boot.
+ * credential projection permanent" would be false. No tmux pane and no child
+ * process survives a reboot, so identifying the boot is what turns conservative
+ * retention into something that eventually clears.
  */
-const BOOT_TOLERANCE_SECONDS = 120;
 
+/**
+ * How far two UPTIME-DERIVED boot epochs may differ and still be one boot.
+ *
+ * Wide on purpose. `Date.now() - os.uptime()` is arithmetic over the wall clock,
+ * so an NTP correction or a suspend/resume moves it -- and the unsafe direction
+ * is concluding "different boot", which authorizes deletion. A minute of slop
+ * was not enough margin for that. Being too generous only costs self-healing
+ * speed; being too strict deletes a live turn's credentials.
+ */
+const IMPRECISE_BOOT_TOLERANCE_SECONDS = 3600;
+
+let cachedBootIdentity;
+
+/**
+ * Identify this boot, preferring something the OS actually tracks.
+ *
+ * Cached because it cannot change within a process, and a sweep would otherwise
+ * spawn a sysctl per lease.
+ */
 export function bootIdentity() {
-  // Both calls can THROW, not merely return something unusable: a restricted
-  // host raises `uv_uptime returned EPERM` from os.uptime(), which propagated
-  // out of allocateLease() and made every lease-backed adapter unstartable
-  // there. This function is documented to answer "cannot be established" with
-  // null, and it has to actually do that -- an unavailable boot identity only
-  // costs the self-healing of identity-less spawning leases, which is a
-  // retention, not a failure.
+  if (cachedBootIdentity !== undefined) return cachedBootIdentity;
+  cachedBootIdentity = computeBootIdentity();
+  return cachedBootIdentity;
+}
+
+function computeBootIdentity() {
+  let host;
   try {
-    const uptime = os.uptime();
-    if (!Number.isFinite(uptime) || uptime < 0) return null;
-    return { host: os.hostname(), bootedAtEpoch: Math.round(Date.now() / 1000 - uptime) };
+    host = os.hostname();
   } catch {
     return null;
   }
+
+  // Carried by EVERY form, precise or not. A lease recorded before precise
+  // identities existed has only this field, and without a counterpart on the
+  // current identity there would be nothing to compare it against -- so those
+  // records would answer `null` forever and never heal.
+  let bootedAtEpoch = null;
+  try {
+    const uptime = os.uptime();
+    if (Number.isFinite(uptime) && uptime >= 0) {
+      bootedAtEpoch = Math.round(Date.now() / 1000 - uptime);
+    }
+  } catch {}
+
+  // Linux: a real per-boot UUID, exact by construction.
+  try {
+    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf-8").trim();
+    if (bootId) return { host, id: bootId, bootedAtEpoch, source: "boot-id", precise: true };
+  } catch {}
+
+  // macOS/BSD: the kernel's own boot timestamp, to the microsecond.
+  try {
+    const out = execFileSync("sysctl", ["-n", "kern.boottime"], {
+      encoding: "utf-8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const sec = /sec\s*=\s*(\d+)/.exec(out);
+    if (sec) {
+      return { host, id: `kern.boottime:${sec[1]}`, bootedAtEpoch, source: "kern.boottime", precise: true };
+    }
+  } catch {}
+
+  // Fallback: derived from the wall clock, so NOT precise. Both calls can THROW
+  // rather than return something unusable -- a restricted host raises
+  // `uv_uptime returned EPERM` from os.uptime(), which propagated out of
+  // allocateLease() and made every lease-backed adapter unstartable there.
+  if (bootedAtEpoch == null) return null;
+  return { host, bootedAtEpoch, source: "uptime", precise: false };
 }
 
-/** Same machine, same boot? `null` when either side cannot be established. */
+/**
+ * Same machine, same boot? `null` when it cannot be established.
+ *
+ * `false` is the answer that authorizes deletion, so every uncertain case has to
+ * resolve to `true` or `null` instead. Two identities compare exactly only when
+ * BOTH came from something the OS tracks; a wall-clock-derived one on either
+ * side falls back to a wide tolerance, because the difference between "rebooted"
+ * and "the clock was corrected" is not visible in that number.
+ */
 export function isSameBoot(recorded, current = bootIdentity()) {
   if (!recorded || !current) return null;
   if (recorded.host !== current.host) return false;
-  if (!Number.isFinite(recorded.bootedAtEpoch)) return null;
-  return Math.abs(recorded.bootedAtEpoch - current.bootedAtEpoch) <= BOOT_TOLERANCE_SECONDS;
+
+  if (recorded.precise === true && current.precise === true) {
+    return recorded.id === current.id;
+  }
+
+  // Records written before this carried no `source`, so an absent one is the
+  // imprecise form rather than an unknown one.
+  const recordedEpoch = recorded.bootedAtEpoch;
+  const currentEpoch = current.bootedAtEpoch;
+  if (!Number.isFinite(recordedEpoch) || !Number.isFinite(currentEpoch)) return null;
+  return Math.abs(recordedEpoch - currentEpoch) <= IMPRECISE_BOOT_TOLERANCE_SECONDS;
 }
 
 function writeJsonExclusive(file, value) {

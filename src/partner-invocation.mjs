@@ -296,288 +296,304 @@ export async function runPartnerCommand({
     ).trim();
   }
 
-  const sessionName = buildTmuxSessionName(
-    path.basename(sessionDir),
-    turnId
-  );
-  const bootstrap = buildBootstrapPrompt({
-    partnerDisplay,
-    promptPath,
-    resultPath,
-    donePath,
-    projectPath,
-    responseInstruction,
-  });
-  // Whether the bootstrap goes in argv or gets pasted into the TUI is the
-  // adapter's call, not a hardcoded per-agent branch: pass it either way and
-  // let promptDelivery decide.
-  const adapter = getAdapter(normalizedAgent);
-  // The same catalog the start-tool preflight validated against. Without it this
-  // check falls back to the manifest, and a live catalog that has widened a
-  // model's effort set would let a session start and then have its every turn
-  // refused here -- the two disagreeing about the same pair.
-  const discoveredModels = await resolveDiscoveryForValidation(adapter, {
-    model,
-    projectPath,
-    log,
-  });
-  // `projecting` is recorded BEFORE this call, not after it: building the
-  // invocation is what copies the credentials in, so a crash midway through
-  // must leave a lease that says secrets MAY be present rather than one that
-  // says none can be.
-  if (lease) transitionLease(lease, "projecting");
-  const { command, args, env, usesInitialPrompt, notices } =
-    buildInvocationFromAdapter(adapter, {
-      partnerCommand,
-      projectPath,
-      sessionDir,
-      scratchDir: lease?.dir ?? null,
-      sessionName,
-      model,
-      reasoningEffort,
-      toolProfile: normalizedToolProfile,
-      initialPrompt: bootstrap,
-      discoveredModels,
-      applyOperatorDefault: true,
-      allowUnknownModel,
-    });
-
-  // A dropped or adjusted option must be reported. If the host asked for an
-  // effort level this partner cannot honor, it needs to know that before it
-  // reasons about the reply as though the setting had applied.
-  for (const notice of notices) {
-    log(`Adapter "${adapter.id}": ${notice.message}`);
-  }
-
-  // Logging alone was not enough. The runner's log is not visible to the host,
-  // so an error-severity finding -- an effort this MODEL rejects, say -- would
-  // drop the flag, start the turn anyway, and leave the session reporting a
-  // setting that was never applied. Refuse instead: the same check runs in
-  // preflightPartner() before a session exists, so reaching here means the
-  // options changed underneath us or a caller bypassed the start tools.
-  const blocking = notices.filter((notice) => notice.severity === "error");
-  if (blocking.length) {
-    // A turn rejected here has projected credentials but will never spawn, so
-    // the lease is removable immediately and on the strongest possible grounds:
-    // the API invariant says no process-creating call has been made.
-    releaseLeaseQuietly(lease, log, { consumerAbsent: true });
-    throw new Error(
-      `Adapter "${adapter.id}" cannot run this turn as requested: ` +
-        blocking.map((notice) => notice.message).join("; ")
-    );
-  }
-  if (lease) transitionLease(lease, "ready");
-
-  const timeoutHint =
-    typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
-      ? timeoutMs
-      : null;
-  const terminalBaseState = {
-    runtime: "tmux-interactive",
-    agent: normalizedAgent,
-    display_name: partnerDisplay,
-    session_name: sessionName,
-    pane_target: `${sessionName}:0.0`,
-    cwd: projectPath,
-    command,
-    args,
-    turn_dir: turnDir,
-    prompt_path: promptPath,
-    result_path: resultPath,
-    done_path: donePath,
-    timeout_hint_ms: timeoutHint,
-    tool_profile: normalizedToolProfile,
-    model: model || null,
-    reasoning_effort: reasoningEffort || null,
-    status: "starting",
-    started_at: new Date().toISOString(),
-  };
-
-  let handle = null;
-  let state = writeTerminalState(sessionDir, terminalBaseState, { active: true });
-
+  // EVERY path from here releases the lease, including the ones that fail before
+  // a pane exists.
+  //
+  // Credentials are projected by buildInvocationFromAdapter() below, which is
+  // OUTSIDE the turn's own try/catch -- so a rendering error, an unwritable MCP
+  // config or a malformed seeded settings file escaped both release paths. The
+  // runner survives a failed turn, so that projection then sat on disk until the
+  // whole session ended, which is the lifetime this design exists to bound.
+  //
+  // The inner catch already releases once a pane exists; reaching this one after
+  // that is a no-op, because releaseLease() finds the directory gone.
   try {
-    log(
-      `Invoking ${partnerDisplay} interactively via tmux session "${sessionName}" (prompt: ${prompt.length} chars, tool profile: ${normalizedToolProfile}, timeout hint: ${timeoutHint ? `${timeoutHint / 1000}s` : "none"})`
+    const sessionName = buildTmuxSessionName(
+      path.basename(sessionDir),
+      turnId
     );
-
-    // Recorded BEFORE the pane can exist. tmux session names are deterministic
-    // and chosen by us, so the identity is already known here -- which closes
-    // the identity-less `spawning` window entirely for this engine. A crash
-    // between this line and the next still leaves a lease that names exactly
-    // what to probe.
-    if (lease) {
-      transitionLease(lease, "spawning", {
-        consumer: { kind: "tmux", session_name: sessionName },
+    const bootstrap = buildBootstrapPrompt({
+      partnerDisplay,
+      promptPath,
+      resultPath,
+      donePath,
+      projectPath,
+      responseInstruction,
+    });
+    // Whether the bootstrap goes in argv or gets pasted into the TUI is the
+    // adapter's call, not a hardcoded per-agent branch: pass it either way and
+    // let promptDelivery decide.
+    const adapter = getAdapter(normalizedAgent);
+    // The same catalog the start-tool preflight validated against. Without it this
+    // check falls back to the manifest, and a live catalog that has widened a
+    // model's effort set would let a session start and then have its every turn
+    // refused here -- the two disagreeing about the same pair.
+    const discoveredModels = await resolveDiscoveryForValidation(adapter, {
+      model,
+      projectPath,
+      log,
+    });
+    // `projecting` is recorded BEFORE this call, not after it: building the
+    // invocation is what copies the credentials in, so a crash midway through
+    // must leave a lease that says secrets MAY be present rather than one that
+    // says none can be.
+    if (lease) transitionLease(lease, "projecting");
+    const { command, args, env, usesInitialPrompt, notices } =
+      buildInvocationFromAdapter(adapter, {
+        partnerCommand,
+        projectPath,
+        sessionDir,
+        scratchDir: lease?.dir ?? null,
+        sessionName,
+        model,
+        reasoningEffort,
+        toolProfile: normalizedToolProfile,
+        initialPrompt: bootstrap,
+        discoveredModels,
+        applyOperatorDefault: true,
+        allowUnknownModel,
       });
+
+    // A dropped or adjusted option must be reported. If the host asked for an
+    // effort level this partner cannot honor, it needs to know that before it
+    // reasons about the reply as though the setting had applied.
+    for (const notice of notices) {
+      log(`Adapter "${adapter.id}": ${notice.message}`);
     }
-    handle = await startTmuxSession({
-      sessionName,
+
+    // Logging alone was not enough. The runner's log is not visible to the host,
+    // so an error-severity finding -- an effort this MODEL rejects, say -- would
+    // drop the flag, start the turn anyway, and leave the session reporting a
+    // setting that was never applied. Refuse instead: the same check runs in
+    // preflightPartner() before a session exists, so reaching here means the
+    // options changed underneath us or a caller bypassed the start tools.
+    const blocking = notices.filter((notice) => notice.severity === "error");
+    if (blocking.length) {
+      // A turn rejected here has projected credentials but will never spawn, so
+      // the lease is removable immediately and on the strongest possible grounds:
+      // the API invariant says no process-creating call has been made.
+      releaseLeaseQuietly(lease, log, { consumerAbsent: true });
+      throw new Error(
+        `Adapter "${adapter.id}" cannot run this turn as requested: ` +
+          blocking.map((notice) => notice.message).join("; ")
+      );
+    }
+    if (lease) transitionLease(lease, "ready");
+
+    const timeoutHint =
+      typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
+        ? timeoutMs
+        : null;
+    const terminalBaseState = {
+      runtime: "tmux-interactive",
+      agent: normalizedAgent,
+      display_name: partnerDisplay,
+      session_name: sessionName,
+      pane_target: `${sessionName}:0.0`,
       cwd: projectPath,
       command,
       args,
-      env,
-    });
-    if (lease) {
-      transitionLease(lease, "active", {
-        // The pane's process as well as the pane. Releasing on the session alone
-        // demonstrably reclaimed the home while the partner was still shutting
-        // down, and it then recreated the directory to flush its cache.
-        consumer: { kind: "tmux", session_name: sessionName, pane_pid: handle.panePid ?? null },
+      turn_dir: turnDir,
+      prompt_path: promptPath,
+      result_path: resultPath,
+      done_path: donePath,
+      timeout_hint_ms: timeoutHint,
+      tool_profile: normalizedToolProfile,
+      model: model || null,
+      reasoning_effort: reasoningEffort || null,
+      status: "starting",
+      started_at: new Date().toISOString(),
+    };
+
+    let handle = null;
+    let state = writeTerminalState(sessionDir, terminalBaseState, { active: true });
+
+    try {
+      log(
+        `Invoking ${partnerDisplay} interactively via tmux session "${sessionName}" (prompt: ${prompt.length} chars, tool profile: ${normalizedToolProfile}, timeout hint: ${timeoutHint ? `${timeoutHint / 1000}s` : "none"})`
+      );
+
+      // Recorded BEFORE the pane can exist. tmux session names are deterministic
+      // and chosen by us, so the identity is already known here -- which closes
+      // the identity-less `spawning` window entirely for this engine. A crash
+      // between this line and the next still leaves a lease that names exactly
+      // what to probe.
+      if (lease) {
+        transitionLease(lease, "spawning", {
+          consumer: { kind: "tmux", session_name: sessionName },
+        });
+      }
+      handle = await startTmuxSession({
+        sessionName,
+        cwd: projectPath,
+        command,
+        args,
+        env,
       });
-    }
-    state = writeTerminalState(
-      sessionDir,
-      {
-        ...state,
-        pane_target: handle.paneTarget,
-        pane_id: handle.paneId || null,
-        status: "readying",
-      },
-      { active: true }
-    );
+      if (lease) {
+        transitionLease(lease, "active", {
+          // The pane's process as well as the pane. Releasing on the session alone
+          // demonstrably reclaimed the home while the partner was still shutting
+          // down, and it then recreated the directory to flush its cache.
+          consumer: { kind: "tmux", session_name: sessionName, pane_pid: handle.panePid ?? null },
+        });
+      }
+      state = writeTerminalState(
+        sessionDir,
+        {
+          ...state,
+          pane_target: handle.paneTarget,
+          pane_id: handle.paneId || null,
+          status: "readying",
+        },
+        { active: true }
+      );
 
-    await waitForInteractiveReady({
-      agent: normalizedAgent,
-      handle,
-      log,
-      partnerDisplay,
-      sessionDir,
-      capturePath,
-      acceptBusy: usesInitialPrompt,
-    });
-
-    state = writeTerminalState(
-      sessionDir,
-      {
-        ...state,
-        status: "running",
-      },
-      { active: true }
-    );
-
-    if (!usesInitialPrompt) {
-      await sendTextToTmux(handle, bootstrap, { enter: false });
-      await new Promise((resolve) => setTimeout(resolve, 750));
-      await sendTextToTmux(handle, "", { enter: true, submitDelayMs: 0 });
-      await waitForPromptSubmission({
+      await waitForInteractiveReady({
         agent: normalizedAgent,
         handle,
-      log,
-      partnerDisplay,
-      sessionDir,
-      capturePath,
-      resultPath,
-      donePath,
+        log,
+        partnerDisplay,
+        sessionDir,
+        capturePath,
+        acceptBusy: usesInitialPrompt,
       });
-    }
 
-    const response = await waitForSidecarCompletion({
-      partnerDisplay,
-      agent: normalizedAgent,
-      sessionDir,
-      turnDir,
-      resultPath,
-      donePath,
-      handle,
-      capturePath,
-      log,
-    });
+      state = writeTerminalState(
+        sessionDir,
+        {
+          ...state,
+          status: "running",
+        },
+        { active: true }
+      );
 
-    const finalCapture = await captureAndPersist(handle, capturePath, log);
-    const verdict = await terminateTmuxSession(handle);
-    writeTerminalState(
-      sessionDir,
-      {
-        ...state,
-        status: "complete",
-        completed_at: new Date().toISOString(),
-        last_capture_path: finalCapture?.path || null,
-      },
-      { active: false }
-    );
-    // The credentials go the moment the process holding them is PROVEN gone.
-    //
-    // "Proven gone" means the PROCESS, not the pane. Releasing on the tmux
-    // verdict alone reclaimed the home while codex was still shutting down, and
-    // it then recreated the directory to flush its models cache -- leaving an
-    // unattributable orphan on every turn. So wait briefly for the pane's
-    // process to exit, then let releaseLease() do the full proof rather than
-    // asserting absence from here.
-    //
-    // The wait is short and bounded because it is a courtesy, not a guarantee: a
-    // partner that takes longer simply keeps its lease, and the sweep reclaims
-    // it once the process can be shown gone.
-    if (lease && verdict === "absent" && handle?.panePid) {
-      await waitForProcessExit(handle.panePid, PARTNER_EXIT_GRACE_MS);
-    }
-    releaseLeaseQuietly(lease, log);
-
-    return response.trim();
-  } catch (err) {
-    const finalCapture = handle
-      ? await captureAndPersist(handle, capturePath, log)
-      : null;
-    let finalCapturePath = finalCapture?.path || null;
-    if (!finalCapturePath && fs.existsSync(capturePath)) {
-      finalCapturePath = capturePath;
-    }
-    const cancelled = isPartnerTurnCancelledError(err);
-
-    // Once a pane exists, every exit from this function must take it down.
-    //
-    // Cleanup used to run only for cancellation and PartnerTerminalFailureError,
-    // leaving any other exception's pane alive under status
-    // "error_waiting_for_end". Nothing ever attached to such a pane -- that
-    // status is written here and read nowhere -- so it was not a resume path,
-    // just a pane nobody owned. It also could not be reclaimed later:
-    // terminateCurrentPartnerTerminal() resolves exactly one handle out of
-    // current_terminal.json, and the next turn overwrites that file. A single
-    // ordinary error (a partner naming a result_path outside its turn directory
-    // trips a plain Error in readCompletion) was enough to strand a pane for the
-    // lifetime of the session.
-    if (handle) {
-      try {
-        await terminateTmuxSession(handle);
-      } catch (cleanupErr) {
-        log(`Failed to terminate ${partnerDisplay} tmux session: ${cleanupErr.message}`);
+      if (!usesInitialPrompt) {
+        await sendTextToTmux(handle, bootstrap, { enter: false });
+        await new Promise((resolve) => setTimeout(resolve, 750));
+        await sendTextToTmux(handle, "", { enter: true, submitDelayMs: 0 });
+        await waitForPromptSubmission({
+          agent: normalizedAgent,
+          handle,
+        log,
+        partnerDisplay,
+        sessionDir,
+        capturePath,
+        resultPath,
+        donePath,
+        });
       }
-    }
-    // Every exit from this function releases the lease if it can. A failed turn
-    // has exactly the same credential copy on disk as a successful one, and it
-    // is the failure paths -- not the happy path -- that left 176 of them behind.
-    releaseLeaseQuietly(lease, log);
 
-    const { last } = readTerminalState(sessionDir);
-    const alreadyTerminated =
-      last?.session_name === state.session_name && last.status === "terminated";
-    // Report what is actually true after cleanup rather than assuming it worked:
-    // a pane that survived termination is a fact the host needs.
-    // Anything short of a proven absence counts as "may still be up". Reporting
-    // a pane we could not check as cleanly gone would clear current_terminal.json
-    // and tell the host the terminal is down -- the two things that must not
-    // happen while a partner might still be holding a live session.
-    const terminalStillAlive = handle
-      ? (await probeTmuxSession(handle.sessionName).catch(() => "unknown")) !== "absent"
-      : false;
-    if (!alreadyTerminated) {
+      const response = await waitForSidecarCompletion({
+        partnerDisplay,
+        agent: normalizedAgent,
+        sessionDir,
+        turnDir,
+        resultPath,
+        donePath,
+        handle,
+        capturePath,
+        log,
+      });
+
+      const finalCapture = await captureAndPersist(handle, capturePath, log);
+      const verdict = await terminateTmuxSession(handle);
       writeTerminalState(
         sessionDir,
         {
           ...state,
-          status: cancelled
-            ? "cancelled"
-            : terminalStillAlive
-              ? "error_terminal_leaked"
-              : "failed",
-          ...(terminalStillAlive ? {} : { completed_at: new Date().toISOString() }),
-          last_capture_path: finalCapturePath,
-          ...(cancelled ? {} : { error: err.message }),
+          status: "complete",
+          completed_at: new Date().toISOString(),
+          last_capture_path: finalCapture?.path || null,
         },
-        { active: terminalStillAlive }
+        { active: false }
       );
+      // The credentials go the moment the process holding them is PROVEN gone.
+      //
+      // "Proven gone" means the PROCESS, not the pane. Releasing on the tmux
+      // verdict alone reclaimed the home while codex was still shutting down, and
+      // it then recreated the directory to flush its models cache -- leaving an
+      // unattributable orphan on every turn. So wait briefly for the pane's
+      // process to exit, then let releaseLease() do the full proof rather than
+      // asserting absence from here.
+      //
+      // The wait is short and bounded because it is a courtesy, not a guarantee: a
+      // partner that takes longer simply keeps its lease, and the sweep reclaims
+      // it once the process can be shown gone.
+      if (lease && verdict === "absent" && handle?.panePid) {
+        await waitForProcessExit(handle.panePid, PARTNER_EXIT_GRACE_MS);
+      }
+      releaseLeaseQuietly(lease, log);
+
+      return response.trim();
+    } catch (err) {
+      const finalCapture = handle
+        ? await captureAndPersist(handle, capturePath, log)
+        : null;
+      let finalCapturePath = finalCapture?.path || null;
+      if (!finalCapturePath && fs.existsSync(capturePath)) {
+        finalCapturePath = capturePath;
+      }
+      const cancelled = isPartnerTurnCancelledError(err);
+
+      // Once a pane exists, every exit from this function must take it down.
+      //
+      // Cleanup used to run only for cancellation and PartnerTerminalFailureError,
+      // leaving any other exception's pane alive under status
+      // "error_waiting_for_end". Nothing ever attached to such a pane -- that
+      // status is written here and read nowhere -- so it was not a resume path,
+      // just a pane nobody owned. It also could not be reclaimed later:
+      // terminateCurrentPartnerTerminal() resolves exactly one handle out of
+      // current_terminal.json, and the next turn overwrites that file. A single
+      // ordinary error (a partner naming a result_path outside its turn directory
+      // trips a plain Error in readCompletion) was enough to strand a pane for the
+      // lifetime of the session.
+      if (handle) {
+        try {
+          await terminateTmuxSession(handle);
+        } catch (cleanupErr) {
+          log(`Failed to terminate ${partnerDisplay} tmux session: ${cleanupErr.message}`);
+        }
+      }
+      // Every exit from this function releases the lease if it can. A failed turn
+      // has exactly the same credential copy on disk as a successful one, and it
+      // is the failure paths -- not the happy path -- that left 176 of them behind.
+      releaseLeaseQuietly(lease, log);
+
+      const { last } = readTerminalState(sessionDir);
+      const alreadyTerminated =
+        last?.session_name === state.session_name && last.status === "terminated";
+      // Report what is actually true after cleanup rather than assuming it worked:
+      // a pane that survived termination is a fact the host needs.
+      // Anything short of a proven absence counts as "may still be up". Reporting
+      // a pane we could not check as cleanly gone would clear current_terminal.json
+      // and tell the host the terminal is down -- the two things that must not
+      // happen while a partner might still be holding a live session.
+      const terminalStillAlive = handle
+        ? (await probeTmuxSession(handle.sessionName).catch(() => "unknown")) !== "absent"
+        : false;
+      if (!alreadyTerminated) {
+        writeTerminalState(
+          sessionDir,
+          {
+            ...state,
+            status: cancelled
+              ? "cancelled"
+              : terminalStillAlive
+                ? "error_terminal_leaked"
+                : "failed",
+            ...(terminalStillAlive ? {} : { completed_at: new Date().toISOString() }),
+            last_capture_path: finalCapturePath,
+            ...(cancelled ? {} : { error: err.message }),
+          },
+          { active: terminalStillAlive }
+        );
+      }
+      throw err;
     }
-    throw err;
+  } catch (setupErr) {
+    releaseLeaseQuietly(lease, log);
+    throw setupErr;
   }
 }
 

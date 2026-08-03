@@ -345,7 +345,23 @@ test("known location variables are refused even when their suffix reads as a tog
 });
 
 test("a settings map may not carry a location-shaped value", () => {
-  for (const value of ["{{sessionDir}}/data", "/etc", "~/x", "./rel", "../up"]) {
+  for (const value of [
+    // `{{scratchDir}}` was MISSING from this check for one release, and it was
+    // the worst possible omission: it is the variable every relocation is built
+    // from, so a settings entry under an unrecognised name could carry
+    // "{{scratchDir}}/../../../outside" past validation and reach the partner
+    // uncontained. Introduced by adding scratchDir to the invocation context
+    // without revisiting the location list.
+    "{{scratchDir}}/data",
+    "{{scratchDir}}/../../../outside",
+    "{{sessionDir}}/data",
+    "{{home}}/x",
+    "{{projectPath}}/x",
+    "/etc",
+    "~/x",
+    "./rel",
+    "../up",
+  ]) {
     assert.throws(
       () => parseManifest(baseManifest({ env: { FAKE_SETTING: value } }), "/f.json"),
       /describes a filesystem location/,
