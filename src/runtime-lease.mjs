@@ -237,7 +237,10 @@ export function allocateLease({ sessionId, turnId, agent, engine, turnDir, runne
     );
   }
 
-  return { id, dir, metaPath: path.join(dir, META_FILE), turnDir };
+  // `owned` marks a handle this process created, which is authority that
+  // survives the metadata becoming unreadable. Deliberately not persisted: it is
+  // a fact about this process, and a flag on disk would let any reader claim it.
+  return { id, dir, metaPath: path.join(dir, META_FILE), turnDir, owned: true };
 }
 
 /** Advance a lease's state, optionally recording its consumer's identity. */
@@ -500,8 +503,22 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
 
   const metaPath = lease.metaPath ?? path.join(dir, META_FILE);
   const record = readJson(metaPath);
-  if (record.state === "invalid") {
-    return { released: false, reason: record.reason };
+  if (record.state !== "valid") {
+    // NO METADATA, AND WE ARE THE OWNER. Observed in production: a partner CLI
+    // outlived its own tmux pane, and after the lease was removed it recreated
+    // `$CODEX_HOME` to flush a models cache -- leaving a directory with a valid
+    // lease name, mode 0755, and no metadata. releaseLease() then reported
+    // "lease metadata is unreadable" and retained it, and sweepLeases() retains
+    // an unreadable lease forever, so nothing could ever reclaim it.
+    //
+    // A handle from allocateLease() in THIS process is proof of ownership that
+    // does not depend on the metadata being readable, which is exactly the case
+    // where the metadata is not. Anything else still refuses.
+    if (lease.owned === true) {
+      removeLeaseDirectory(dir);
+      return { released: true, reason: null };
+    }
+    return { released: false, reason: record.reason ?? `lease metadata is ${record.state}` };
   }
 
   // THE OWNER RELEASING ITS OWN PRE-SPAWN LEASE IS AUTHORITATIVE.
@@ -574,7 +591,36 @@ export function readTurnLease(turnDir) {
  * unknown directory under the runtime root, malformed metadata, or a consumer
  * that cannot be probed are all left in place and named in the receipt.
  */
-export function sweepLeases({ apply = false } = {}) {
+/**
+ * How old an unattributable directory must be before the sweep may remove it.
+ *
+ * Deliberately far longer than any turn's setup: metadata is written
+ * immediately after the mkdir, so a directory without it is not a lease being
+ * allocated right now, and a day of margin means no ordinary operation can be
+ * mistaken for an abandoned one.
+ */
+const UNATTRIBUTABLE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** Age of a lease directory in ms, or null when it cannot be established. */
+function leaseDirectoryAge(dir, now) {
+  try {
+    const stat = fs.lstatSync(dir);
+    // birthtime is unreliable on some filesystems (reported as 0 or as the
+    // epoch); mtime is the conservative fallback because a directory being
+    // written to keeps looking young, which retains rather than removes.
+    const born = stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs;
+    if (!Number.isFinite(born) || born <= 0) return null;
+    return Math.max(0, now - born);
+  } catch {
+    return null;
+  }
+}
+
+export function sweepLeases({
+  apply = false,
+  now = Date.now(),
+  unattributableMaxAgeMs = UNATTRIBUTABLE_MAX_AGE_MS,
+} = {}) {
   const root = runtimeDir();
   const receipt = { root, removed: [], retained: [], errors: [] };
 
@@ -607,7 +653,43 @@ export function sweepLeases({ apply = false } = {}) {
     }
     const record = readJson(path.join(dir, META_FILE));
     if (record.state !== "valid") {
-      receipt.retained.push({ dir, reason: record.reason ?? `metadata is ${record.state}` });
+      // AN UNATTRIBUTABLE DIRECTORY NEEDS AN EXPIRY, or "retain what you cannot
+      // classify" becomes "accumulate forever".
+      //
+      // This is not hypothetical: a partner CLI that outlived its pane recreated
+      // its home after the lease was released, producing a directory with a
+      // valid lease name and no metadata. Nothing could then reclaim it, because
+      // every rule here keys off metadata that does not exist.
+      //
+      // Age is the only evidence available. The threshold is long enough that no
+      // live turn can reach it -- a turn holding a lease this old has been
+      // running for a day -- and metadata is written immediately after the mkdir,
+      // so a directory that has none for that long is not a lease being set up.
+      // `null` age means the directory could not be stat'd -- it vanished
+      // between readdir and here, or the filesystem reports no usable times. It
+      // is folded into the retaining branch rather than given its own: both
+      // answers are "not old enough to be sure", and the unsafe direction would
+      // be to treat an unknown age as expired. Reachable only through a
+      // filesystem race, so no test drives it; the `||` is what keeps the
+      // conservative direction from depending on that.
+      const age = leaseDirectoryAge(dir, now);
+      if (age == null || age < unattributableMaxAgeMs) {
+        receipt.retained.push({
+          dir,
+          reason: `${record.reason ?? `metadata is ${record.state}`}; retained until it is ${Math.round(unattributableMaxAgeMs / 3600000)}h old`,
+        });
+        continue;
+      }
+      if (!apply) {
+        receipt.removed.push({ dir, applied: false, reason: "unattributable and past its age limit" });
+        continue;
+      }
+      try {
+        removeLeaseDirectory(dir);
+        receipt.removed.push({ dir, applied: true, reason: "unattributable and past its age limit" });
+      } catch (err) {
+        receipt.errors.push({ path: dir, error: err.message });
+      }
       continue;
     }
     const verdict = proveLeaseReleasable(record.value);

@@ -660,6 +660,59 @@ test("releasing a lease whose consumer is still live does nothing", () => {
   fs.rmSync(lease.dir, { recursive: true, force: true });
 });
 
+test("an owner can reclaim its lease after the metadata is gone", () => {
+  // FOUND IN PRODUCTION, during this change's own review. A partner CLI
+  // outlived its tmux pane; after the lease was released it recreated
+  // $CODEX_HOME to flush a models cache, leaving a directory with a valid lease
+  // name, mode 0755 and no metadata. releaseLease() reported "lease metadata is
+  // unreadable" and retained it -- and every rule in the sweep keys off metadata
+  // that no longer existed, so nothing could ever reclaim it.
+  const lease = newLease();
+  transitionLease(lease, "projecting");
+  fs.mkdirSync(path.join(lease.dir, "codex-home"), { recursive: true });
+  fs.writeFileSync(path.join(lease.dir, "codex-home", "auth.json"), '{"token":"x"}');
+  fs.rmSync(lease.metaPath, { force: true });
+
+  const { released } = releaseLease(lease);
+  assert.equal(released, true, "a handle from allocateLease is ownership the metadata cannot revoke");
+  assert.equal(fs.existsSync(lease.dir), false);
+
+  // But ONLY for a handle this process created. A directory someone merely
+  // points at, with no readable metadata, is not reclaimable on request.
+  const stranger = newLease();
+  fs.rmSync(stranger.metaPath, { force: true });
+  const refused = releaseLease({ dir: stranger.dir, metaPath: stranger.metaPath });
+  assert.equal(refused.released, false);
+  assert.match(refused.reason, /metadata is/);
+  fs.rmSync(stranger.dir, { recursive: true, force: true });
+});
+
+test("an unattributable directory expires rather than accumulating forever", () => {
+  // "Retain what you cannot classify" is right until it has no expiry. The
+  // production orphan above had no metadata by construction, so no probe could
+  // ever classify it, and it would have sat in the runtime root permanently.
+  const orphan = path.join(runtimeDir(), "d".repeat(32));
+  fs.mkdirSync(path.join(orphan, "codex-home"), { recursive: true });
+
+  // Young: retained, and the receipt says what it is waiting for.
+  const young = sweepLeases({ apply: true });
+  const retained = young.retained.find((r) => r.dir === orphan);
+  assert.ok(retained, "a fresh unattributable directory must be retained");
+  assert.match(retained.reason, /retained until it is 24h old/);
+  assert.equal(fs.existsSync(orphan), true);
+
+  // Old enough: reclaimed. Driven by injecting `now` rather than by touching
+  // timestamps, so the test states the rule rather than the filesystem's.
+  const later = Date.now() + 25 * 60 * 60 * 1000;
+  const dry = sweepLeases({ now: later });
+  assert.ok(dry.removed.some((r) => r.dir === orphan && r.applied === false));
+  assert.equal(fs.existsSync(orphan), true, "a dry run still changes nothing");
+
+  const applied = sweepLeases({ apply: true, now: later });
+  assert.ok(applied.removed.some((r) => r.dir === orphan && r.applied === true));
+  assert.equal(fs.existsSync(orphan), false);
+});
+
 // --- the sweep -----------------------------------------------------------------
 
 test("the sweep reports what it will not touch, and touches nothing on a dry run", () => {
