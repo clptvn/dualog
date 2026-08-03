@@ -39,6 +39,11 @@ const LSOF_TIMEOUT_MS = 5000;
  * counted as UNREADABLE rather than absent, because "I was not allowed to look"
  * is not "nothing is there".
  */
+// NOT EXERCISED BY THE TEST SUITE ON macOS, where /proc does not exist and this
+// returns null immediately. Its branches are reviewed rather than covered, and a
+// mutant that makes a partial scan read as `free` survives on this machine. Said
+// here because "the mutants all die" is otherwise read as a claim about every
+// line, and this is the line it is not true of.
 function probeViaProc(dir) {
   let entries;
   try {
@@ -73,8 +78,11 @@ function probeViaProc(dir) {
     for (const fd of fds) {
       try {
         if (matches(fs.readlinkSync(`/proc/${entry}/fd/${fd}`))) return "in-use";
-      } catch {
-        // Raced with the process closing it.
+      } catch (err) {
+        // A closed descriptor contributes nothing; a descriptor we were not
+        // ALLOWED to read is a hole in the scan, and a partial look must not
+        // report "free".
+        if (err.code === "EACCES" || err.code === "EPERM") blocked = true;
       }
     }
   }
@@ -95,7 +103,7 @@ function probeViaLsof(dir) {
     const out = execFileSync("lsof", ["-w", "-F", "pn", "+D", dir], {
       encoding: "utf-8",
       timeout: LSOF_TIMEOUT_MS,
-      stdio: ["ignore", "pipe", "ignore"],
+      stdio: ["ignore", "pipe", "pipe"],
     });
     return hasForeignProcess(out) ? "in-use" : "free";
   } catch (err) {
@@ -104,7 +112,12 @@ function probeViaLsof(dir) {
     // a clean empty result as free and anything else as unknown.
     if (err?.status === 1) {
       const out = typeof err.stdout === "string" ? err.stdout : "";
-      return hasForeignProcess(out) ? "in-use" : "free";
+      if (hasForeignProcess(out)) return "in-use";
+      // Exit 1 means "found nothing" AND "could not fully look" -- lsof uses it
+      // for both. Only a clean, empty, error-free run is evidence of `free`;
+      // anything it complained about leaves the question open.
+      const noise = typeof err.stderr === "string" ? err.stderr.trim() : "";
+      return noise ? "unknown" : "free";
     }
     return "unknown";
   }

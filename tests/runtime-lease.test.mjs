@@ -1083,6 +1083,111 @@ test("an unattributable directory is retained, not aged out", () => {
   fs.rmSync(orphan, { recursive: true, force: true });
 });
 
+test("a spawn the owner watched fail is not the same as one that may have happened", () => {
+  // FOUND IN REVIEW. The headless engine writes `spawning` with only a kind
+  // before spawn(), and an identity-less spawning lease is retained until the
+  // next reboot -- correctly, because a crash there leaves no portable proof
+  // that spawn() did not happen. But an ordinary missing-binary failure is not
+  // that case: spawn() THREW, so no process exists, and the owner watched it.
+  // Without recording that, a typo in a manifest held a credential copy for the
+  // whole boot, or forever on a host with no boot identity.
+  const crashed = newLease();
+  transitionLease(crashed, "spawning", { consumer: { kind: "headless" } });
+  assert.equal(
+    releaseLease(crashed).released,
+    false,
+    "the ambiguous crash window must still retain"
+  );
+  fs.rmSync(crashed.dir, { recursive: true, force: true });
+  fs.rmSync(crashed.metaPath, { force: true });
+
+  const observed = newLease();
+  fs.mkdirSync(path.join(observed.dir, "codex-home"), { recursive: true });
+  fs.writeFileSync(path.join(observed.dir, "codex-home", "auth.json"), '{"token":"x"}');
+  transitionLease(observed, "spawning", {
+    consumer: { kind: "headless", spawn_outcome: "failed" },
+  });
+  assert.equal(
+    releaseLease(observed).released,
+    true,
+    "a spawn the owner saw throw releases immediately"
+  );
+  assert.equal(fs.existsSync(observed.dir), false);
+});
+
+test("a tombstone is not aged out until its consumer is proven gone", () => {
+  // FOUND IN REVIEW. Expiring on elapsed time alone re-opened the hole the
+  // sibling record closed: a consumer keeps a token, touches nothing for a day,
+  // then recreates its home -- and with the tombstone already discarded, what it
+  // leaves is unattributable and retained forever.
+  const lease = newLease();
+  transitionLease(lease, "active", {
+    consumer: { kind: "headless", pid: process.pid, pgid: process.pid },
+  });
+  fs.writeFileSync(
+    lease.metaPath,
+    JSON.stringify({
+      schema_version: 1,
+      lease_id: lease.id,
+      state: "released",
+      released_at: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+      consumer: { kind: "headless", pid: process.pid, pgid: process.pid },
+    })
+  );
+  fs.rmSync(lease.dir, { recursive: true, force: true });
+
+  sweepLeases({ apply: true, now: Date.now() });
+  assert.equal(
+    fs.existsSync(lease.metaPath),
+    true,
+    "a long-expired record whose consumer is alive must be kept"
+  );
+
+  // And once that consumer is gone, the record may go.
+  fs.writeFileSync(
+    lease.metaPath,
+    JSON.stringify({
+      schema_version: 1,
+      lease_id: lease.id,
+      state: "released",
+      released_at: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+      consumer: { kind: "headless", pid: 999999, pgid: 999999 },
+    })
+  );
+  sweepLeases({ apply: true, now: Date.now() });
+  assert.equal(fs.existsSync(lease.metaPath), false);
+});
+
+test("a release that cannot persist its tombstone keeps the directory", () => {
+  // Removing anyway left the credential directory gone AND no record, so a late
+  // recreation could never be attributed -- destroying exactly the evidence the
+  // sibling-record design exists to preserve, and reporting success while doing it.
+  const lease = newLease();
+  transitionLease(lease, "active", {
+    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session", pane_pid: 999999 },
+  });
+  // Readable but NOT writable: the record is where it belongs, and the runtime
+  // root denies the atomic write. That is the case being tested -- an unreadable
+  // record takes a different branch entirely.
+  const root = runtimeDir();
+  const originalMode = fs.statSync(root).mode & 0o777;
+  fs.chmodSync(root, 0o500);
+  let result;
+  try {
+    result = releaseLease(lease);
+  } finally {
+    fs.chmodSync(root, originalMode);
+  }
+
+  assert.equal(result.released, false, "a release that cannot be recorded must not destroy");
+  assert.match(result.reason, /could not be persisted/);
+  assert.equal(fs.existsSync(lease.dir), true, "and the directory must survive");
+  assert.equal(fs.existsSync(lease.metaPath), true, "as must the record it could not replace");
+
+  fs.rmSync(lease.dir, { recursive: true, force: true });
+  fs.rmSync(lease.metaPath, { force: true });
+});
+
 test("a spent lease record is eventually reaped, once its directory is gone", () => {
   // Tombstones are metadata, not credentials, so age IS the right measure for
   // them -- otherwise the runtime root fills with records of turns long past.
@@ -1381,6 +1486,43 @@ test("a setsid descendant keeps the lease, though no identity check can see it",
   assert.equal(fs.existsSync(lease.dir), false, "and it is reclaimed once nothing holds it");
 });
 
+test("an undeterminable usage answer cannot authorize deletion at ANY path", (t) => {
+  // REPRODUCED BY THE REVIEWER. The verdict retained on `unknown`, but the
+  // deletion choke point rejected only `in-use` -- and several paths reach the
+  // removal WITHOUT going through the verdict (the owner's failed-spawn
+  // shortcut, the released-tombstone branch). So on a host with no lsof the
+  // answer was `unknown` and the directory was removed anyway.
+  if (process.platform === "win32") {
+    t.skip("Windows enforces this in the platform itself");
+    return;
+  }
+  const script = `
+    process.env.PATH = "";
+    const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-unknown-"));
+    process.env.HOME = home; process.env.USERPROFILE = home;
+    process.env.HOMEDRIVE = ""; process.env.HOMEPATH = home;
+    const dir = path.join(home, ".dualog", "runtime", "a".repeat(32));
+    fs.mkdirSync(path.join(dir, "codex-home"), { recursive: true });
+    Promise.all([
+      import(${JSON.stringify(new URL("../src/directory-usage.mjs", import.meta.url).href)}),
+      import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}),
+    ]).then(([u, l]) => {
+      let refused = false;
+      try { l.removeLeaseDirectory(dir); } catch { refused = true; }
+      console.log(JSON.stringify({
+        usage: u.probeDirectoryInUse(dir),
+        refused,
+        survives: fs.existsSync(dir),
+      }));
+    });
+  `;
+  const out = JSON.parse(execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim());
+  assert.equal(out.usage, "unknown", "precondition: neither /proc nor lsof reachable");
+  assert.equal(out.refused, true, "the choke point must refuse an unanswerable usage query");
+  assert.equal(out.survives, true);
+});
+
 test("usage that cannot be determined retains, and never reads as free", (t) => {
   // The probe needs /proc or lsof. Where neither is reachable -- a stripped
   // container, a restricted PATH -- the answer is `unknown`, and on a platform
@@ -1441,7 +1583,7 @@ test("the removal choke point refuses a directory in use, whatever the caller be
 
   assert.throws(
     () => removeLeaseDirectory(lease.dir),
-    /still open by a running process/,
+    /a process still has this directory open/,
     "the choke point must refuse regardless of what the caller decided"
   );
   assert.equal(fs.existsSync(home), true);

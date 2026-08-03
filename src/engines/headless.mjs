@@ -343,16 +343,38 @@ async function runHeadlessTurnInner({
   // that spawn() did not happen. That retention is released by the boot check
   // once the machine restarts, so a crash cannot make a projection permanent.
   if (lease) transitionLease(lease, "spawning", { consumer: { kind: "headless" } });
-  const child = spawn(command, args, {
-    cwd: projectPath,
-    env: { ...process.env, ...env },
-    stdio: ["pipe", "pipe", "pipe"],
-    windowsHide: true,
-    // Lead a process group so termination reaches the CLI's own children. Many
-    // partner CLIs shell out; signalling only the direct PID leaves those behind
-    // holding the pipes, which reads as a hang rather than a kill.
-    detached: process.platform !== "win32",
-  });
+  let child;
+  try {
+    child = spawnPartner();
+  } catch (err) {
+    // THE OWNER WATCHED THE SPAWN FAIL, which is knowledge no probe can
+    // reconstruct. Without recording it, the lease stays identity-less
+    // `spawning` and proveLeaseReleasable retains it until the next reboot --
+    // so an ordinary missing-binary failure held a credential copy for the whole
+    // boot, or forever where no boot identity is available.
+    if (lease) {
+      try {
+        transitionLease(lease, "spawning", {
+          consumer: { kind: "headless", spawn_outcome: "failed" },
+        });
+      } catch {
+        // The release below still refuses without a proof.
+      }
+    }
+    throw err;
+  }
+  function spawnPartner() {
+    return spawn(command, args, {
+      cwd: projectPath,
+      env: { ...process.env, ...env },
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      // Lead a process group so termination reaches the CLI's own children. Many
+      // partner CLIs shell out; signalling only the direct PID leaves those
+      // behind holding the pipes, which reads as a hang rather than a kill.
+      detached: process.platform !== "win32",
+    });
+  }
   if (lease) {
     transitionLease(lease, "active", {
       consumer: {

@@ -432,17 +432,8 @@ export function proveLeaseReleasable(meta, { now = Date.now(), dir = null } = {}
    */
   const releasable = () => {
     if (!dir) return { removable: true, reason: null };
-    const usage = probeDirectoryInUse(dir);
-    if (usage === "in-use") return keep("a process still has this directory open");
-    if (usage === "unknown") {
-      // Windows, where handle enumeration needs native code. Deletion is still
-      // safe there because the platform refuses to remove a directory anything
-      // has open -- removeLeaseDirectory does not force past that.
-      return process.platform === "win32"
-        ? { removable: true, reason: null }
-        : keep("whether this directory is in use could not be determined");
-    }
-    return { removable: true, reason: null };
+    const usage = directoryReleaseVerdict(dir);
+    return usage.ok ? { removable: true, reason: null } : keep(usage.reason);
   };
   if (!meta || typeof meta !== "object") return keep("lease metadata is unreadable");
 
@@ -662,6 +653,28 @@ function probeConsumer(consumer) {
 }
 
 /**
+ * May this directory be deleted, as far as CURRENT USE is concerned?
+ *
+ * One rule, shared by the verdict and by the deletion choke point. They used to
+ * differ: the verdict retained on `unknown`, the choke point rejected only
+ * `in-use` -- so a host with no lsof answered `unknown` and the directory was
+ * removed anyway, through paths that bypass the verdict entirely (the owner's
+ * failed-spawn shortcut, the released-tombstone branch). Reproduced before it
+ * was fixed. `free` is now required everywhere.
+ */
+function directoryReleaseVerdict(dir) {
+  const usage = probeDirectoryInUse(dir);
+  if (usage === "free") return { ok: true, reason: null };
+  if (usage === "in-use") return { ok: false, reason: "a process still has this directory open" };
+  // Windows cannot enumerate handles without native code, but it enforces this
+  // in the platform: removing a directory any process has open FAILS there, and
+  // the rmSync below does not force past that. Everywhere else, unanswerable
+  // means retained.
+  if (process.platform === "win32") return { ok: true, reason: null };
+  return { ok: false, reason: "whether this directory is in use could not be determined" };
+}
+
+/**
  * Remove a lease directory, re-proving it is ours immediately before unlinking.
  *
  * The checks are repeated here rather than trusted from allocation time: a lease
@@ -689,8 +702,9 @@ export function removeLeaseDirectory(dir) {
   }
   // THE LAST GUARD, at the one place every deletion goes through. Callers check
   // this too, for a legible receipt; this is what makes it unskippable.
-  if (probeDirectoryInUse(resolved) === "in-use") {
-    throw new Error(`removeLeaseDirectory: ${resolved} is still open by a running process`);
+  const usage = directoryReleaseVerdict(resolved);
+  if (!usage.ok) {
+    throw new Error(`removeLeaseDirectory: refusing to remove ${resolved}: ${usage.reason}`);
   }
   const stat = fs.lstatSync(resolved);
   if (stat.isSymbolicLink()) {
@@ -768,13 +782,21 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
     // therefore watch exit -- lets the owner take this shortcut; everything else
     // falls through to the boot-scoped retention below.
     const spawnConsumer = record.value.consumer ?? {};
+    // A headless spawn the owner WATCHED throw. That is knowledge no probe can
+    // reconstruct -- spawn() never returned, so no process exists -- and without
+    // it an ordinary missing-binary failure retained its credential copy until
+    // the next reboot.
+    const observedSpawnFailure =
+      record.value.state === "spawning" &&
+      spawnConsumer.kind === "headless" &&
+      spawnConsumer.spawn_outcome === "failed";
     const failedSpawn =
       record.value.state === "spawning" &&
       spawnConsumer.kind === "tmux" &&
       Number.isSafeInteger(spawnConsumer.pane_pid) &&
       probeConsumer(spawnConsumer) === "absent" &&
       (sleepSync(SPAWN_SETTLE_MS), probeConsumer(spawnConsumer) === "absent");
-    if (preSpawn || failedSpawn) {
+    if (preSpawn || failedSpawn || observedSpawnFailure) {
       return finishRelease(dir, metaPath, record.value);
     }
   }
@@ -822,8 +844,15 @@ function finishRelease(dir, metaPath, meta) {
       released_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     });
-  } catch {
-    // A tombstone we cannot write costs attributability later, never safety now.
+  } catch (err) {
+    // WITHOUT A DURABLE RECORD, DO NOT DESTROY. Removing anyway leaves the
+    // credential directory gone AND no tombstone, so a late recreation is
+    // unattributable and retained forever -- losing the exact evidence this
+    // redesign exists to preserve. Reporting failure keeps both.
+    return {
+      released: false,
+      reason: `the release record could not be persisted (${err.code || err.message}), so the directory was kept`,
+    };
   }
   removeLeaseDirectory(dir);
   // A legacy in-directory record went with the directory; nothing to clean.
@@ -953,6 +982,16 @@ export function sweepLeases({
       const held = readJson(path.join(root, entry.name));
       const releasedAt = held.state === "valid" ? Date.parse(held.value.released_at ?? "") : NaN;
       if (!Number.isFinite(releasedAt) || now - releasedAt < unattributableMaxAgeMs) continue;
+      // AGE IS NOT ABSENCE. A tombstone is the only thing that can attribute a
+      // directory a late consumer recreates, so discarding one on elapsed time
+      // alone re-opens the hole the sibling record closed: the consumer keeps a
+      // token, touches nothing for a day, then recreates the home, and what it
+      // leaves is unattributable forever. The record may only go once the
+      // consumer it names is proven gone -- and a record naming nothing
+      // probeable is kept, because it can never earn that proof.
+      const consumer = held.value.consumer;
+      if (!hasUsableIdentity(consumer)) continue;
+      if (probeConsumer(consumer) !== "absent") continue;
       if (!apply) {
         receipt.removed.push({ dir, applied: false, reason: "spent lease record" });
         continue;
