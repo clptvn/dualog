@@ -451,6 +451,26 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
     return { released: false, reason: record.reason };
   }
 
+  // THE OWNER RELEASING ITS OWN PRE-SPAWN LEASE IS AUTHORITATIVE.
+  //
+  // proveLeaseReleasable() retains a pre-spawn lease while its owner lives,
+  // which is right for a sweep running in another process and exactly wrong
+  // here: the owner IS the live runner, so it would refuse to clean up after
+  // itself. A turn that failed during projection therefore left its partial
+  // credential copy on disk for the rest of the session -- the runner only exits
+  // at session end -- which is the condition per-turn leases exist to end.
+  //
+  // Sound because the API invariant says `spawning` is written before any
+  // process-creating call, so in these three states nothing was started, and the
+  // owner is the authority on whether it is giving up.
+  if (record.state === "valid" && record.value.runner_pid === process.pid) {
+    const preSpawn = ["allocated", "projecting", "ready"].includes(record.value.state);
+    if (preSpawn) {
+      removeLeaseDirectory(dir);
+      return { released: true, reason: null };
+    }
+  }
+
   // A caller that has just PROVEN the consumer absent -- the turn loop watching
   // its own tmux pane die -- knows something the metadata cannot express yet.
   if (consumerAbsent === true && record.state === "valid") {

@@ -533,6 +533,32 @@ test("releasing takes the credentials with it", () => {
   assert.equal(fs.existsSync(lease.dir), false, "the whole lease goes, auth.json included");
 });
 
+test("a runner can clean up after its own failed pre-spawn turn", () => {
+  // FOUND BY SELF-REVIEW, not by the reviewer. proveLeaseReleasable() retains a
+  // pre-spawn lease while its owner lives -- correct for a sweep in another
+  // process, and exactly wrong for the owner itself, which is that live runner.
+  // A turn failing during projection therefore kept its partial credential copy
+  // for the REST OF THE SESSION, since the runner only exits at session end.
+  // That is the condition per-turn leases exist to end.
+  const lease = newLease();
+  transitionLease(lease, "projecting");
+  const home = path.join(lease.dir, "codex-home");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "auth.json"), '{"token":"partial-projection"}');
+
+  const { released } = releaseLease(lease);
+  assert.equal(released, true, "the owner may reclaim its own pre-spawn lease");
+  assert.equal(fs.existsSync(lease.dir), false);
+
+  // The counterweight: this must be about being the OWNER, not about being any
+  // process that asks. A lease belonging to a different, live runner is refused.
+  const other = newLease({ runnerPid: 1 });
+  const refused = releaseLease(other);
+  assert.equal(refused.released, false, "another process may not reclaim a live owner's lease");
+  assert.match(refused.reason, /still alive/);
+  fs.rmSync(other.dir, { recursive: true, force: true });
+});
+
 test("releasing a lease whose consumer is still live does nothing", () => {
   const lease = newLease();
   transitionLease(lease, "active", {
