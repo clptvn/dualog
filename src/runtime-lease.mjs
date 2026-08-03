@@ -438,7 +438,22 @@ function probeOwner(meta) {
 function probeConsumer(consumer) {
   if (consumer.kind === "tmux") {
     if (typeof consumer.session_name !== "string" || !consumer.session_name) return "unknown";
-    return probeTmuxSessionSync(consumer.session_name);
+    const session = probeTmuxSessionSync(consumer.session_name);
+    if (session !== "absent") return session;
+    // THE PANE BEING GONE IS NOT THE PROGRAM BEING GONE, and the difference was
+    // observable on every single turn: codex flushes its models cache during
+    // shutdown, after its pane has closed. Releasing on the session alone
+    // deleted the home and the partner then recreated it, leaving a directory
+    // with a valid lease name and no metadata that nothing could reclaim.
+    //
+    // pane_pid is that program -- the shell payload execs into the CLI -- so it
+    // answers the question the session name cannot. Records written before this
+    // existed carry no pane_pid; for those the session remains the only
+    // available evidence, which is the previous behaviour rather than a new gap.
+    if (consumer.pane_pid == null) return "absent";
+    const pane = probeProcess(consumer.pane_pid);
+    if (pane === "invalid") return "unknown";
+    return pane;
   }
   if (consumer.kind === "headless") {
     const pidVerdict = probeProcess(consumer.pid);

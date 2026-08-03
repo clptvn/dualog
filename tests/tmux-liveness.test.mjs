@@ -24,7 +24,10 @@ import {
   isTmuxSessionAlive,
   probeTmuxSession,
   probeTmuxSessionSync,
+  startTmuxSession,
+  terminateTmuxSession,
 } from "../src/tmux-runtime.mjs";
+import { probeProcess } from "../src/process-probe.mjs";
 import { killTmuxServer } from "./helpers/tmux.mjs";
 
 const SOCKET = `dualog-liveness-${process.pid}`;
@@ -259,6 +262,41 @@ test("nothing that can end a turn uses the two-valued predicate", () => {
     /if \(liveness === "absent"\) \{/,
     "the sidecar loop ends the turn only on a proven absence"
   );
+});
+
+// --- the pane's process, against a real server --------------------------------
+
+test("a started session reports the process running in its pane", async (t) => {
+  if (!realTmuxAvailable()) {
+    t.skip("tmux is not installed");
+    return;
+  }
+  const socket = `${SOCKET}-panepid`;
+  const previousSocket = process.env.DUALOG_TMUX_SOCKET;
+  process.env.DUALOG_TMUX_SOCKET = socket;
+  delete process.env.DUALOG_TMUX_BINARY;
+
+  const handle = await startTmuxSession({
+    sessionName: `dualog-panepid-${process.pid}`,
+    cwd: process.cwd(),
+    command: "sleep",
+    args: ["60"],
+    env: {},
+  });
+  t.after(() => {
+    killTmuxServer(socket);
+    if (previousSocket === undefined) delete process.env.DUALOG_TMUX_SOCKET;
+    else process.env.DUALOG_TMUX_SOCKET = previousSocket;
+  });
+
+  // The credential lease's release decision reads this: a closed pane is not an
+  // exited process, so without a pid there is nothing to check the difference
+  // against and cleanup falls back to trusting the session alone.
+  assert.ok(Number.isSafeInteger(handle.panePid) && handle.panePid > 0, "pane_pid must be captured");
+  assert.equal(probeProcess(handle.panePid), "alive", "and must name a process that exists");
+
+  await terminateTmuxSession(handle);
+  assert.equal(await probeTmuxSession(handle.sessionName), "absent");
 });
 
 // --- what the classifier tells a driver --------------------------------------

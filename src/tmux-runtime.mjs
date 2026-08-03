@@ -106,10 +106,22 @@ export async function startTmuxSession({ sessionName, cwd, command, args, env })
     const paneId = (
       await runTmux(["display-message", "-p", "-t", paneTarget, "#{pane_id}"])
     ).stdout.trim();
+    // The PROCESS in the pane, not just the pane.
+    //
+    // A tmux session going away does not prove the program it was running has
+    // exited, and that gap is observable: a partner CLI flushes caches during
+    // shutdown, after its pane is gone. Anything deciding "is this partner
+    // finished" needs a handle on the process, and the shell payload `exec`s
+    // into the CLI, so pane_pid IS that process rather than a wrapper.
+    const panePid = Number.parseInt(
+      (await runTmux(["display-message", "-p", "-t", paneTarget, "#{pane_pid}"])).stdout.trim(),
+      10
+    );
     return {
       sessionName,
       paneTarget,
       paneId,
+      panePid: Number.isSafeInteger(panePid) && panePid > 0 ? panePid : null,
       cwd,
       command,
       args: [...args],

@@ -22,6 +22,7 @@ import {
   releaseLease,
   transitionLease,
 } from "./runtime-lease.mjs";
+import { probeProcess } from "./process-probe.mjs";
 import { resolveDiscoveryForValidation } from "./adapters/resolve-for-validation.mjs";
 import { getAdapter, tryGetAdapter } from "./adapters/registry.mjs";
 import {
@@ -147,6 +148,26 @@ function needsRuntimeArtifacts(adapter) {
       adapter?.mcp?.strategy === "empty-config-file" ||
       Object.keys(adapter?.dirs ?? {}).length > 0
   );
+}
+
+/**
+ * How long to wait for a partner to finish exiting after its pane closes.
+ *
+ * Measured against the observed behaviour: codex writes its models cache during
+ * shutdown, well within this window. Short on purpose -- it delays only the
+ * cleanup, never the turn's result, and a partner that outlasts it keeps its
+ * lease rather than blocking anything.
+ */
+const PARTNER_EXIT_GRACE_MS = 3000;
+
+/** Poll until a process is gone, or the budget runs out. Never throws. */
+async function waitForProcessExit(pid, budgetMs) {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (probeProcess(pid) === "absent") return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return probeProcess(pid) === "absent";
 }
 
 /**
@@ -399,7 +420,10 @@ export async function runPartnerCommand({
     });
     if (lease) {
       transitionLease(lease, "active", {
-        consumer: { kind: "tmux", session_name: sessionName },
+        // The pane's process as well as the pane. Releasing on the session alone
+        // demonstrably reclaimed the home while the partner was still shutting
+        // down, and it then recreated the directory to flush its cache.
+        consumer: { kind: "tmux", session_name: sessionName, pane_pid: handle.panePid ?? null },
       });
     }
     state = writeTerminalState(
@@ -472,11 +496,22 @@ export async function runPartnerCommand({
       },
       { active: false }
     );
-    // The credentials go the moment the process holding them is PROVEN gone --
-    // which is the whole point of a per-turn lease. Under any other verdict the
-    // lease stays and the sweep reclaims it once the pane can be shown absent;
-    // deleting a home out from under a live CLI is the worse failure.
-    releaseLeaseQuietly(lease, log, { consumerAbsent: verdict === "absent" });
+    // The credentials go the moment the process holding them is PROVEN gone.
+    //
+    // "Proven gone" means the PROCESS, not the pane. Releasing on the tmux
+    // verdict alone reclaimed the home while codex was still shutting down, and
+    // it then recreated the directory to flush its models cache -- leaving an
+    // unattributable orphan on every turn. So wait briefly for the pane's
+    // process to exit, then let releaseLease() do the full proof rather than
+    // asserting absence from here.
+    //
+    // The wait is short and bounded because it is a courtesy, not a guarantee: a
+    // partner that takes longer simply keeps its lease, and the sweep reclaims
+    // it once the process can be shown gone.
+    if (lease && verdict === "absent" && handle?.panePid) {
+      await waitForProcessExit(handle.panePid, PARTNER_EXIT_GRACE_MS);
+    }
+    releaseLeaseQuietly(lease, log);
 
     return response.trim();
   } catch (err) {

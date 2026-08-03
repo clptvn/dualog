@@ -271,6 +271,56 @@ test("a headless consumer whose leader died but whose group survives is retained
   assert.match(verdict.reason, /still running/);
 });
 
+test("a closed pane does not prove the partner process exited", (t) => {
+  // FOUND IN PRODUCTION. codex flushes its models cache during shutdown, after
+  // its pane has closed. Releasing on the tmux session alone therefore deleted
+  // the home while the partner was still running, and it recreated the directory
+  // on the way out -- an unattributable orphan on every single turn.
+  //
+  // pane_pid is that process (the shell payload execs into the CLI), so it
+  // answers what the session name cannot.
+  const shuttingDown = {
+    state: "active",
+    consumer: {
+      kind: "tmux",
+      session_name: "dualog-lease-test-no-such-session",
+      pane_pid: liveProcess(t),
+    },
+  };
+  const verdict = proveLeaseReleasable(shuttingDown);
+  assert.equal(verdict.removable, false, "a live pane process must keep the lease");
+  assert.match(verdict.reason, /still running/);
+
+  // Once the process is gone, both facts agree and the lease goes.
+  assert.equal(
+    proveLeaseReleasable({
+      ...shuttingDown,
+      consumer: { ...shuttingDown.consumer, pane_pid: 999999 },
+    }).removable,
+    true
+  );
+
+  // A record written before pane_pid existed still resolves on the session
+  // alone -- the previous behaviour, not a new gap.
+  assert.equal(
+    proveLeaseReleasable({
+      state: "active",
+      consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+    }).removable,
+    true,
+    "a legacy record without pane_pid keeps working"
+  );
+
+  // And a live SESSION still short-circuits, without needing the pid at all.
+  assert.equal(
+    proveLeaseReleasable({
+      state: "active",
+      consumer: { kind: "tmux", session_name: "", pane_pid: 999999 },
+    }).removable,
+    false
+  );
+});
+
 test("a lease whose consumer is proven absent is removable", () => {
   assert.equal(
     proveLeaseReleasable({
@@ -780,17 +830,29 @@ test("every exit from a partner turn releases its lease, and only on proof", () 
     "a rejected turn, a completed turn, and a failed turn each release the lease"
   );
 
-  // The success path releases on the TERMINATION VERDICT, not unconditionally.
+  // EXACTLY ONE site may assert absence rather than prove it: the rejected turn,
+  // where the API invariant says no process-creating call has been made. The
+  // completed and failed paths pass no assertion, so releaseLease() has to
+  // establish it from the recorded consumer.
+  //
+  // The completed path used to assert `consumerAbsent: verdict === "absent"`,
+  // which trusted the TMUX verdict -- and a closed pane is not an exited
+  // process, so it reclaimed the home while the partner was still shutting down.
+  const asserted = (src.match(/consumerAbsent:/g) || []).length;
+  assert.equal(asserted, 1, "only the rejected-turn release may assert absence");
+  assert.match(src, /releaseLeaseQuietly\(lease, log, \{ consumerAbsent: true \}\)/);
+  assert.equal(
+    (src.match(/releaseLeaseQuietly\(lease, log\);/g) || []).length,
+    2,
+    "the completed and failed paths must both prove rather than assert"
+  );
+
+  // And the completed path waits for the pane's PROCESS before reclaiming.
   assert.match(
     src,
-    /releaseLeaseQuietly\(lease, log, \{ consumerAbsent: verdict === "absent" \}\)/,
-    "the completed-turn release must be conditioned on the pane being proven gone"
+    /waitForProcessExit\(handle\.panePid, PARTNER_EXIT_GRACE_MS\)/,
+    "the completed turn must give the partner a chance to exit before cleanup"
   );
-  // The rejected-turn release may assert absence outright: the API invariant is
-  // that no process-creating call has been made at that point.
-  assert.match(src, /releaseLeaseQuietly\(lease, log, \{ consumerAbsent: true \}\)/);
-  // The error path passes no proof at all, so releaseLease() has to establish it.
-  assert.match(src, /releaseLeaseQuietly\(lease, log\);/);
 
   const headless = fs.readFileSync(
     new URL("../src/engines/headless.mjs", import.meta.url),
