@@ -540,7 +540,7 @@ function finish(chunks, complete, warning) {
  * Atomics.wait on a SharedArrayBuffer is the only way to sleep synchronously,
  * and these hooks are synchronous top to bottom.
  */
-function sleepSync(ms) {
+export function sleepSync(ms) {
   try {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   } catch {

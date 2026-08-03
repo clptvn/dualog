@@ -520,10 +520,24 @@ export async function runPartnerCommand({
       // The wait is short and bounded because it is a courtesy, not a guarantee: a
       // partner that takes longer simply keeps its lease, and the sweep reclaims
       // it once the process can be shown gone.
+      //
+      // And the release only happens once that is ESTABLISHED. `owned` proves
+      // this process created the lease, not that nothing is using it -- so if
+      // the partner outlives the grace period, the lease stays and the sweep
+      // takes it later. Without this gate, a partner still running after the
+      // wait would have its recreated home deleted on the strength of ownership
+      // alone.
+      let partnerExited = true;
       if (lease && verdict === "absent" && handle?.panePid) {
-        await waitForProcessExit(handle.panePid, PARTNER_EXIT_GRACE_MS);
+        partnerExited = await waitForProcessExit(handle.panePid, PARTNER_EXIT_GRACE_MS);
       }
-      releaseLeaseQuietly(lease, log);
+      if (partnerExited) {
+        releaseLeaseQuietly(lease, log);
+      } else if (lease) {
+        log(
+          `${partnerDisplay} is still running after its pane closed; runtime lease ${lease.id} retained for the sweep`
+        );
+      }
 
       return response.trim();
     } catch (err) {

@@ -51,6 +51,7 @@ import {
   isValidLeaseId,
   leaseDir,
   runtimeDir,
+  sleepSync,
 } from "./platform.mjs";
 import { probeGroup, probeProcess } from "./process-probe.mjs";
 import { probeTmuxSessionSync } from "./tmux-runtime.mjs";
@@ -90,6 +91,13 @@ export const LEASE_STATES = [
  * speed; being too strict deletes a live turn's credentials.
  */
 const IMPRECISE_BOOT_TOLERANCE_SECONDS = 3600;
+
+/**
+ * How long to let a killed tmux client's queued work land before believing
+ * "no pane exists". The tmux server is a separate process from the client we
+ * ran, so the command can outlive the call that issued it.
+ */
+const SPAWN_SETTLE_MS = 400;
 
 let cachedBootIdentity;
 
@@ -622,9 +630,19 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
     // third-party sweep it knows no helper of its own is still in flight -- which
     // is the only thing that made "owner gone + consumer absent" unsafe. Without
     // this, a failed startTmuxSession() retained its lease until the next reboot.
+    //
+    // TWO probes, separated by a settle. `startTmuxSession()` drives tmux
+    // through an execFile CLIENT, and the tmux SERVER is a separate process: a
+    // client that timed out and was SIGKILLed can already have handed
+    // `new-session` over, so the pane may appear just after the client call
+    // settles. One probe reads that as "no pane, safe to delete" and removes the
+    // home the pane is about to start against. The settle is short because the
+    // gap being covered is the server acting on a command it already has.
     const failedSpawn =
       record.value.state === "spawning" &&
-      probeConsumer(record.value.consumer ?? {}) === "absent";
+      probeConsumer(record.value.consumer ?? {}) === "absent" &&
+      (sleepSync(SPAWN_SETTLE_MS),
+      probeConsumer(record.value.consumer ?? {}) === "absent");
     if (preSpawn || failedSpawn) {
       removeLeaseDirectory(dir);
       return { released: true, reason: null };
@@ -683,19 +701,51 @@ export function readTurnLease(turnDir) {
  */
 const UNATTRIBUTABLE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
-/** Age of a lease directory in ms, or null when it cannot be established. */
-function leaseDirectoryAge(dir, now) {
-  try {
-    const stat = fs.lstatSync(dir);
-    // birthtime is unreliable on some filesystems (reported as 0 or as the
-    // epoch); mtime is the conservative fallback because a directory being
-    // written to keeps looking young, which retains rather than removes.
-    const born = stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs;
-    if (!Number.isFinite(born) || born <= 0) return null;
-    return Math.max(0, now - born);
-  } catch {
-    return null;
-  }
+/**
+ * How long since ANYTHING in this directory changed, or null if unknowable.
+ *
+ * Deliberately the newest mtime in the tree rather than the directory's own
+ * birth time. Age-since-creation says nothing about whether something is still
+ * using the directory -- and the case this exists for is precisely a partner
+ * that outlived its pane and is writing into a home it recreated. A live writer
+ * keeps this number small, which retains; only a tree nothing has touched for
+ * the full window is reclaimed.
+ *
+ * Bounded so a pathological tree cannot stall the sweep. Hitting the bound
+ * returns null, which retains -- the conservative direction.
+ */
+const ACTIVITY_SCAN_MAX_ENTRIES = 2000;
+
+function msSinceLastActivity(dir, now) {
+  let newest = 0;
+  let budget = ACTIVITY_SCAN_MAX_ENTRIES;
+
+  const visit = (target) => {
+    if (budget-- <= 0) return false;
+    let stat;
+    try {
+      stat = fs.lstatSync(target);
+    } catch {
+      return true; // vanished mid-scan; it contributes nothing
+    }
+    if (stat.mtimeMs > newest) newest = stat.mtimeMs;
+    if (stat.birthtimeMs > newest) newest = stat.birthtimeMs;
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return true;
+    let entries;
+    try {
+      entries = fs.readdirSync(target);
+    } catch {
+      return true;
+    }
+    for (const entry of entries) {
+      if (!visit(path.join(target, entry))) return false;
+    }
+    return true;
+  };
+
+  if (!visit(dir)) return null;
+  if (!Number.isFinite(newest) || newest <= 0) return null;
+  return Math.max(0, now - newest);
 }
 
 export function sweepLeases({
@@ -754,21 +804,21 @@ export function sweepLeases({
       // be to treat an unknown age as expired. Reachable only through a
       // filesystem race, so no test drives it; the `||` is what keeps the
       // conservative direction from depending on that.
-      const age = leaseDirectoryAge(dir, now);
+      const age = msSinceLastActivity(dir, now);
       if (age == null || age < unattributableMaxAgeMs) {
         receipt.retained.push({
           dir,
-          reason: `${record.reason ?? `metadata is ${record.state}`}; retained until it is ${Math.round(unattributableMaxAgeMs / 3600000)}h old`,
+          reason: `${record.reason ?? `metadata is ${record.state}`}; retained until nothing has touched it for ${Math.round(unattributableMaxAgeMs / 3600000)}h`,
         });
         continue;
       }
       if (!apply) {
-        receipt.removed.push({ dir, applied: false, reason: "unattributable and past its age limit" });
+        receipt.removed.push({ dir, applied: false, reason: "unattributable and untouched past its age limit" });
         continue;
       }
       try {
         removeLeaseDirectory(dir);
-        receipt.removed.push({ dir, applied: true, reason: "unattributable and past its age limit" });
+        receipt.removed.push({ dir, applied: true, reason: "unattributable and untouched past its age limit" });
       } catch (err) {
         receipt.errors.push({ path: dir, error: err.message });
       }

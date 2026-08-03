@@ -800,7 +800,7 @@ test("an unattributable directory expires rather than accumulating forever", () 
   const young = sweepLeases({ apply: true });
   const retained = young.retained.find((r) => r.dir === orphan);
   assert.ok(retained, "a fresh unattributable directory must be retained");
-  assert.match(retained.reason, /retained until it is 24h old/);
+  assert.match(retained.reason, /retained until nothing has touched it for 24h/);
   assert.equal(fs.existsSync(orphan), true);
 
   // Old enough: reclaimed. Driven by injecting `now` rather than by touching
@@ -809,6 +809,29 @@ test("an unattributable directory expires rather than accumulating forever", () 
   const dry = sweepLeases({ now: later });
   assert.ok(dry.removed.some((r) => r.dir === orphan && r.applied === false));
   assert.equal(fs.existsSync(orphan), true, "a dry run still changes nothing");
+
+  // BUT a live writer inside it must reset that clock. The window exists for a
+  // partner that outlived its pane and is writing into a home it recreated;
+  // measuring the directory's own creation time would have reclaimed it out from
+  // under exactly that process.
+  const active = path.join(runtimeDir(), "e".repeat(32));
+  fs.mkdirSync(path.join(active, "codex-home"), { recursive: true });
+  const written = path.join(active, "codex-home", "models_cache.json");
+  fs.writeFileSync(written, "{}");
+  // Touched as of the evaluation time. `now` is injected 25h ahead, so a file
+  // written at real-now would read as 25h stale; the point being tested is what
+  // happens when something writes WHILE the sweep considers the directory.
+  const asOf = new Date(later);
+  fs.utimesSync(written, asOf, asOf);
+  // A dry run: applying here would reclaim the orphan too, and the last
+  // assertion below still needs it present.
+  const stillWriting = sweepLeases({ now: later });
+  assert.ok(
+    stillWriting.retained.some((r) => r.dir === active),
+    "a tree touched recently must be retained however old the directory is"
+  );
+  assert.equal(fs.existsSync(active), true);
+  fs.rmSync(active, { recursive: true, force: true });
 
   const applied = sweepLeases({ apply: true, now: later });
   assert.ok(applied.removed.some((r) => r.dir === orphan && r.applied === true));
@@ -909,11 +932,34 @@ test("every exit from a partner turn releases its lease, and only on proof", () 
     "the completed, failed and setup paths must all prove rather than assert"
   );
 
-  // And the completed path waits for the pane's PROCESS before reclaiming.
+  // And the completed path waits for the pane's PROCESS before reclaiming...
   assert.match(
     src,
-    /waitForProcessExit\(handle\.panePid, PARTNER_EXIT_GRACE_MS\)/,
+    /partnerExited = await waitForProcessExit\(handle\.panePid, PARTNER_EXIT_GRACE_MS\)/,
     "the completed turn must give the partner a chance to exit before cleanup"
+  );
+  // ...and only releases if that actually established absence. `owned` proves
+  // this process created the lease, not that nothing is using it, so a partner
+  // still alive after the grace period must keep its home.
+  assert.match(
+    src,
+    /if \(partnerExited\) \{\s*\n\s*releaseLeaseQuietly\(lease, log\);/,
+    "the release must be gated on the partner having exited"
+  );
+
+  // The failed-spawn shortcut probes TWICE across a settle: the tmux SERVER is a
+  // separate process from the client we ran, so a killed client's queued
+  // new-session can create the pane just after the call returns.
+  const leaseSrc = fs.readFileSync(
+    new URL("../src/runtime-lease.mjs", import.meta.url),
+    "utf-8"
+  );
+  const settled = leaseSrc.match(/sleepSync\(SPAWN_SETTLE_MS\)/g) || [];
+  assert.equal(settled.length, 1, "the failed-spawn shortcut must settle before its second probe");
+  assert.equal(
+    (leaseSrc.match(/probeConsumer\(record\.value\.consumer \?\? \{\}\) === "absent"/g) || []).length,
+    2,
+    "and must probe on both sides of that settle"
   );
 
   const headless = fs.readFileSync(
