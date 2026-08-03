@@ -491,16 +491,21 @@ export function buildInvocationFromAdapter(adapter, options) {
   return {
     command: options.partnerCommand || adapter.binary.default,
     args,
-    // Sentinel last: nothing an adapter declares may override the recursion
-    // guard, since that is the one protection every partner depends on.
-    // Contained relocations merge LAST, after every settings map.
+    // MERGE ORDER IS A SECURITY PROPERTY HERE. Least-proven first, so every
+    // value merged later is one whose location was established:
     //
-    // The schema rejects a key declared in two overlay maps, so this should be
-    // unreachable -- but it is the layer that held when that check had a gap:
-    // a top-level `dirs` entry and a `configIsolation.extraEnv` entry sharing a
-    // name resolved to whichever merged later, and `staticEnv` merging first
-    // meant the UNCONTAINED settings value won over the proven one. Ordering it
-    // this way makes the safe value the last word regardless.
+    //   staticEnv             settings, plus this adapter's own relocations
+    //   isolationEnv          configIsolation's settings, then ITS relocations
+    //   containedRelocations  the adapter's relocations again, now last
+    //   partnerSentinelEnv    the recursion guard, which nothing may override
+    //
+    // The third entry looks redundant and is not. The schema rejects a key
+    // declared in two overlay maps, but that check had a gap: a top-level `dirs`
+    // entry and a `configIsolation.extraEnv` entry sharing a name resolved to
+    // whichever merged later, and staticEnv merging first meant the UNCONTAINED
+    // settings value won over the proven one. Re-applying the proven values here
+    // makes the safe value the last word even if a fifth map is added later and
+    // the collision check is not extended to cover it.
     env: {
       ...staticEnv(adapter, ctx),
       ...isolationEnv,

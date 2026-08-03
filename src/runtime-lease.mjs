@@ -333,9 +333,9 @@ export function proveLeaseReleasable(meta, { now = Date.now() } = {}) {
     // absent", deleted the lease with its freshly seeded credentials, and left
     // the partner launching against a home that no longer existed.
     //
-    // So a spawning lease additionally requires its OWNER to be gone. A live
-    // runner mid-spawn keeps it; a dead runner that never reached `active` means
-    // nothing is coming.
+    // So a spawning lease additionally requires its OWNER to be gone -- and
+    // then one more thing, because the owner is not the only process that can
+    // still create the pane. See below.
     if (state === "spawning") {
       const owner = probeOwner(meta);
       if (owner === "alive") {
