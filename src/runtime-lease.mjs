@@ -183,6 +183,13 @@ export function allocateLease({ sessionId, turnId, agent, engine, turnDir, runne
   const root = runtimeDir();
   assertManagedRootPath(root, { fn: "allocateLease", label: "runtime root" });
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  // Re-prove the root AFTER creating it. The check above and this mkdir are two
+  // syscalls, and `recursive: true` follows whatever it finds -- so a root
+  // swapped for a symlink in between would already have been followed. Node
+  // exposes no openat/O_NOFOLLOW, so the window cannot be closed outright; this
+  // makes it detectable before anything is written INTO the root, which is the
+  // part that matters. Every later write re-checks through assertManagedLeasePath.
+  assertManagedRootPath(root, { fn: "allocateLease", label: "runtime root" });
   // mkdir's mode is masked by the umask, so an existing or freshly created root
   // can still be group/world readable. Say it explicitly.
   try {

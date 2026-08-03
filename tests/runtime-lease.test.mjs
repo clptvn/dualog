@@ -402,6 +402,78 @@ test("a symlinked managed ROOT is refused, not just a symlinked leaf", () => {
   assert.equal(results.at(-1).victimSurvives, true, "the link target is never touched");
 });
 
+test("allocation refuses a symlinked runtime root, before and after its mkdir", () => {
+  // allocateLease() mkdirs the root itself with `recursive: true`, which follows
+  // whatever it finds -- so the per-path assertions could not have protected it.
+  // Validated before the mkdir, and again after: those are two syscalls, and a
+  // root swapped in between would already have been followed. Node exposes no
+  // openat/O_NOFOLLOW, so the second check makes the swap detectable before
+  // anything is written INTO the root rather than closing the window outright.
+  const script = `
+    const os = require("node:os"), fs = require("node:fs"), path = require("node:path");
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-alloclink-"));
+    const victim = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-allocvictim-"));
+    process.env.HOME = home; process.env.USERPROFILE = home;
+    process.env.HOMEDRIVE = ""; process.env.HOMEPATH = home;
+    // The link goes at .dualog, NOT at .dualog/runtime, so that the
+    // \`recursive: true\` mkdir would actually CREATE runtime/ inside the target.
+    // Linking the leaf directly makes the mkdir a no-op and the test then passes
+    // whether or not the pre-check exists.
+    fs.symlinkSync(victim, path.join(home, ".dualog"));
+    const turnDir = path.join(os.tmpdir(), "dualog-alloc-turn-" + process.pid);
+    fs.mkdirSync(turnDir, { recursive: true });
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      let refused = false, message = null;
+      try {
+        m.allocateLease({ sessionId: "dialog-x-0000", turnId: "t1", agent: "codex", turnDir });
+      } catch (err) { refused = true; message = err.message.split("\\n")[0]; }
+      console.log(JSON.stringify({
+        refused,
+        message,
+        victimIsEmpty: fs.readdirSync(victim).length === 0,
+      }));
+    });
+  `;
+  const out = JSON.parse(execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim());
+  assert.equal(out.refused, true, "a symlinked runtime root must refuse allocation");
+  assert.match(out.message, /symbolic link/);
+  assert.equal(out.victimIsEmpty, true, "and nothing may be created in the link target");
+});
+
+test("the sweep refuses to enumerate a symlinked runtime root", () => {
+  // The sweep DELETES directory trees. Following a linked root would let it
+  // reap whatever the link points at, judging each entry only by whether it
+  // looks like a lease -- so this is the most dangerous place the root check
+  // could have been missing.
+  const script = `
+    const os = require("node:os"), fs = require("node:fs"), path = require("node:path");
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-sweeplink-"));
+    const victim = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-sweepvictim-"));
+    process.env.HOME = home; process.env.USERPROFILE = home;
+    process.env.HOMEDRIVE = ""; process.env.HOMEPATH = home;
+    // A directory in the victim that looks exactly like a reapable lease.
+    const decoy = path.join(victim, "b".repeat(32));
+    fs.mkdirSync(decoy, { recursive: true });
+    fs.writeFileSync(path.join(decoy, "lease.json"), JSON.stringify({
+      schema_version: 1, state: "active", consumer: { kind: "headless", pid: 999999, pgid: 999999 },
+    }));
+    fs.mkdirSync(path.join(home, ".dualog"), { recursive: true });
+    fs.symlinkSync(victim, path.join(home, ".dualog", "runtime"));
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const receipt = m.sweepLeases({ apply: true });
+      console.log(JSON.stringify({
+        removed: receipt.removed.length,
+        errors: receipt.errors.map((e) => e.error.split("\\n")[0]),
+        decoySurvives: fs.existsSync(decoy),
+      }));
+    });
+  `;
+  const out = JSON.parse(execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim());
+  assert.equal(out.removed, 0, "a linked root must yield no removals");
+  assert.equal(out.decoySurvives, true, "and nothing behind the link may be deleted");
+  assert.match(out.errors.join(" "), /symbolic link/);
+});
+
 test("boot identity reports unavailable rather than throwing", () => {
   // FOUND IN REVIEW, on a restricted host: os.uptime() raises
   // `uv_uptime returned EPERM` rather than returning something unusable, and it
