@@ -370,6 +370,37 @@ test("a settings map may not carry a location-shaped value", () => {
   }
 });
 
+test("path shapes and variable names are not assumed to be POSIX or upper-case", () => {
+  // A manifest is DATA and can come from anywhere, so the heuristic cannot
+  // assume the platform it was written for. Two concrete gaps: the value check
+  // recognised only POSIX shapes, and the name check was case-sensitive -- but
+  // environment variable names are case-INSENSITIVE on Windows, so `Path` is
+  // `PATH` there and slipped through under a different spelling.
+  for (const value of ["C:\\outside", "c:/outside", "..\\outside", ".\\rel", "\\\\server\\share", "\\rooted"]) {
+    assert.throws(
+      () => parseManifest(baseManifest({ env: { FAKE_SETTING: value } }), "/f.json"),
+      /describes a filesystem location/,
+      `${value} must be refused`
+    );
+  }
+
+  for (const key of ["Path", "path", "Home", "Xdg_Data_Home", "kubeconfig"]) {
+    assert.throws(
+      () => parseManifest(baseManifest({ env: { [key]: "1" } }), "/f.json"),
+      /names a filesystem location/,
+      `${key} must be refused whatever its case`
+    );
+  }
+
+  // And the counterweight, so widening the rule did not swallow real settings.
+  assert.doesNotThrow(() =>
+    parseManifest(
+      baseManifest({ env: { GOOSE_MODE: "auto", FAKE_URL: "https://example.com/v1" } }),
+      "/f.json"
+    )
+  );
+});
+
 test("the settings every built-in actually declares still validate", () => {
   // The counterweight. A rule that rejected these would have made the split
   // unshippable, and each of these is a real entry from a real manifest.
@@ -389,6 +420,50 @@ test("the settings every built-in actually declares still validate", () => {
   assert.doesNotThrow(() =>
     parseManifest(baseManifest({ env: { FAKE_BASE_URL: "https://example.com/v1" } }), "/f.json")
   );
+});
+
+test("every location in the invocation context is classified", async () => {
+  // THIS CLASS OF BUG HAS HAPPENED TWICE. `scratchDir` was added to the context
+  // by the lease work and `mcpConfigPath` by MCP suppression, and neither was
+  // added to the location list -- so a settings entry built from either rendered
+  // to a real path outside the lease and was handed to the partner uncontained.
+  //
+  // Restating the list by hand is what failed. This walks the LIVE context and
+  // requires every key to be classified one way or the other, so the next key
+  // added fails here until someone decides which it is.
+  const { resolveContext } = await import("../src/adapters/argv.mjs");
+  const { LOCATION_CONTEXT_KEYS } = await import("../src/adapters/schema.mjs");
+
+  // Values that are not filesystem locations. Anything not here must be.
+  const NOT_LOCATIONS = new Set([
+    "sessionName",
+    "model",
+    "reasoningEffort",
+    "reasoningEffortJson",
+    "initialPrompt",
+    "toolProfile",
+    "toolProfileAllowedTools",
+    "toolProfileDisallowedTools",
+  ]);
+
+  const { ctx } = resolveContext(parseManifest(baseManifest(), "/f.json"), {
+    projectPath: "/fixture/project",
+    sessionDir: "/fixture/session",
+    scratchDir: "/fixture/lease",
+  });
+
+  const classified = new Set([...LOCATION_CONTEXT_KEYS, ...NOT_LOCATIONS]);
+  const unclassified = Object.keys(ctx).filter((key) => !classified.has(key));
+  assert.deepEqual(
+    unclassified,
+    [],
+    `unclassified invocation context keys: ${unclassified.join(", ")}. ` +
+      "Add each to LOCATION_CONTEXT_KEYS in schema.mjs if it names a file or " +
+      "directory, or to NOT_LOCATIONS here if it does not."
+  );
+
+  // And `isolatedDir`, which prepareConfigIsolation adds later, is covered too.
+  assert.ok(LOCATION_CONTEXT_KEYS.includes("isolatedDir"));
 });
 
 test("a variable cannot be both a relocation and a setting", () => {

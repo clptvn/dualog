@@ -57,7 +57,35 @@ import { probeGroup, probeProcess } from "./process-probe.mjs";
 import { probeTmuxSessionSync } from "./tmux-runtime.mjs";
 
 const LEASE_SCHEMA_VERSION = 1;
-const META_FILE = "lease.json";
+/**
+ * The lease record lives BESIDE the lease directory, not inside it.
+ *
+ * `<runtime>/<id>/` is the partner's; `<runtime>/<id>.lease.json` is ours. That
+ * separation is the whole point: a partner that outlived its pane recreated
+ * `$CODEX_HOME` after the lease was removed, and with the record inside the
+ * directory that recreation produced something with no metadata at all -- which
+ * no rule could classify, so nothing could reclaim it and ownership and age had
+ * to stand in for a consumer proof. A record the consumer cannot reach means
+ * there is always a real identity to probe.
+ *
+ * `LEGACY_META_FILE` is still read so leases created before this layout remain
+ * judgeable rather than becoming unattributable by the upgrade itself.
+ */
+function metaPathFor(dir) {
+  return `${dir}.lease.json`;
+}
+const LEGACY_META_FILE = "lease.json";
+
+/**
+ * Read a lease record, preferring the sibling and falling back to the legacy
+ * in-directory copy.
+ */
+function readLeaseRecord(dir) {
+  const sibling = readJson(metaPathFor(dir));
+  if (sibling.state !== "missing") return { ...sibling, metaPath: metaPathFor(dir) };
+  const legacy = readJson(path.join(dir, LEGACY_META_FILE));
+  return { ...legacy, metaPath: path.join(dir, LEGACY_META_FILE) };
+}
 /** The turn directory's only record of its lease: an opaque id, nothing else. */
 const POINTER_FILE = "runtime-lease.json";
 
@@ -171,18 +199,30 @@ function computeBootIdentity() {
  */
 export function isSameBoot(recorded, current = bootIdentity()) {
   if (!recorded || !current) return null;
-  if (recorded.host !== current.host) return false;
 
+  // ONLY TWO PRECISE IDENTITIES MAY ANSWER `false`.
+  //
+  // `false` is the verdict that authorizes deletion, and wall-clock arithmetic
+  // cannot support it: a suspend or an NTP step moves the derived epoch by an
+  // arbitrary amount, and a hostname can change on a DHCP lease without any
+  // reboot at all. Either would have read as "previous boot" and released a
+  // lease whose child was alive. An imprecise or mixed comparison is now `null`
+  // -- unknown, therefore retained -- which costs self-healing on hosts with no
+  // OS boot identity and never costs a live turn its credentials.
   if (recorded.precise === true && current.precise === true) {
+    if (recorded.host !== current.host) return false;
     return recorded.id === current.id;
   }
 
-  // Records written before this carried no `source`, so an absent one is the
-  // imprecise form rather than an unknown one.
+  // The wall-clock epoch is still compared, but only to answer `true`: two
+  // values close together are one boot, and two far apart establish nothing.
   const recordedEpoch = recorded.bootedAtEpoch;
   const currentEpoch = current.bootedAtEpoch;
   if (!Number.isFinite(recordedEpoch) || !Number.isFinite(currentEpoch)) return null;
-  return Math.abs(recordedEpoch - currentEpoch) <= IMPRECISE_BOOT_TOLERANCE_SECONDS;
+  if (recorded.host !== current.host) return null;
+  const sameWindow =
+    Math.abs(recordedEpoch - currentEpoch) <= IMPRECISE_BOOT_TOLERANCE_SECONDS;
+  return sameWindow ? true : null;
 }
 
 function writeJsonExclusive(file, value) {
@@ -291,7 +331,7 @@ export function allocateLease({ sessionId, turnId, agent, engine, turnDir, runne
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
-  writeJsonAtomic(path.join(dir, META_FILE), meta);
+  writeJsonAtomic(metaPathFor(dir), meta);
 
   // The pointer is the durable side's ONLY knowledge of the lease. Everything
   // needed to reap it lives in the lease's own metadata, so a deleted session
@@ -302,9 +342,15 @@ export function allocateLease({ sessionId, turnId, agent, engine, turnDir, runne
       lease_id: id,
     });
   } catch (err) {
-    // Roll the lease back: it has no secrets yet and nothing points at it.
+    // Roll the lease back: it has no secrets yet and nothing points at it. BOTH
+    // halves go -- the record lives beside the directory now, so removing only
+    // the directory would leave an orphan record describing a lease that never
+    // existed.
     try {
       fs.rmSync(dir, { recursive: true, force: true });
+    } catch {}
+    try {
+      fs.unlinkSync(metaPathFor(dir));
     } catch {}
     throw new Error(
       `allocateLease: could not record the lease pointer in ${turnDir} (${err.code || err.message}). ` +
@@ -315,7 +361,7 @@ export function allocateLease({ sessionId, turnId, agent, engine, turnDir, runne
   // `owned` marks a handle this process created, which is authority that
   // survives the metadata becoming unreadable. Deliberately not persisted: it is
   // a fact about this process, and a flag on disk would let any reader claim it.
-  return { id, dir, metaPath: path.join(dir, META_FILE), turnDir, owned: true };
+  return { id, dir, metaPath: metaPathFor(dir), turnDir, owned: true };
 }
 
 /** Advance a lease's state, optionally recording its consumer's identity. */
@@ -323,8 +369,8 @@ export function transitionLease(lease, state, { consumer = undefined } = {}) {
   if (!LEASE_STATES.includes(state)) {
     throw new Error(`transitionLease: ${JSON.stringify(state)} is not a lease state`);
   }
-  const metaPath = lease.metaPath ?? path.join(lease.dir, META_FILE);
-  const record = readJson(metaPath);
+  const record = readLeaseRecord(lease.dir);
+  const metaPath = record.metaPath;
   if (record.state !== "valid") {
     throw new Error(`transitionLease: ${metaPath} is unreadable (${record.reason ?? record.state})`);
   }
@@ -591,23 +637,17 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
   const dir = lease?.dir;
   if (!dir || !fs.existsSync(dir)) return { released: false, reason: "lease directory is already gone" };
 
-  const metaPath = lease.metaPath ?? path.join(dir, META_FILE);
-  const record = readJson(metaPath);
+  const record = readLeaseRecord(dir);
+  const metaPath = record.metaPath;
   if (record.state !== "valid") {
-    // NO METADATA, AND WE ARE THE OWNER. Observed in production: a partner CLI
-    // outlived its own tmux pane, and after the lease was removed it recreated
-    // `$CODEX_HOME` to flush a models cache -- leaving a directory with a valid
-    // lease name, mode 0755, and no metadata. releaseLease() then reported
-    // "lease metadata is unreadable" and retained it, and sweepLeases() retains
-    // an unreadable lease forever, so nothing could ever reclaim it.
+    // UNREADABLE METADATA RETAINS, again.
     //
-    // A handle from allocateLease() in THIS process is proof of ownership that
-    // does not depend on the metadata being readable, which is exactly the case
-    // where the metadata is not. Anything else still refuses.
-    if (lease.owned === true) {
-      removeLeaseDirectory(dir);
-      return { released: true, reason: null };
-    }
+    // This used to fall back to `lease.owned === true` and delete anyway, which
+    // was ownership standing in for a consumer proof: it establishes that this
+    // process allocated the path, not that nothing is using what is there now.
+    // The reason it was needed has been removed instead -- the record lives
+    // beside the directory rather than inside it, so a partner recreating its
+    // home can no longer destroy the evidence needed to judge it.
     return { released: false, reason: record.reason ?? `lease metadata is ${record.state}` };
   }
 
@@ -644,26 +684,50 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
       (sleepSync(SPAWN_SETTLE_MS),
       probeConsumer(record.value.consumer ?? {}) === "absent");
     if (preSpawn || failedSpawn) {
-      removeLeaseDirectory(dir);
-      return { released: true, reason: null };
+      return finishRelease(dir, metaPath, record.value);
     }
   }
 
   // A caller that has just PROVEN the consumer absent -- the turn loop watching
   // its own tmux pane die -- knows something the metadata cannot express yet.
   if (consumerAbsent === true && record.state === "valid") {
-    try {
-      transitionLease({ dir, metaPath }, "released");
-    } catch {
-      // Metadata is advisory at this point; the proof came from the caller.
-    }
-    removeLeaseDirectory(dir);
-    return { released: true, reason: null };
+    return finishRelease(dir, metaPath, record.value);
   }
 
   const verdict = proveLeaseReleasable(record.value);
   if (!verdict.removable) return { released: false, reason: verdict.reason };
+  return finishRelease(dir, metaPath, record.value);
+}
+
+/**
+ * Remove a released lease's directory and leave a TOMBSTONE in its place.
+ *
+ * The record outlives the directory deliberately. If a partner that was proven
+ * gone nonetheless recreates its home afterwards, the recreated directory is
+ * still attributable -- the tombstone says this lease was released, and when --
+ * so the sweep can reclaim it on evidence rather than on age or ownership. Every
+ * previous attempt to handle that case had to guess, because the only record of
+ * what the directory was lived inside the directory.
+ */
+function finishRelease(dir, metaPath, meta) {
   removeLeaseDirectory(dir);
+  try {
+    writeJsonAtomic(metaPathFor(dir), {
+      ...meta,
+      state: "released",
+      consumer: meta.consumer ?? null,
+      released_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    // A legacy in-directory record went with the directory; nothing to clean.
+    if (metaPath !== metaPathFor(dir)) {
+      try {
+        fs.unlinkSync(metaPath);
+      } catch {}
+    }
+  } catch {
+    // A tombstone we cannot write costs attributability later, never safety now.
+  }
   return { released: true, reason: null };
 }
 
@@ -671,8 +735,8 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
 export function readLease(leaseId) {
   if (!isValidLeaseId(leaseId)) return null;
   const dir = leaseDir(leaseId);
-  const metaPath = path.join(dir, META_FILE);
-  const record = readJson(metaPath);
+  const record = readLeaseRecord(dir);
+  const metaPath = record.metaPath;
   if (record.state !== "valid") return null;
   return { id: leaseId, dir, metaPath, meta: record.value };
 }
@@ -775,6 +839,28 @@ export function sweepLeases({
 
   for (const entry of entries) {
     const dir = path.join(root, entry.name);
+    if (entry.isFile() && entry.name.endsWith(".lease.json")) {
+      // A record, not a lease. Reap it once the directory it described is gone
+      // and it has been released long enough that no recreation is coming --
+      // this is file housekeeping, so age is the right measure here, unlike for
+      // anything holding credentials.
+      const owner = path.join(root, entry.name.slice(0, -".lease.json".length));
+      if (fs.existsSync(owner)) continue;
+      const held = readJson(path.join(root, entry.name));
+      const releasedAt = held.state === "valid" ? Date.parse(held.value.released_at ?? "") : NaN;
+      if (!Number.isFinite(releasedAt) || now - releasedAt < unattributableMaxAgeMs) continue;
+      if (!apply) {
+        receipt.removed.push({ dir, applied: false, reason: "spent lease record" });
+        continue;
+      }
+      try {
+        fs.unlinkSync(path.join(root, entry.name));
+        receipt.removed.push({ dir, applied: true, reason: "spent lease record" });
+      } catch (err) {
+        receipt.errors.push({ path: dir, error: err.message });
+      }
+      continue;
+    }
     if (!entry.isDirectory() || entry.isSymbolicLink()) {
       receipt.retained.push({ dir, reason: "not a plain directory" });
       continue;
@@ -783,42 +869,51 @@ export function sweepLeases({
       receipt.retained.push({ dir, reason: "name is not a lease id" });
       continue;
     }
-    const record = readJson(path.join(dir, META_FILE));
+    const record = readLeaseRecord(dir);
     if (record.state !== "valid") {
-      // AN UNATTRIBUTABLE DIRECTORY NEEDS AN EXPIRY, or "retain what you cannot
-      // classify" becomes "accumulate forever".
+      // UNATTRIBUTABLE MEANS RETAIN. No age heuristic, no ownership shortcut.
       //
-      // This is not hypothetical: a partner CLI that outlived its pane recreated
-      // its home after the lease was released, producing a directory with a
-      // valid lease name and no metadata. Nothing could then reclaim it, because
-      // every rule here keys off metadata that does not exist.
+      // Both of those were substitutes for a consumer proof, and both were
+      // reachable while a consumer was alive: an idle process can hold a
+      // directory open for a day without touching a file, and ownership says
+      // only that this process once allocated the path. What made them tempting
+      // was that the record lived INSIDE the directory, so a partner recreating
+      // its home destroyed the only evidence. It lives beside the directory now,
+      // and a released lease leaves a tombstone, so the recreated-home case is
+      // handled below on evidence rather than guessed at here.
+      receipt.retained.push({ dir, reason: record.reason ?? `metadata is ${record.state}` });
+      continue;
+    }
+    if (record.value.state === "released") {
+      // A TOMBSTONE with a directory still present: the lease was released after
+      // its consumer was proven gone, and something recreated the directory
+      // afterwards. Reclaimable on that record rather than on age -- this is the
+      // production case, now attributable.
       //
-      // Age is the only evidence available. The threshold is long enough that no
-      // live turn can reach it -- a turn holding a lease this old has been
-      // running for a day -- and metadata is written immediately after the mkdir,
-      // so a directory that has none for that long is not a lease being set up.
-      // `null` age means the directory could not be stat'd -- it vanished
-      // between readdir and here, or the filesystem reports no usable times. It
-      // is folded into the retaining branch rather than given its own: both
-      // answers are "not old enough to be sure", and the unsafe direction would
-      // be to treat an unknown age as expired. Reachable only through a
-      // filesystem race, so no test drives it; the `||` is what keeps the
-      // conservative direction from depending on that.
-      const age = msSinceLastActivity(dir, now);
-      if (age == null || age < unattributableMaxAgeMs) {
-        receipt.retained.push({
-          dir,
-          reason: `${record.reason ?? `metadata is ${record.state}`}; retained until nothing has touched it for ${Math.round(unattributableMaxAgeMs / 3600000)}h`,
-        });
-        continue;
+      // But the consumer is RE-PROBED first, because "was proven gone" is a
+      // statement about the past. If a spawn that was thought to have failed
+      // later succeeded -- a tmux client killed after handing `new-session` to
+      // the server -- the pane is alive and this directory is its home. The
+      // tombstone identifies what to check; it does not by itself authorize
+      // deletion.
+      const consumer = record.value.consumer;
+      if (hasUsableIdentity(consumer)) {
+        const verdict = probeConsumer(consumer);
+        if (verdict !== "absent") {
+          receipt.retained.push({
+            dir,
+            reason: `released, but its recorded consumer is ${verdict === "alive" ? "running again" : `unprobeable (${verdict})`}`,
+          });
+          continue;
+        }
       }
       if (!apply) {
-        receipt.removed.push({ dir, applied: false, reason: "unattributable and untouched past its age limit" });
+        receipt.removed.push({ dir, applied: false, reason: "recreated after the lease was released" });
         continue;
       }
       try {
         removeLeaseDirectory(dir);
-        receipt.removed.push({ dir, applied: true, reason: "unattributable and untouched past its age limit" });
+        receipt.removed.push({ dir, applied: true, reason: "recreated after the lease was released" });
       } catch (err) {
         receipt.errors.push({ path: dir, error: err.message });
       }

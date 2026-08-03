@@ -59,6 +59,36 @@ function meta(lease) {
   return JSON.parse(fs.readFileSync(lease.metaPath, "utf-8"));
 }
 
+/**
+ * A previous boot, expressed the only way that may authorize deletion.
+ *
+ * Wall-clock arithmetic is no longer allowed to answer "different boot": a
+ * suspend or an NTP step moves it, and that verdict releases leases. So a test
+ * that wants a previous boot has to produce a PRECISE identity with a different
+ * id, exactly as a real reboot would.
+ */
+function previousBoot() {
+  const current = bootIdentity();
+  if (!current?.precise) return null;
+  return { ...current, id: `${current.id}-previous` };
+}
+
+/**
+ * Only a host with a precise identity can express "a previous boot" at all.
+ *
+ * That is the design, not a test limitation: a mixed or wall-clock comparison
+ * resolves to `null`, so on such a host an identity-less lease is retained
+ * rather than healed. Cases that assert healing therefore have to establish
+ * precision first -- and this is not merely theoretical, because the sysctl
+ * probe can time out under a fully parallel test run, which is exactly how this
+ * suite first went intermittently red.
+ */
+function requirePreciseBoot(t) {
+  const boot = previousBoot();
+  if (!boot) t.skip("this host has no precise boot identity, so nothing can heal");
+  return boot;
+}
+
 /** A process that is genuinely alive for the duration of one test. */
 function liveProcess(t) {
   const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
@@ -186,6 +216,8 @@ test("a pre-spawn lease is removable only once its owner is gone", (t) => {
 });
 
 test("a lease mid-spawn is not mistaken for one whose consumer exited", (t) => {
+  const rebooted = requirePreciseBoot(t);
+  if (!rebooted) return;
   // FOUND IN REVIEW. The tmux identity is recorded BEFORE startTmuxSession(),
   // so between those two statements the session name is legitimately absent --
   // the pane does not exist YET. Reading that as "the consumer finished" let a
@@ -216,7 +248,7 @@ test("a lease mid-spawn is not mistaken for one whose consumer exited", (t) => {
     proveLeaseReleasable({
       ...spawning,
       runner_pid: 999999,
-      boot: { host: os.hostname(), bootedAtEpoch: 1 },
+      boot: rebooted,
     }).removable,
     true,
     "a previous boot's abandoned spawn is reclaimable"
@@ -338,7 +370,9 @@ test("a lease whose consumer is proven absent is removable", () => {
   );
 });
 
-test("a consumer record with no usable identity retains, and heals on reboot", () => {
+test("a consumer record with no usable identity retains, and heals on reboot", (t) => {
+  const rebooted = requirePreciseBoot(t);
+  if (!rebooted) return;
   // A record is written BEFORE the thing it describes exists, so "there is a
   // consumer object" and "there is something to probe" are different questions.
   // Conflating them left a kind-only headless record -- what the headless engine
@@ -359,7 +393,7 @@ test("a consumer record with no usable identity retains, and heals on reboot", (
       proveLeaseReleasable({
         state: "spawning",
         consumer,
-        boot: { host: os.hostname(), bootedAtEpoch: 1 },
+        boot: rebooted,
       }).removable,
       true,
       `${JSON.stringify(consumer)} must be reclaimable after a reboot`
@@ -367,7 +401,9 @@ test("a consumer record with no usable identity retains, and heals on reboot", (
   }
 });
 
-test("the identity-less spawning window retains on this boot and heals on the next", () => {
+test("the identity-less spawning window retains on this boot and heals on the next", (t) => {
+  const rebooted = requirePreciseBoot(t);
+  if (!rebooted) return;
   // There is no portable proof that spawn() did not happen, so a lease that
   // crashed here must be kept.
   const thisBoot = proveLeaseReleasable({ state: "spawning", consumer: null, boot: bootIdentity() });
@@ -376,18 +412,18 @@ test("the identity-less spawning window retains on this boot and heals on the ne
 
   // But nothing that lease started can outlive a reboot, which is what stops
   // conservative retention from being permanent.
-  const previousBoot = proveLeaseReleasable({
+  const afterReboot = proveLeaseReleasable({
     state: "spawning",
     consumer: null,
-    boot: { host: os.hostname(), bootedAtEpoch: 1 },
+    boot: rebooted,
   });
-  assert.equal(previousBoot.removable, true);
+  assert.equal(afterReboot.removable, true);
 
   // A lease from another machine is not ours to reason about at all.
   const otherHost = proveLeaseReleasable({
     state: "spawning",
     consumer: null,
-    boot: { host: "some-other-host", bootedAtEpoch: 1 },
+    boot: { host: "some-other-host", id: "boot-elsewhere", precise: true },
   });
   assert.equal(otherHost.removable, true, "another host's boot cannot be running our spawn");
 
@@ -400,7 +436,11 @@ test("the identity-less spawning window retains on this boot and heals on the ne
 test("boot identity is stable within one boot", () => {
   assert.equal(isSameBoot(bootIdentity()), true);
   assert.equal(isSameBoot(null), null);
-  assert.equal(isSameBoot({ host: os.hostname(), bootedAtEpoch: 1 }), false);
+  // A precise identity with a different id is a reboot. A wall-clock epoch far
+  // in the past is NOT -- it is equally consistent with a clock correction, and
+  // `false` is the verdict that deletes.
+  assert.equal(isSameBoot(previousBoot() ?? bootIdentity()), previousBoot() ? false : true);
+  assert.equal(isSameBoot({ host: os.hostname(), bootedAtEpoch: 1 }), null);
 });
 
 test("a state this version does not understand blocks", () => {
@@ -601,8 +641,15 @@ test("boot identity prefers what the OS tracks over wall-clock arithmetic", () =
   );
   assert.equal(
     isSameBoot({ host: identity.host, bootedAtEpoch: 1 }),
-    false,
-    "but a genuinely ancient record is a previous boot"
+    null,
+    "an ancient wall-clock epoch establishes nothing; only a precise id may say 'reboot'"
+  );
+  if (identity.precise) assert.equal(isSameBoot(previousBoot()), false, "a precise mismatch does say it");
+
+  // A hostname change without a reboot -- a DHCP lease -- must not read as one.
+  assert.equal(
+    isSameBoot({ host: `${identity.host}-renamed`, bootedAtEpoch: identity.bootedAtEpoch }),
+    null
   );
 });
 
@@ -762,80 +809,127 @@ test("releasing a lease whose consumer is still live does nothing", () => {
   fs.rmSync(lease.dir, { recursive: true, force: true });
 });
 
-test("an owner can reclaim its lease after the metadata is gone", () => {
-  // FOUND IN PRODUCTION, during this change's own review. A partner CLI
-  // outlived its tmux pane; after the lease was released it recreated
-  // $CODEX_HOME to flush a models cache, leaving a directory with a valid lease
-  // name, mode 0755 and no metadata. releaseLease() reported "lease metadata is
-  // unreadable" and retained it -- and every rule in the sweep keys off metadata
-  // that no longer existed, so nothing could ever reclaim it.
+test("a lease record survives the partner recreating its home", () => {
+  // THE PRODUCTION INCIDENT, fixed structurally rather than worked around.
+  //
+  // A partner CLI outlived its tmux pane and, after the lease was released,
+  // recreated $CODEX_HOME to flush a models cache. With the record INSIDE the
+  // directory, that recreation produced something no rule could classify: the
+  // metadata was gone, so releaseLease() reported "unreadable" and the sweep
+  // retained it forever. Two substitutes were tried -- ownership, then age --
+  // and both were guesses standing in for a consumer proof.
+  //
+  // The record lives BESIDE the directory now, so the partner cannot reach it.
   const lease = newLease();
-  transitionLease(lease, "projecting");
-  fs.mkdirSync(path.join(lease.dir, "codex-home"), { recursive: true });
-  fs.writeFileSync(path.join(lease.dir, "codex-home", "auth.json"), '{"token":"x"}');
-  fs.rmSync(lease.metaPath, { force: true });
+  transitionLease(lease, "active", {
+    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+  });
+  assert.equal(path.dirname(lease.metaPath), path.resolve(runtimeDir()));
+  assert.equal(fs.existsSync(path.join(lease.dir, "lease.json")), false, "nothing inside the lease");
 
-  const { released } = releaseLease(lease);
-  assert.equal(released, true, "a handle from allocateLease is ownership the metadata cannot revoke");
+  assert.equal(releaseLease(lease).released, true);
   assert.equal(fs.existsSync(lease.dir), false);
 
-  // But ONLY for a handle this process created. A directory someone merely
-  // points at, with no readable metadata, is not reclaimable on request.
-  const stranger = newLease();
-  fs.rmSync(stranger.metaPath, { force: true });
-  const refused = releaseLease({ dir: stranger.dir, metaPath: stranger.metaPath });
-  assert.equal(refused.released, false);
-  assert.match(refused.reason, /metadata is/);
-  fs.rmSync(stranger.dir, { recursive: true, force: true });
+  // A TOMBSTONE remains, so what the directory was is still knowable.
+  const tombstone = JSON.parse(fs.readFileSync(lease.metaPath, "utf-8"));
+  assert.equal(tombstone.state, "released");
+  assert.ok(tombstone.released_at);
+
+  // Now the partner recreates its home, exactly as codex did.
+  fs.mkdirSync(path.join(lease.dir, "codex-home"), { recursive: true });
+  fs.writeFileSync(path.join(lease.dir, "codex-home", "models_cache.json"), "{}");
+
+  // Reclaimed on the record, not on age and not on ownership.
+  const receipt = sweepLeases({ apply: true });
+  const removed = receipt.removed.find((r) => r.dir === lease.dir);
+  assert.ok(removed, "a recreated home must be reclaimable");
+  assert.match(removed.reason, /recreated after the lease was released/);
+  assert.equal(fs.existsSync(lease.dir), false);
 });
 
-test("an unattributable directory expires rather than accumulating forever", () => {
-  // "Retain what you cannot classify" is right until it has no expiry. The
-  // production orphan above had no metadata by construction, so no probe could
-  // ever classify it, and it would have sat in the runtime root permanently.
+test("a tombstone identifies what to check; it does not authorize deletion", (t) => {
+  // "Was proven gone" is a statement about the PAST. A spawn believed to have
+  // failed can still succeed -- a tmux client killed after handing new-session
+  // to the server -- so the pane may be alive and this directory may be its
+  // home. The record says what to probe; the probe decides.
+  const lease = newLease();
+  transitionLease(lease, "active", {
+    consumer: { kind: "headless", pid: process.pid, pgid: process.pid },
+  });
+  // Write the tombstone by hand: releaseLease would (correctly) refuse, since
+  // the consumer is this very process.
+  fs.writeFileSync(
+    lease.metaPath,
+    JSON.stringify({
+      schema_version: 1,
+      lease_id: lease.id,
+      state: "released",
+      released_at: new Date().toISOString(),
+      consumer: { kind: "headless", pid: process.pid, pgid: process.pid },
+    })
+  );
+
+  const receipt = sweepLeases({ apply: true });
+  const retained = receipt.retained.find((r) => r.dir === lease.dir);
+  assert.ok(retained, "a released record whose consumer is alive must retain");
+  assert.match(retained.reason, /running again/);
+  assert.equal(fs.existsSync(lease.dir), true);
+
+  fs.rmSync(lease.dir, { recursive: true, force: true });
+  fs.rmSync(lease.metaPath, { force: true });
+});
+
+test("unreadable metadata retains, with no ownership shortcut", () => {
+  // The counterweight to the above: ownership establishes that this process
+  // allocated the path, never that nothing is using what is there now.
+  const lease = newLease();
+  fs.rmSync(lease.metaPath, { force: true });
+  const refused = releaseLease(lease);
+  assert.equal(refused.released, false, "an owned handle is not a consumer proof");
+  assert.match(refused.reason, /metadata is/);
+  assert.equal(fs.existsSync(lease.dir), true);
+  fs.rmSync(lease.dir, { recursive: true, force: true });
+});
+
+test("an unattributable directory is retained, not aged out", () => {
+  // Both previous designs reclaimed these -- first on ownership, then after 24h
+  // of inactivity. Both were reachable while a consumer was alive: an idle
+  // process can hold a directory for a day without touching a file. With the
+  // record beside the directory and a tombstone left on release, the case that
+  // produced unattributable directories is handled on evidence, so this can go
+  // back to the rule the rest of the module follows -- what cannot be classified
+  // is kept.
   const orphan = path.join(runtimeDir(), "d".repeat(32));
   fs.mkdirSync(path.join(orphan, "codex-home"), { recursive: true });
 
-  // Young: retained, and the receipt says what it is waiting for.
-  const young = sweepLeases({ apply: true });
-  const retained = young.retained.find((r) => r.dir === orphan);
-  assert.ok(retained, "a fresh unattributable directory must be retained");
-  assert.match(retained.reason, /retained until nothing has touched it for 24h/);
-  assert.equal(fs.existsSync(orphan), true);
+  for (const now of [Date.now(), Date.now() + 30 * 24 * 60 * 60 * 1000]) {
+    const receipt = sweepLeases({ apply: true, now });
+    assert.ok(
+      receipt.retained.some((r) => r.dir === orphan),
+      "an unattributable directory must be retained however old it is"
+    );
+    assert.equal(fs.existsSync(orphan), true);
+  }
+  fs.rmSync(orphan, { recursive: true, force: true });
+});
 
-  // Old enough: reclaimed. Driven by injecting `now` rather than by touching
-  // timestamps, so the test states the rule rather than the filesystem's.
+test("a spent lease record is eventually reaped, once its directory is gone", () => {
+  // Tombstones are metadata, not credentials, so age IS the right measure for
+  // them -- otherwise the runtime root fills with records of turns long past.
+  const lease = newLease();
+  transitionLease(lease, "active", {
+    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+  });
+  assert.equal(releaseLease(lease).released, true);
+  assert.equal(fs.existsSync(lease.metaPath), true, "the tombstone outlives the directory");
+
+  // Not while it is fresh: a recreation may still be coming.
+  sweepLeases({ apply: true });
+  assert.equal(fs.existsSync(lease.metaPath), true);
+
   const later = Date.now() + 25 * 60 * 60 * 1000;
-  const dry = sweepLeases({ now: later });
-  assert.ok(dry.removed.some((r) => r.dir === orphan && r.applied === false));
-  assert.equal(fs.existsSync(orphan), true, "a dry run still changes nothing");
-
-  // BUT a live writer inside it must reset that clock. The window exists for a
-  // partner that outlived its pane and is writing into a home it recreated;
-  // measuring the directory's own creation time would have reclaimed it out from
-  // under exactly that process.
-  const active = path.join(runtimeDir(), "e".repeat(32));
-  fs.mkdirSync(path.join(active, "codex-home"), { recursive: true });
-  const written = path.join(active, "codex-home", "models_cache.json");
-  fs.writeFileSync(written, "{}");
-  // Touched as of the evaluation time. `now` is injected 25h ahead, so a file
-  // written at real-now would read as 25h stale; the point being tested is what
-  // happens when something writes WHILE the sweep considers the directory.
-  const asOf = new Date(later);
-  fs.utimesSync(written, asOf, asOf);
-  // A dry run: applying here would reclaim the orphan too, and the last
-  // assertion below still needs it present.
-  const stillWriting = sweepLeases({ now: later });
-  assert.ok(
-    stillWriting.retained.some((r) => r.dir === active),
-    "a tree touched recently must be retained however old the directory is"
-  );
-  assert.equal(fs.existsSync(active), true);
-  fs.rmSync(active, { recursive: true, force: true });
-
-  const applied = sweepLeases({ apply: true, now: later });
-  assert.ok(applied.removed.some((r) => r.dir === orphan && r.applied === true));
-  assert.equal(fs.existsSync(orphan), false);
+  sweepLeases({ apply: true, now: later });
+  assert.equal(fs.existsSync(lease.metaPath), false, "and is reaped once nothing can reference it");
 });
 
 // --- the sweep -----------------------------------------------------------------

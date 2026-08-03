@@ -107,7 +107,10 @@ const KNOWN_PATH_VARIABLES = new Set([
  * in that threat model, but it is stated rather than papered over.
  */
 export function isPathVariableName(name) {
-  const key = String(name);
+  // CASE-INSENSITIVE, because environment variable names are on Windows: `Path`
+  // and `PATH` are the same variable there, so a case-sensitive check let the
+  // most obvious location variable of all through under a different spelling.
+  const key = String(name).toUpperCase();
   if (SETTING_NAME_EXCEPTIONS.has(key)) return false;
   if (KNOWN_PATH_VARIABLES.has(key)) return true;
   return PATH_VARIABLE_NAME.test(key);
@@ -129,19 +132,37 @@ export function isPathVariableName(name) {
 // Introduced by adding scratchDir to the context without revisiting this list --
 // which is the argument for deriving it from the context keys rather than
 // restating them.
-const LOCATION_CONTEXT_KEYS = [
+export const LOCATION_CONTEXT_KEYS = [
   "scratchDir",
   "sessionDir",
   "home",
   "projectPath",
   "configHome",
   "isolatedDir",
+  // Added after `mcpConfigPath` was found missing the same way `scratchDir` was:
+  // it is populated by applyMcpSuppression before argv rendering, so a settings
+  // entry built from it -- `{{mcpConfigPath}}/../../../../.codex` -- rendered to
+  // a real path outside the lease. Every context value that names a FILE or
+  // DIRECTORY belongs here; a test walks the live invocation context and fails
+  // if one appears that this list does not know about.
+  "mcpConfigPath",
 ];
 const LOCATION_TEMPLATE = new RegExp(`\\{\\{(${LOCATION_CONTEXT_KEYS.join("|")})\\}\\}`);
 
+/**
+ * Path shapes, not just POSIX ones.
+ *
+ * `/^[~/]/` and `/^\.\.?\//` describe one platform. A manifest is data and can
+ * come from anywhere, so `C:\outside`, `..\outside` and `\\server\share` have to
+ * read as locations too -- on Windows they are exactly that, and on POSIX they
+ * are still not something a legitimate scalar setting looks like.
+ */
+const PATH_SHAPED_VALUE =
+  /^[~/]|^\.\.?[/\\]|^[A-Za-z]:[/\\]|^\\\\|^\\/;
+
 export function looksLikeLocation(template) {
   const text = String(template);
-  return LOCATION_TEMPLATE.test(text) || /^[~/]/.test(text) || /^\.\.?\//.test(text);
+  return LOCATION_TEMPLATE.test(text) || PATH_SHAPED_VALUE.test(text);
 }
 
 /**
