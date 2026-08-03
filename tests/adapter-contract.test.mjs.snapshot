@@ -8,7 +8,7 @@ exports[`argv for every adapter and engine 1`] = `
       "--allowedTools",
       "Read,Grep,Glob,Bash,LSP",
       "--mcp-config",
-      "<SESSION_DIR>/claude-empty-mcp.json",
+      "<SCRATCH_DIR>/claude-empty-mcp.json",
       "--strict-mcp-config",
       "--add-dir",
       "/fixture/project",
@@ -49,7 +49,7 @@ exports[`argv for every adapter and engine 1`] = `
       "Completion protocol is mandatory: write result.md then done.json"
     ],
     "env": {
-      "CODEX_HOME": "<SESSION_DIR>/codex-home",
+      "CODEX_HOME": "<SCRATCH_DIR>/codex-home",
       "DUALOG_ROLE": "partner",
       "DUALOG_DEPTH": "1"
     }
@@ -88,7 +88,7 @@ exports[`argv for every adapter and engine 1`] = `
       "GOOSE_MODE": "auto",
       "GOOSE_THINKING_EFFORT": "off",
       "GOOSE_DISABLE_KEYRING": "1",
-      "GOOSE_PATH_ROOT": "<SESSION_DIR>/goose-root",
+      "GOOSE_PATH_ROOT": "<SCRATCH_DIR>/goose-root",
       "DUALOG_ROLE": "partner",
       "DUALOG_DEPTH": "1"
     }
@@ -120,7 +120,7 @@ exports[`argv for every adapter and engine 1`] = `
       "GROK_CURSOR_MCPS_ENABLED": "0",
       "GROK_FOLDER_TRUST": "0",
       "GROK_DISABLE_AUTOUPDATER": "1",
-      "GROK_HOME": "<SESSION_DIR>/grok-home",
+      "GROK_HOME": "<SCRATCH_DIR>/grok-home",
       "DUALOG_ROLE": "partner",
       "DUALOG_DEPTH": "1"
     }
@@ -150,7 +150,7 @@ exports[`argv for every adapter and engine 1`] = `
       "GROK_CURSOR_MCPS_ENABLED": "0",
       "GROK_FOLDER_TRUST": "0",
       "GROK_DISABLE_AUTOUPDATER": "1",
-      "GROK_HOME": "<SESSION_DIR>/grok-home",
+      "GROK_HOME": "<SCRATCH_DIR>/grok-home",
       "DUALOG_ROLE": "partner",
       "DUALOG_DEPTH": "1"
     }
@@ -172,8 +172,8 @@ exports[`argv for every adapter and engine 1`] = `
     ],
     "env": {
       "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
-      "XDG_DATA_HOME": "<SESSION_DIR>/opencode-data",
-      "OPENCODE_CONFIG_DIR": "<SESSION_DIR>/opencode-config",
+      "XDG_DATA_HOME": "<SCRATCH_DIR>/opencode-data",
+      "OPENCODE_CONFIG_DIR": "<SCRATCH_DIR>/opencode-config",
       "DUALOG_ROLE": "partner",
       "DUALOG_DEPTH": "1"
     }
@@ -191,7 +191,7 @@ exports[`argv for every adapter and engine 1`] = `
       "Completion protocol is mandatory: write result.md then done.json"
     ],
     "env": {
-      "QWEN_HOME": "<SESSION_DIR>/qwen-home",
+      "QWEN_HOME": "<SCRATCH_DIR>/qwen-home",
       "DUALOG_ROLE": "partner",
       "DUALOG_DEPTH": "1"
     }

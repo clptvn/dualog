@@ -30,7 +30,7 @@
   "mcp": { "strategy": "flag" },
   "configIsolation": {
     "env": "GOOSE_PATH_ROOT",
-    "dir": "{{sessionDir}}/goose-root",
+    "dir": "{{scratchDir}}/goose-root",
     "extraEnv": { "GOOSE_DISABLE_KEYRING": "1" }
   },
   "env": { "GOOSE_MODE": "auto", "GOOSE_THINKING_EFFORT": "{{reasoningEffort}}" },

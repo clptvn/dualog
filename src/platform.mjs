@@ -27,6 +27,44 @@ export function legacyDialogsDir() {
 }
 
 /**
+ * The runtime root: disposable per-turn state, never an archive.
+ *
+ * A session directory is durable -- transcript, status, prompts, diagnostics --
+ * and config isolation quietly made it a partner CLI's live home as well, seeded
+ * with that CLI's real credentials. Nothing removed those, which is how 176
+ * credential copies and 12 GiB accumulated under directories whose whole purpose
+ * was to be kept.
+ *
+ * Separating the roots is what makes the lifetimes separable. Everything under
+ * here belongs to exactly one turn and is removable the moment that turn's
+ * process is proven gone; nothing under here is ever worth reading later.
+ */
+export function runtimeDir() {
+  return path.join(homeDir(), ".dualog", "runtime");
+}
+
+/**
+ * The only shape a lease id may have.
+ *
+ * Opaque and generated, never derived from a session id or a partner name. A
+ * lease directory is created with exclusive semantics under a root this module
+ * chooses, so the id needs no meaning -- and giving it none keeps a caller from
+ * constructing one that collides with another turn's.
+ */
+const LEASE_ID_PATTERN = /^[0-9a-f]{32}$/;
+
+export function isValidLeaseId(leaseId) {
+  return typeof leaseId === "string" && LEASE_ID_PATTERN.test(leaseId);
+}
+
+export function leaseDir(leaseId) {
+  if (!isValidLeaseId(leaseId)) {
+    throw new Error(`leaseDir: ${JSON.stringify(leaseId)} is not a valid lease id.`);
+  }
+  return path.join(runtimeDir(), leaseId);
+}
+
+/**
  * The only shape a session id may have.
  *
  * `\w` is [A-Za-z0-9_], so this admits no `.`, `/`, or `\` -- which is what
@@ -211,23 +249,85 @@ export function assertManagedSessionPath(sessionDir, candidate, { fn = "assertMa
   // /victim/repo` was accepted, and mkdirSync then created `codex-home` inside
   // the victim. Everything below this point is only as trustworthy as the
   // directory it is relative to.
-  let sessionStat;
+  assertRealDirectory(resolvedSession, fn, "session directory");
+  assertNoSymlinkComponents(resolvedSession, resolvedCandidate, fn);
+  return resolvedCandidate;
+}
+
+/**
+ * The container a candidate is measured against must be a real directory.
+ *
+ * Shared by both boundaries because the hole it closes was found in one and
+ * applies identically to the other: assertNoSymlinkComponents() walks DOWNWARD
+ * from the container, so it never inspects the container itself, and a symlink
+ * planted there is lexically a direct child of the managed root and passes every
+ * other check. Everything below such a directory resolves somewhere else.
+ */
+function assertRealDirectory(resolved, fn, label) {
+  let stat;
   try {
-    sessionStat = fs.lstatSync(resolvedSession);
+    stat = fs.lstatSync(resolved);
   } catch {
-    sessionStat = null; // not yet created: nothing to redirect through
+    return; // not yet created: nothing to redirect through
   }
-  if (sessionStat?.isSymbolicLink()) {
+  if (stat.isSymbolicLink()) {
     throw new Error(
-      `${fn}: refusing to use ${resolvedSession} because the session directory itself ` +
-        `is a symbolic link. Everything inside it would resolve somewhere else.`
+      `${fn}: refusing to use ${resolved} because the ${label} itself is a ` +
+        `symbolic link. Everything inside it would resolve somewhere else.`
     );
   }
-  if (sessionStat && !sessionStat.isDirectory()) {
-    throw new Error(`${fn}: refusing to use ${resolvedSession}; it is not a directory.`);
+  if (!stat.isDirectory()) {
+    throw new Error(`${fn}: refusing to use ${resolved}; it is not a directory.`);
+  }
+}
+
+/**
+ * Prove a path is inside a dualog-owned runtime lease before anything writes to it.
+ *
+ * The runtime counterpart of assertManagedSessionPath, and deliberately a
+ * separate function rather than a parameterized one: the two roots have
+ * different rules. A session may live under the legacy root and must survive; a
+ * lease is always freshly created under the current runtime root, so there is no
+ * legacy case to admit and the id grammar is exact rather than permissive.
+ *
+ * Both boundaries are checked for the same reason as sessions -- "inside the
+ * runtime root" alone still admits `{{scratchDir}}/../<other lease>`, which
+ * would let one turn write into another turn's credential projection.
+ */
+export function assertManagedLeasePath(leasePath, candidate, { fn = "assertManagedLeasePath" } = {}) {
+  if (typeof leasePath !== "string" || !leasePath) {
+    throw new Error(`${fn}: leasePath must be a non-empty string, received ${typeof leasePath}.`);
+  }
+  if (typeof candidate !== "string" || !candidate) {
+    throw new Error(`${fn}: candidate must be a non-empty string, received ${typeof candidate}.`);
   }
 
-  assertNoSymlinkComponents(resolvedSession, resolvedCandidate, fn);
+  const resolvedLease = path.resolve(leasePath);
+  const leaseId = path.basename(resolvedLease);
+  const parent = path.dirname(resolvedLease);
+  const root = path.resolve(runtimeDir());
+
+  if (parent !== root) {
+    throw new Error(
+      `${fn}: refusing to use ${resolvedLease} as a lease directory. ` +
+        `It must be a direct child of ${root}.`
+    );
+  }
+  if (!isValidLeaseId(leaseId)) {
+    throw new Error(
+      `${fn}: refusing to use ${resolvedLease}: ${JSON.stringify(leaseId)} is not a valid lease id.`
+    );
+  }
+
+  const resolvedCandidate = path.resolve(candidate);
+  if (!isLexicallyInside(resolvedLease, resolvedCandidate) || resolvedCandidate === resolvedLease) {
+    throw new Error(
+      `${fn}: refusing to use ${resolvedCandidate}; it is not inside the lease directory ${resolvedLease}.`
+    );
+  }
+
+  assertRealDirectory(resolvedLease, fn, "lease directory");
+  assertNoSymlinkComponents(resolvedLease, resolvedCandidate, fn);
   return resolvedCandidate;
 }
 

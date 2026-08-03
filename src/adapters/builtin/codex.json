@@ -84,7 +84,7 @@
 
   "configIsolation": {
     "env": "CODEX_HOME",
-    "dir": "{{sessionDir}}/codex-home",
+    "dir": "{{scratchDir}}/codex-home",
     "seedFromEnv": "CODEX_HOME",
     "seedFromFallback": "{{home}}/.codex",
     "copyIfMissing": ["auth.json"],

@@ -29,7 +29,7 @@
   "mcp": { "strategy": "flag" },
   "configIsolation": {
     "env": "QWEN_HOME",
-    "dir": "{{sessionDir}}/qwen-home",
+    "dir": "{{scratchDir}}/qwen-home",
     "seedFromEnv": "QWEN_HOME",
     "seedFromFallback": "{{home}}/.qwen",
     "copyIfExists": ["oauth_creds.json"]

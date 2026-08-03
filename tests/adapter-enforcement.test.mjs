@@ -17,12 +17,12 @@ import { buildInvocationFromAdapter, resolveContext } from "../src/adapters/argv
 import { negotiate } from "../src/adapters/negotiate.mjs";
 import { isEnumerable, modelIds, resolveModelEntry } from "../src/adapters/schema.mjs";
 import { resolveDiscovery } from "../src/adapters/discovery.mjs";
-import { managedSession } from "./helpers/session.mjs";
+import { managedLease, managedSession } from "./helpers/session.mjs";
 
 // This file asserts against the machine's REAL codex model cache in one
 // case, so the HOME redirect must not quietly move that cache out of reach
 // and turn a live assertion into a silent skip.
-const { home: ROOT, dir: SESSION_DIR } = managedSession("enforcement", {
+const { home: ROOT, dir: SESSION_DIR, scratchDir: SCRATCH_DIR } = managedSession("enforcement", {
   keepAdapterSeeds: [{ env: "CODEX_HOME", dir: ".codex" }],
 });
 
@@ -49,6 +49,7 @@ function check(id, options) {
     engine: adapterFor(id).engines.default,
     requireBinary: false,
     sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
     projectPath: "/fixture/project",
     ...options,
   });
@@ -134,6 +135,7 @@ test("the gpt-5.6 alias resolves to gpt-5.6-sol and inherits ultra", () => {
   const { args } = buildInvocationFromAdapter(adapterFor("codex"), {
     projectPath: "/fixture/project",
     sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
     sessionName: "fixture",
     model: "gpt-5.6",
     reasoningEffort: "ultra",
@@ -241,6 +243,7 @@ test("an adapter with no discovery source says so in the warning", () => {
     engine: undiscoverable.engines.default,
     requireBinary: false,
     sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
     projectPath: "/fixture/project",
     model: "gpt-5-high",
   });
@@ -391,6 +394,7 @@ test("no adapter rejects an unknown model without a catalog in hand", () => {
       engine: adapter.engines.default,
       requireBinary: false,
       sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
       projectPath: "/fixture/project",
       model: "some-model-nobody-declared",
     });
@@ -427,6 +431,7 @@ test("a model's own default effort is reported but never restated in argv", () =
   const { args } = buildInvocationFromAdapter(adapterFor("codex"), {
     projectPath: "/fixture/project",
     sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
     sessionName: "fixture",
     model: "gpt-5.6-sol",
   });
@@ -447,6 +452,7 @@ test("goose's thinking-effort variable appears only when an effort is set", () =
   const without = buildInvocationFromAdapter(goose, {
     projectPath: "/fixture/project",
     sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
     initialPrompt: "hi",
   });
   assert.equal(without.env.GOOSE_MODE, "auto", "static entries still resolve");
@@ -458,6 +464,7 @@ test("goose's thinking-effort variable appears only when an effort is set", () =
   const with_ = buildInvocationFromAdapter(goose, {
     projectPath: "/fixture/project",
     sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
     initialPrompt: "hi",
     reasoningEffort: "high",
   });
@@ -471,6 +478,7 @@ test("goose maps xhigh onto max rather than rejecting it", () => {
   const invocation = buildInvocationFromAdapter(adapterFor("goose"), {
     projectPath: "/fixture/project",
     sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
     initialPrompt: "hi",
     reasoningEffort: "xhigh",
   });
@@ -496,6 +504,7 @@ test("an env template referencing an unknown key is still fatal", () => {
       buildInvocationFromAdapter(broken, {
         projectPath: "/fixture/project",
         sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
         initialPrompt: "hi",
       }),
     /not a known context value/
@@ -504,44 +513,47 @@ test("an env template referencing an unknown key is still fatal", () => {
 
 // --- Effort delivery: settings file (qwen) -------------------------------
 
-function qwenSettings(sessionDir) {
-  return path.join(sessionDir, "qwen-home", "settings.json");
+// The settings file lives in the per-turn LEASE, not the session: it is written
+// into the partner's isolated config home, and that home is runtime state now.
+function qwenSettings(turn) {
+  return path.join(turn.scratchDir, "qwen-home", "settings.json");
 }
 
-function runQwen(sessionDir, reasoningEffort) {
+function runQwen(turn, reasoningEffort) {
   return buildInvocationFromAdapter(adapterFor("qwen"), {
     projectPath: "/fixture/project",
-    sessionDir,
+    sessionDir: turn.sessionDir,
+    scratchDir: turn.scratchDir,
     initialPrompt: "hi",
     reasoningEffort,
   });
 }
 
-// Each case needs its own session, and it must be a session the containment
-// assertion recognizes: a direct child of the sessions root under this file's
-// throwaway HOME, named like a real session id.
-function freshSession(name) {
-  const dir = path.join(ROOT, ".dualog", "sessions", `dialog-${name}-0000`);
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
+// Each case needs its own session AND its own lease, and both must be shapes the
+// containment assertions recognize: a direct child of the sessions root, and a
+// direct child of the runtime root, under this file's throwaway HOME.
+function freshTurn(name) {
+  const sessionDir = path.join(ROOT, ".dualog", "sessions", `dialog-${name}-0000`);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  return { sessionDir, scratchDir: managedLease() };
 }
 
 test("qwen's effort is written into the isolated settings file", () => {
   // qwen has no flag and no env var for effort, so this file is the only
   // channel that exists.
-  const dir = freshSession("qwen-write");
-  const result = runQwen(dir, "high");
+  const turn = freshTurn("qwen-write");
+  const result = runQwen(turn, "high");
 
   assert.ok(!result.args.includes("high"), "qwen exposes no effort flag");
-  assert.equal(result.effortSettingsPath, qwenSettings(dir));
+  assert.equal(result.effortSettingsPath, qwenSettings(turn));
 
-  const written = JSON.parse(fs.readFileSync(qwenSettings(dir), "utf-8"));
+  const written = JSON.parse(fs.readFileSync(qwenSettings(turn), "utf-8"));
   assert.deepEqual(written, { model: { reasoningEffort: "high" } });
 });
 
 test("qwen's settings write merges with a seeded file rather than clobbering it", () => {
-  const dir = freshSession("qwen-merge");
-  const settingsPath = qwenSettings(dir);
+  const turn = freshTurn("qwen-merge");
+  const settingsPath = qwenSettings(turn);
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   fs.writeFileSync(
     settingsPath,
@@ -552,7 +564,7 @@ test("qwen's settings write merges with a seeded file rather than clobbering it"
     })
   );
 
-  runQwen(dir, "max");
+  runQwen(turn, "max");
 
   const merged = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
   assert.equal(merged.selectedAuthType, "oauth-personal", "sibling keys survive");
@@ -563,19 +575,19 @@ test("qwen's settings write merges with a seeded file rather than clobbering it"
 });
 
 test("qwen writes no settings file when no effort was requested", () => {
-  const dir = freshSession("qwen-none");
-  const result = runQwen(dir, null);
+  const turn = freshTurn("qwen-none");
+  const result = runQwen(turn, null);
   assert.equal(result.effortSettingsPath, null);
-  assert.equal(fs.existsSync(qwenSettings(dir)), false);
+  assert.equal(fs.existsSync(qwenSettings(turn)), false);
 });
 
 test("a seeded settings file that is not JSON is refused, not overwritten", () => {
-  const dir = freshSession("qwen-corrupt");
-  const settingsPath = qwenSettings(dir);
+  const turn = freshTurn("qwen-corrupt");
+  const settingsPath = qwenSettings(turn);
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   fs.writeFileSync(settingsPath, "{ not json");
 
-  assert.throws(() => runQwen(dir, "high"), /is not valid JSON/);
+  assert.throws(() => runQwen(turn, "high"), /is not valid JSON/);
   assert.equal(fs.readFileSync(settingsPath, "utf-8"), "{ not json");
 });
 
@@ -593,6 +605,7 @@ test("negotiate and the argv builder never disagree about a turn", () => {
   const { notices } = resolveContext(adapterFor("claude"), {
     projectPath: "/fixture/project",
     sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
     ...options,
   });
 

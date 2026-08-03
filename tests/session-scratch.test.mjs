@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 import {
   SCRATCH_LEDGER,
@@ -72,8 +72,9 @@ test("the ledger is exact names, never patterns", () => {
       assert.doesNotMatch(name, /[*?[\]]/, `${name} must not be a glob`);
     }
   }
-  // opencode-data came from extraEnv, not configIsolation.dir. Deriving this
-  // list from the schema field would have missed it.
+  // opencode-data was never a configIsolation.dir: it came from extraEnv, and
+  // now lives in configIsolation.dirs. Deriving this list from whichever field
+  // is current would have missed it twice over.
   assert.ok(ledgerNames().has("opencode-data"));
   assert.ok(ledgerNames().has("codex-home"));
 });
@@ -142,6 +143,82 @@ test("a recorded terminal blocks, using the shape the product actually writes", 
   if (!inactive) {
     assert.match(reason, /tmux session/);
   }
+});
+
+/** Point the runtime at a tmux socket nothing is listening on. */
+function withDeadTmuxSocket(t) {
+  const previousSocket = process.env.DUALOG_TMUX_SOCKET;
+  const previousBinary = process.env.DUALOG_TMUX_BINARY;
+  process.env.DUALOG_TMUX_SOCKET = `dualog-noserver-${process.pid}`;
+  delete process.env.DUALOG_TMUX_BINARY;
+  t.after(() => {
+    if (previousSocket === undefined) delete process.env.DUALOG_TMUX_SOCKET;
+    else process.env.DUALOG_TMUX_SOCKET = previousSocket;
+    if (previousBinary !== undefined) process.env.DUALOG_TMUX_BINARY = previousBinary;
+  });
+}
+
+// The case above asserts only that a blocked session gives a tmux reason, which
+// a probe answering `unknown` satisfies. That is how the following shipped: on a
+// machine whose tmux server is not running -- the ordinary state after a reboot
+// -- tmux prints "error connecting to <socket> (No such file or directory)",
+// the absence pattern did not match it, every session holding a
+// current_terminal.json probed `unknown`, and the sweep retained all of them.
+// The credential copies this module exists to reclaim were never reclaimed. So
+// this case pins the verdict itself, not just its shape.
+test("with no tmux server running, a recorded pane is provably absent and can be reclaimed", (t) => {
+  if (spawnSync("tmux", ["-V"], { stdio: "ignore" }).status !== 0) {
+    t.skip("tmux is not installed");
+    return;
+  }
+  withDeadTmuxSocket(t);
+
+  const root = tempRoot(t, "noserver");
+  makeSession(root, "dialog-1785626305511-65d59016", {
+    status: { runner_state: "exited", runner_pid: null, type: "dialog" },
+    extra: {
+      "current_terminal.json": JSON.stringify({
+        schema_version: 1,
+        runtime: "tmux-interactive",
+        agent: "codex",
+        session_name: "dualog-probe-session-that-does-not-exist",
+      }),
+    },
+  });
+
+  const plan = planScratchSweep({ roots: [root] });
+  assert.equal(
+    plan.sessions[0].inactive,
+    true,
+    `expected a reclaimable session, got: ${plan.sessions[0].reason}`
+  );
+});
+
+test("a tmux we cannot run still retains the home", (t) => {
+  // The other direction, and the one that must never regress: ignorance retains.
+  const previousBinary = process.env.DUALOG_TMUX_BINARY;
+  process.env.DUALOG_TMUX_BINARY = path.join(os.tmpdir(), "dualog-absent-tmux-binary");
+  t.after(() => {
+    if (previousBinary === undefined) delete process.env.DUALOG_TMUX_BINARY;
+    else process.env.DUALOG_TMUX_BINARY = previousBinary;
+  });
+
+  const root = tempRoot(t, "notmux");
+  makeSession(root, "dialog-1785626305511-65d59017", {
+    status: { runner_state: "exited", runner_pid: null, type: "dialog" },
+    extra: {
+      "current_terminal.json": JSON.stringify({
+        schema_version: 1,
+        runtime: "tmux-interactive",
+        agent: "codex",
+        session_name: "dualog-probe-session-that-does-not-exist",
+      }),
+    },
+  });
+
+  const plan = planScratchSweep({ roots: [root] });
+  assert.equal(plan.sessions[0].inactive, false);
+  assert.match(plan.sessions[0].reason, /could not be checked \(unknown\)/);
 });
 
 test("a terminal record with no session_name blocks, because there is nothing to check", (t) => {

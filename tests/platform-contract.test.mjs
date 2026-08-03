@@ -686,8 +686,8 @@ test("the containment helper is what the isolation path actually calls", () => {
 // contained. They are here because "I audited every write" turned out to mean
 // "I audited every write I thought of".
 
-test("an extraEnv entry cannot smuggle a relocation past containment", () => {
-  // Two separate defects, one demonstration.
+test("a relocation cannot be smuggled through a settings map, and every declared one is contained", () => {
+  // Three defects, one demonstration.
   //
   // 1. The overlay was built as `{ [isolation.env]: targetDir, ...extra }`, so
   //    an extraEnv key EQUAL to the isolation variable overwrote the value that
@@ -697,6 +697,11 @@ test("an extraEnv entry cannot smuggle a relocation past containment", () => {
   //    relative name like `pwned-config` has no separator and is not absolute,
   //    so it was classified a scalar and never checked. dualog then created it
   //    relative to its own cwd, i.e. inside the user's project.
+  // 3. The fix for (2) exempted four literal scalars, which left `XDG_DATA_HOME`
+  //    set to `1` or `true` uncontained -- a relative path the partner resolves
+  //    against its own cwd. That residual was documented as unclosable without
+  //    this split, and the `dirs-*` cases below are where it closes: a declared
+  //    relocation is contained at EVERY value, with no exempt forms at all.
   //
   // Runs under a throwaway HOME because the boundary resolves the sessions root
   // from os.homedir() at call time.
@@ -709,48 +714,89 @@ test("an extraEnv entry cannot smuggle a relocation past containment", () => {
         dir: "{{sessionDir}}/probe-home",
         copyIfMissing: [],
         copyIfExists: [],
+        dirs: {},
         extraEnv: {},
       },
     };
     const ctx = { sessionDir, home };
-    const withExtra = (extraEnv) => ({
+    const withIsolation = (patch) => ({
       ...base,
-      configIsolation: { ...base.configIsolation, extraEnv },
+      configIsolation: { ...base.configIsolation, ...patch },
     });
+    const withExtra = (extraEnv) => withIsolation({ extraEnv });
+    const withDirs = (dirs) => withIsolation({ dirs });
 
     attempt("collision", () => env.prepareConfigIsolation(withExtra({ PROBE_HOME: "elsewhere" }), ctx));
-    attempt("bare-relative", () => env.prepareConfigIsolation(withExtra({ OTHER_DIR: "pwned-config" }), ctx));
-    attempt("dot", () => env.prepareConfigIsolation(withExtra({ OTHER_DIR: "." }), ctx));
+    attempt("collision-dirs", () => env.prepareConfigIsolation(withDirs({ PROBE_HOME: "elsewhere" }), ctx));
+
+    // A location-named variable is refused by a settings map at ANY value.
+    attempt("settings-path-name", () => env.prepareConfigIsolation(withExtra({ OTHER_DIR: "pwned-config" }), ctx));
+    attempt("settings-xdg", () => env.prepareConfigIsolation(withExtra({ XDG_DATA_HOME: "1" }), ctx));
+    attempt("settings-home-suffix", () => env.prepareConfigIsolation(withExtra({ PROBE_OTHER_HOME: "." }), ctx));
+
+    // A declared relocation is contained at EVERY value -- no exempt forms.
+    attempt("dirs-bare-relative", () => env.prepareConfigIsolation(withDirs({ OTHER_DIR: "pwned-config" }), ctx));
+    attempt("dirs-dot", () => env.prepareConfigIsolation(withDirs({ OTHER_DIR: "." }), ctx));
+    attempt("dirs-digits", () => env.prepareConfigIsolation(withDirs({ OTHER_DIR: "123" }), ctx));
+    attempt("dirs-one", () => env.prepareConfigIsolation(withDirs({ OTHER_DIR: "1" }), ctx));
+    attempt("dirs-true", () => env.prepareConfigIsolation(withDirs({ OTHER_DIR: "true" }), ctx));
+    attempt("dirs-escape", () => env.prepareConfigIsolation(withDirs({ OTHER_DIR: "{{sessionDir}}/../escape" }), ctx));
+    attempt("dirs-contained", () => env.prepareConfigIsolation(withDirs({ OTHER_DIR: "{{sessionDir}}/probe-data" }), ctx));
+
     attempt("scalar-still-works", () => env.prepareConfigIsolation(withExtra({ PROBE_SWITCH: "1" }), ctx));
-    attempt("digits", () => env.prepareConfigIsolation(withExtra({ OTHER_DIR: "123" }), ctx));
-    attempt("uppercase-true", () => env.prepareConfigIsolation(withExtra({ OTHER_DIR: "TRUE" }), ctx));
+    attempt("scalar-word", () => env.prepareConfigIsolation(withExtra({ PROBE_MODE: "auto" }), ctx));
+
+    // The adapter-level maps, which had no containment check on ANY path before
+    // the split: staticEnv is merged into the launch environment independently
+    // of configIsolation.
+    attempt("static-env-path-name", () => env.staticEnv({ id: "probe", env: { OTHER_DIR: "/etc" } }, ctx));
+    attempt("static-dirs-escape", () => env.staticEnv({ id: "probe", env: {}, dirs: { OTHER_DIR: "/etc" } }, ctx));
+    attempt("static-dirs-contained", () =>
+      env.staticEnv({ id: "probe", env: {}, dirs: { OTHER_DIR: "{{sessionDir}}/probe-static" } }, ctx));
+    attempt("static-env-scalar", () => env.staticEnv({ id: "probe", env: { PROBE_MODE: "auto" } }, ctx));
   `);
   const byLabel = Object.fromEntries(results.map((r) => [r.label, r]));
+  const refused = (label, pattern) => {
+    assert.equal(byLabel[label].ok, false, `${label} must be refused`);
+    assert.match(byLabel[label].error, pattern, label);
+  };
 
-  assert.equal(byLabel.collision.ok, false, "an extraEnv key equal to the isolation variable must be refused");
-  assert.match(byLabel.collision.error, /may not redefine PROBE_HOME/);
+  refused("collision", /may not redefine PROBE_HOME/);
+  refused("collision-dirs", /may not redefine PROBE_HOME/);
 
-  assert.equal(byLabel["bare-relative"].ok, false, "a separator-free relative path is still a path");
-  assert.match(byLabel["bare-relative"].error, /not inside the session directory|must be a direct child/);
+  for (const label of ["settings-path-name", "settings-xdg", "settings-home-suffix"]) {
+    refused(label, /names a filesystem location/);
+  }
 
-  assert.equal(byLabel.dot.ok, false, '"." must not become a partner config home');
-  assert.match(byLabel.dot.error, /not inside the session directory|must be a direct child/);
+  const contained = /not inside the session directory|must be a direct child/;
+  for (const label of [
+    "dirs-bare-relative",
+    "dirs-dot",
+    "dirs-digits",
+    "dirs-one",
+    "dirs-true",
+    "dirs-escape",
+  ]) {
+    refused(label, contained);
+  }
 
-  // The counterweight: real scalar switches must still pass through untouched,
-  // or "contain everything" has quietly broken every adapter that has one.
+  // The counterweight: a legitimate relocation and real scalar switches must
+  // still pass, or "contain everything" has quietly broken every adapter.
+  assert.equal(byLabel["dirs-contained"].ok, true, byLabel["dirs-contained"].error);
+  assert.match(byLabel["dirs-contained"].value.OTHER_DIR, /probe-data$/);
+  assert.match(byLabel["dirs-contained"].value.PROBE_HOME, /probe-home$/);
+
   assert.equal(byLabel["scalar-still-works"].ok, true, "a scalar switch is not a path");
   assert.equal(byLabel["scalar-still-works"].value.PROBE_SWITCH, "1");
-  assert.match(byLabel["scalar-still-works"].value.PROBE_HOME, /probe-home$/);
+  assert.equal(byLabel["scalar-word"].ok, true, "goose's GOOSE_MODE=auto shape must survive");
+  assert.equal(byLabel["scalar-word"].value.PROBE_MODE, "auto");
 
-  // And the exemption must not be a hole of its own. An earlier version
-  // exempted any bare integer, case-insensitively, so `XDG_DATA_HOME=123` and
-  // `=TRUE` were handed to the partner uncontained -- relative paths it
-  // resolves against its own cwd, i.e. the project. Asserting only that "1"
-  // works would have kept blessing exactly that.
-  for (const label of ["digits", "uppercase-true"]) {
-    assert.equal(byLabel[label].ok, false, `${label} must not be treated as a scalar switch`);
-    assert.match(byLabel[label].error, /not inside the session directory|must be a direct child/);
-  }
+  refused("static-env-path-name", /names a filesystem location/);
+  refused("static-dirs-escape", contained);
+  assert.equal(byLabel["static-dirs-contained"].ok, true, byLabel["static-dirs-contained"].error);
+  assert.match(byLabel["static-dirs-contained"].value.OTHER_DIR, /probe-static$/);
+  assert.equal(byLabel["static-env-scalar"].ok, true, byLabel["static-env-scalar"].error);
+  assert.equal(byLabel["static-env-scalar"].value.PROBE_MODE, "auto");
 });
 
 test("a turn writes nothing until its session directory has been proven managed", async () => {

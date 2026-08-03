@@ -49,6 +49,7 @@ import { resolveDiscovery } from "./adapters/discovery.mjs";
 import { resolveDiscoveryForValidation } from "./adapters/resolve-for-validation.mjs";
 import { ENGINES, resolveEngine } from "./engines/index.mjs";
 import { reapOrphanedHeadlessChildren } from "./engines/headless.mjs";
+import { sweepLeases } from "./runtime-lease.mjs";
 
 const server = new McpServer({
   name: "dualog",
@@ -1823,7 +1824,7 @@ server.tool(
     fs.writeFileSync(path.join(sessionDir, "end_signal"), "");
 
     const status = readStat(session_id);
-    const terminatedPartnerTerminal = await terminateCurrentPartnerTerminal(sessionDir);
+    let partnerTerminal = await terminateCurrentPartnerTerminal(sessionDir);
     unlinkProcessingMarkers(sessionDir);
 
     // The headless counterpart to terminateCurrentPartnerTerminal. A headless
@@ -1862,7 +1863,13 @@ server.tool(
         // sweeps below look for what the runner left behind.
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
-      await terminateCurrentPartnerTerminal(sessionDir);
+      // The runner is gone now, so this attempt can reach a pane the first one
+      // could not. Keep whichever result actually found a terminal: the second
+      // call returns `found: false` once the first proved the pane absent and
+      // cleared the record, and overwriting the real verdict with that would
+      // report the terminal as never having existed.
+      const second = await terminateCurrentPartnerTerminal(sessionDir);
+      if (second.found) partnerTerminal = second;
       unlinkProcessingMarkers(sessionDir);
       // The runner had to be signalled, so it may have spawned a child between
       // the first sweep and dying. Sweep again now that it is gone.
@@ -1871,6 +1878,18 @@ server.tool(
       } catch {
         /* best-effort */
       }
+    }
+
+    // The partner is down and the runner is gone, so this session's leases are
+    // now provably reclaimable. Sweeping rather than resolving this session's
+    // turn pointers directly is deliberate: the lease's own metadata carries
+    // everything needed to judge it, so a session whose archive was deleted by
+    // hand still gets its credential projection reclaimed.
+    let reclaimedLeases = 0;
+    try {
+      reclaimedLeases = sweepLeases({ apply: true }).removed.length;
+    } catch {
+      // Best-effort; a retained lease is reclaimed at the next startup sweep.
     }
 
     const messages = readConv(session_id);
@@ -1884,7 +1903,14 @@ server.tool(
           text: JSON.stringify(
             {
               ended: true,
-              terminated_partner_terminal: terminatedPartnerTerminal,
+              reclaimed_runtime_leases: reclaimedLeases,
+              // Now means "there was a pane and it is PROVEN gone", where it
+              // previously meant "there was a pane and we tried". A pane that
+              // survived, or one tmux could not be asked about, reported as
+              // terminated -- see partner_terminal_status for which it was.
+              terminated_partner_terminal:
+                partnerTerminal.found && partnerTerminal.verdict === "absent",
+              partner_terminal_status: partnerTerminal.status,
               reaped_headless_children: reapedHeadlessChildren,
               session_type: status?.type || "unknown",
               total_messages: messages.length,
@@ -2202,6 +2228,26 @@ server.tool(
 );
 
 // ── Start ────────────────────────────────────────────────────────────────────
+
+// Reclaim runtime leases whose consumers are gone.
+//
+// A turn releases its own lease when its partner exits, so this catches only
+// what a crash left behind -- a SIGKILLed runner, a machine that went down
+// mid-turn. It runs at startup because that is the earliest moment a previous
+// boot's leases can be shown unreachable: `sweepLeases` removes only what it can
+// PROVE finished, so nothing here can touch a turn running under another server.
+try {
+  const receipt = sweepLeases({ apply: true });
+  if (receipt.removed.length || receipt.errors.length) {
+    console.error(
+      `[dualog] runtime leases: reclaimed ${receipt.removed.length}, ` +
+        `retained ${receipt.retained.length}, errors ${receipt.errors.length}`
+    );
+  }
+} catch (err) {
+  // Never block startup on cleanup. Retention is the safe direction anyway.
+  console.error(`[dualog] runtime lease sweep skipped: ${err.message}`);
+}
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

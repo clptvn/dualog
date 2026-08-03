@@ -92,7 +92,7 @@
 
   "mcp": {
     "strategy": "empty-config-file",
-    "path": "{{sessionDir}}/claude-empty-mcp.json",
+    "path": "{{scratchDir}}/claude-empty-mcp.json",
     "content": { "mcpServers": {} }
   },
 

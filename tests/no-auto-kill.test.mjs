@@ -113,8 +113,24 @@ test("runner shutdown preserves an active tmux pane until explicit termination",
     "runner shutdown must not kill an active partner pane"
   );
 
-  assert.equal(await terminateCurrentPartnerTerminal(sessionDir), true);
+  // The verdict, not a boolean: this used to report "terminated" whether or not
+  // the pane actually went away. `absent` is the only result that authorizes a
+  // caller to treat the partner as down and release what it was holding.
+  const result = await terminateCurrentPartnerTerminal(sessionDir);
+  assert.deepEqual(result, { found: true, verdict: "absent", status: "terminated" });
   assert.equal(await isTmuxSessionAlive(terminal.session_name), false);
+
+  // And a proven absence is the one case that clears the record.
+  assert.equal(readTerminalState(sessionDir).current, null);
+  assert.equal(readTerminalState(sessionDir).last.status, "terminated");
+
+  // Nothing left to terminate: the second call finds no current terminal rather
+  // than reporting a fresh one.
+  assert.deepEqual(await terminateCurrentPartnerTerminal(sessionDir), {
+    found: false,
+    verdict: null,
+    status: null,
+  });
 });
 
 test("source contains no pane inactivity watchdog or automatic orphan sweep", () => {

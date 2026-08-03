@@ -65,6 +65,13 @@ export function resolveContext(adapter, options) {
   const {
     projectPath,
     sessionDir,
+    // The per-turn runtime lease: where every partner home, MCP config and
+    // settings file for THIS turn is written. Separate from sessionDir because
+    // the two have opposite lifetimes -- the session directory is an archive
+    // kept for months, the lease is removed as soon as the turn's process is
+    // proven gone. Conflating them is what left a credential copy in every
+    // session ever run.
+    scratchDir = null,
     sessionName = null,
     model = null,
     reasoningEffort = null,
@@ -373,6 +380,7 @@ export function resolveContext(adapter, options) {
     home: os.homedir(),
     projectPath,
     sessionDir,
+    scratchDir,
     sessionName,
     model: effectiveModel,
     reasoningEffort: effectiveEffort,

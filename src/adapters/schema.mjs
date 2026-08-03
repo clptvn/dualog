@@ -22,6 +22,52 @@ export const ENGINES = ["tmux-interactive", "headless"];
 const Template = z.string();
 
 /**
+ * Environment variables a CLI reads as a filesystem location.
+ *
+ * This list is the security boundary for the settings/relocation split, and it
+ * is a rule about NAMES because that is what decides interpretation. Nothing in
+ * dualog creates a directory for a setting -- only `configIsolation.dir` and the
+ * `dirs` maps cause a mkdir -- so a setting holding a path-shaped string is
+ * inert unless the partner CLI treats that variable as a location. `GOOSE_MODE`
+ * is safe at any value; `XDG_DATA_HOME` is dangerous at every value that
+ * resolves outside the session.
+ *
+ * Guessing from the VALUE was the previous approach and could not work in
+ * either direction: `auto` and `pwned-config` are the same shape, so the check
+ * either rejected goose's legitimate mode or admitted a relative directory that
+ * the partner then resolved against the user's own project.
+ *
+ * Checked against every built-in: the four grok toggles, goose's mode, thinking
+ * effort and keyring switch, and opencode's project-config switch all pass;
+ * `XDG_DATA_HOME` is the only settings entry any manifest had that this
+ * classifies as a location, and it is a relocation that was living in the wrong
+ * field. Note `OPENCODE_DISABLE_PROJECT_CONFIG` deliberately does not match --
+ * a trailing `_CONFIG` names a feature far more often than a directory.
+ */
+const PATH_VARIABLE_NAME =
+  /^XDG_|_(HOME|DIR|DIRS|PATH|ROOT)$|^(HOME|PATH|TMPDIR|TMP|TEMP|USERPROFILE|APPDATA|LOCALAPPDATA)$/;
+
+export function isPathVariableName(name) {
+  return PATH_VARIABLE_NAME.test(String(name));
+}
+
+/**
+ * Does this TEMPLATE describe a filesystem location?
+ *
+ * Authoring hygiene rather than a security boundary, and narrow on purpose: it
+ * catches the shapes a relocation actually takes so an author who puts one in a
+ * settings map is told to move it, without rejecting a legitimate setting that
+ * merely contains a slash. A base URL (`https://...`) is not a location; a value
+ * built from {{sessionDir}} is.
+ */
+const LOCATION_TEMPLATE = /\{\{(sessionDir|home|projectPath|configHome|isolatedDir)\}\}/;
+
+export function looksLikeLocation(template) {
+  const text = String(template);
+  return LOCATION_TEMPLATE.test(text) || /^[~/]/.test(text) || /^\.\.?\//.test(text);
+}
+
+/**
  * Conditions are intentionally trivial: a value is set, or a value equals a
  * literal. Anything more expressive belongs in code, not in JSON. Values are
  * normalized before argv is built -- an effort not valid for this adapter is
@@ -68,9 +114,24 @@ const ConfigIsolation = z
     seedFromFallback: Template.optional(),
     copyIfMissing: z.array(z.string()).default([]),
     copyIfExists: z.array(z.string()).default([]),
-    // Several CLIs need more than one variable to be fully relocated -- one for
-    // config, another for data or cache. Isolating only some of them leaves the
-    // partner reading the user's real state through whichever was missed.
+
+    /**
+     * Further RELOCATIONS, each contained exactly as `dir` is.
+     *
+     * Several CLIs need more than one variable to be fully relocated -- one for
+     * config, another for data or cache. Isolating only some of them leaves the
+     * partner reading the user's real state through whichever was missed.
+     */
+    dirs: z.record(z.string(), Template).default({}),
+
+    /**
+     * SETTINGS delivered alongside the relocation. Never a location, never
+     * contained, and never used to create anything.
+     *
+     * This field and `dirs` were one field, which is what forced the runtime to
+     * guess which kind each entry was. The guess is gone: the manifest says
+     * which it means, and the two are validated by opposite rules.
+     */
     extraEnv: z.record(z.string(), Template).default({}),
   })
   .strict();
@@ -523,11 +584,27 @@ export const AdapterManifest = z
     configIsolation: ConfigIsolation.nullable().default(null),
 
     /**
-     * Static environment applied to every invocation. Some CLIs express what
-     * are effectively flags only as env vars (goose's GOOSE_MODE, grok's MCP
-     * import toggles), so this is not merely convenience.
+     * Static SETTINGS applied to every invocation. Some CLIs express what are
+     * effectively flags only as env vars (goose's GOOSE_MODE, grok's MCP import
+     * toggles), so this is not merely convenience.
+     *
+     * Settings only: an entry naming a location belongs in `dirs`, where it is
+     * contained. Until that split existed this map was an unchecked channel for
+     * arbitrary paths -- it is merged into the launch environment independently
+     * of configIsolation, so a manifest could point a partner at any directory
+     * through a variable its own isolation did not happen to relocate.
      */
     env: z.record(z.string(), Template).default({}),
+
+    /**
+     * Static RELOCATIONS, contained inside the session like every other
+     * directory dualog hands a partner.
+     *
+     * Empty in every built-in adapter today. It exists so that the answer to
+     * "my CLI needs one more directory redirected" is a field with a containment
+     * rule attached, rather than `env`, which has none.
+     */
+    dirs: z.record(z.string(), Template).default({}),
 
     /**
      * How the bootstrap prompt reaches the partner, per engine. Both keys are
@@ -756,6 +833,81 @@ export const AdapterManifest = z
           "is no session-owned config directory to write the setting into",
         ["effortDelivery"]
       );
+    }
+
+    // --- settings are not relocations -----------------------------------------
+    //
+    // Caught at load rather than at spawn so a manifest author is told which
+    // field to use, in a message naming the entry, instead of discovering it as
+    // a containment refusal mid-turn.
+    const settingsMaps = [
+      { label: "env", map: m.env, dirsField: "dirs", path: ["env"] },
+      ...(m.configIsolation
+        ? [
+            {
+              label: "configIsolation.extraEnv",
+              map: m.configIsolation.extraEnv,
+              dirsField: "configIsolation.dirs",
+              path: ["configIsolation", "extraEnv"],
+            },
+          ]
+        : []),
+    ];
+    for (const { label, map, dirsField, path: base } of settingsMaps) {
+      for (const [key, template] of Object.entries(map)) {
+        if (isPathVariableName(key)) {
+          fail(
+            `${label}.${key} names a filesystem location. Declare it under ` +
+              `${dirsField}, where the rendered path is proven to be inside the ` +
+              `session before anything is created at it.`,
+            [...base, key]
+          );
+        } else if (looksLikeLocation(template)) {
+          fail(
+            `${label}.${key} is set to ${JSON.stringify(template)}, which describes a ` +
+              `filesystem location. Declare it under ${dirsField} so it is contained, ` +
+              `or use a value that is not a path.`,
+            [...base, key]
+          );
+        }
+      }
+    }
+
+    if (m.configIsolation) {
+      const isolation = m.configIsolation;
+      // Both maps are merged into the same overlay, so one key in two of them is
+      // a silent precedence question rather than a configuration.
+      for (const key of Object.keys(isolation.dirs)) {
+        if (key in isolation.extraEnv) {
+          fail(
+            `configIsolation.dirs.${key} is also declared in configIsolation.extraEnv; ` +
+              "a variable is either a relocation or a setting, not both",
+            ["configIsolation", "dirs", key]
+          );
+        }
+      }
+      // Same rule the runtime enforces for extraEnv, and for the same reason:
+      // the primary variable is set from the one value proven contained, and
+      // nothing may redefine it.
+      for (const field of ["dirs", "extraEnv"]) {
+        if (isolation.env in isolation[field]) {
+          fail(
+            `configIsolation.${field} may not redefine ${isolation.env}; that ` +
+              "variable is set from configIsolation.dir",
+            ["configIsolation", field, isolation.env]
+          );
+        }
+      }
+    }
+
+    for (const key of Object.keys(m.dirs)) {
+      if (key in m.env) {
+        fail(
+          `dirs.${key} is also declared in env; a variable is either a relocation ` +
+            "or a setting, not both",
+          ["dirs", key]
+        );
+      }
     }
 
     if (m.capabilities.toolProfiles === "flags" && !m.toolProfiles[m.defaultToolProfile]) {

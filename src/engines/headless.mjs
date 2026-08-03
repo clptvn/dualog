@@ -13,6 +13,7 @@ import fs from "fs";
 import path from "path";
 import { spawn, execFileSync } from "child_process";
 import { buildInvocationFromAdapter } from "../adapters/argv.mjs";
+import { releaseLease, transitionLease } from "../runtime-lease.mjs";
 import { readCompletion } from "./completion.mjs";
 import { resolveDiscoveryForValidation } from "../adapters/resolve-for-validation.mjs";
 import { isProcessAlive } from "../shared.mjs";
@@ -228,8 +229,37 @@ export function extractStdoutResult(adapter, stdout) {
 /**
  * Run one partner turn headlessly and return its final message.
  */
-export async function runHeadlessTurn({
+/**
+ * Run one headless turn, releasing its runtime lease however it ends.
+ *
+ * The wrapper exists for the `finally`: this function has a dozen exit paths --
+ * timeout, cancellation, five distinct completion diagnoses -- and the credential
+ * projection has to go on every one of them. Releasing at each `return` and
+ * `throw` is how the failure paths come to be the ones that leak.
+ *
+ * `releaseLease` only removes a lease whose consumer is PROVEN gone, so this
+ * cannot reclaim a home from a process group that outlived our direct child;
+ * such a lease is retained and swept once the group can be shown absent.
+ */
+export async function runHeadlessTurn(options) {
+  try {
+    return await runHeadlessTurnInner(options);
+  } finally {
+    const { lease, log } = options;
+    if (lease) {
+      try {
+        const { released, reason } = releaseLease(lease);
+        if (!released && reason) log(`Runtime lease ${lease.id} retained: ${reason}`);
+      } catch (err) {
+        log(`Runtime lease ${lease.id} could not be released: ${err.message}`);
+      }
+    }
+  }
+}
+
+async function runHeadlessTurnInner({
   adapter,
+  lease = null,
   partnerCommand,
   bootstrap,
   projectPath,
@@ -265,11 +295,16 @@ export async function runHeadlessTurn({
     log,
   });
 
+  // `projecting` before the call that copies credentials in; see runtime-lease.mjs
+  // for why the state is an upper bound on what may have happened rather than a
+  // report of what did.
+  if (lease) transitionLease(lease, "projecting");
   const { command, args, env, notices } = buildInvocationFromAdapter(adapter, {
     engine: "headless",
     partnerCommand,
     projectPath,
     sessionDir,
+    scratchDir: lease?.dir ?? null,
     model,
     reasoningEffort,
     toolProfile,
@@ -295,11 +330,20 @@ export async function runHeadlessTurn({
     );
   }
 
+  if (lease) transitionLease(lease, "ready");
+
   const delivery = adapter.promptDelivery.headless;
   log(
     `Invoking ${adapter.displayName} headlessly (prompt via ${delivery}, ${bootstrap.length} chars)`
   );
 
+  // Unlike tmux, this engine cannot know its consumer's identity until spawn()
+  // returns, so `spawning` records only the KIND. A SIGKILL in the window
+  // between these two statements leaves a live child with no recorded pid --
+  // which the lease reaper reads as "retain", because there is no portable proof
+  // that spawn() did not happen. That retention is released by the boot check
+  // once the machine restarts, so a crash cannot make a projection permanent.
+  if (lease) transitionLease(lease, "spawning", { consumer: { kind: "headless" } });
   const child = spawn(command, args, {
     cwd: projectPath,
     env: { ...process.env, ...env },
@@ -310,6 +354,17 @@ export async function runHeadlessTurn({
     // holding the pipes, which reads as a hang rather than a kill.
     detached: process.platform !== "win32",
   });
+  if (lease) {
+    transitionLease(lease, "active", {
+      consumer: {
+        kind: "headless",
+        pid: child.pid ?? null,
+        // The group, not just the pid: a TERM-ignoring descendant keeps the CLI
+        // that holds our credentials open after the direct child is gone.
+        pgid: process.platform === "win32" ? null : (child.pid ?? null),
+      },
+    });
+  }
   activeChildren.add(child);
   // Both cleanups are tied to `close`, not to the turn returning. On timeout or
   // cancellation waitForExit() resolves as soon as it has SIGNALLED the child --

@@ -52,7 +52,7 @@ fs.writeFileSync(
 process.env.CODEX_HOME = path.join(FIXTURE_HOME, ".codex");
 
 const PROJECT_PATH = "/fixture/project";
-const { home: SESSION_HOME, dir: SESSION_DIR } = managedSession("argvsnap");
+const { home: SESSION_HOME, dir: SESSION_DIR, scratchDir: SCRATCH_DIR } = managedSession("argvsnap");
 const SESSION_NAME = "ccd-dialog-1700000000000-abcd1234-turn";
 const BOOTSTRAP = "Read the prompt file at:\n/fixture/session/turns/t1/prompt.md";
 
@@ -66,6 +66,8 @@ process.on("exit", () => {
 function stabilize(value) {
   return JSON.parse(
     JSON.stringify(value)
+      .split(SCRATCH_DIR)
+      .join("<SCRATCH_DIR>")
       .split(SESSION_DIR)
       .join("<SESSION_DIR>")
       .split(FIXTURE_HOME)
@@ -98,6 +100,7 @@ function invoke(overrides) {
     partnerCommand: requested === "claude" ? "claude" : "codex",
     projectPath: PROJECT_PATH,
     sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
     sessionName: SESSION_NAME,
     model: overrides.model ?? null,
     reasoningEffort: overrides.reasoningEffort ?? null,
@@ -257,6 +260,7 @@ test("requesting an engine the adapter disallows fails at build time", async () 
         engine: "headless",
         projectPath: PROJECT_PATH,
         sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
         sessionName: SESSION_NAME,
       }),
     // Must name the manifest file: a wrong engine in a user-supplied adapter is

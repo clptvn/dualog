@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import { execFile } from "child_process";
+import { execFile, spawnSync } from "child_process";
 import { envWithAliases } from "./platform.mjs";
 import { tryGetAdapter } from "./adapters/registry.mjs";
 import { isBlocked, isIdlePrompt } from "./tui/markers.mjs";
@@ -63,13 +63,28 @@ export async function runTmux(args, { allowFailure = false } = {}) {
   return result;
 }
 
-export async function isTmuxAvailable() {
+/**
+ * Can we run tmux at all? `available` | `missing` | `unknown`.
+ *
+ * A timeout is not proof tmux is absent, and reporting it as such tells a
+ * caller to stop using a runtime that is merely slow.
+ */
+export async function probeTmuxAvailability() {
+  let result;
   try {
-    const result = await runTmux(["-V"], { allowFailure: true });
-    return result.exitCode === 0;
+    result = await runTmux(["-V"], { allowFailure: true });
   } catch {
-    return false;
+    return "unknown";
   }
+  if (result.exitCode === 0) return "available";
+  // execFile reports a binary that will not spawn as 127 and a killed call as
+  // 124; only the former proves tmux is not there.
+  if (result.exitCode === 127) return "missing";
+  return "unknown";
+}
+
+export async function isTmuxAvailable() {
+  return (await probeTmuxAvailability()) === "available";
 }
 
 export function buildTmuxSessionName(sessionId, label) {
@@ -152,12 +167,115 @@ export async function captureTmuxPane(handleOrSessionName, options = {}) {
   return result.stdout;
 }
 
-export async function isTmuxSessionAlive(sessionName) {
-  if (!sessionName || sessionName.includes(":")) return false;
-  const result = await runTmux(["has-session", "-t", sessionName], {
-    allowFailure: true,
+/**
+ * A tmux target that can only ever name the session it spells out.
+ *
+ * `-t name` is NOT an exact lookup: tmux matches a bare target as a prefix or
+ * fnmatch pattern, so `has-session -t real` succeeds against a session called
+ * `realone` (verified against tmux 3.5a). `=` forces exact matching.
+ *
+ * The colon rejection is separate and equally load-bearing: `=realone:0` is a
+ * WINDOW target and still exits 0, so a name carrying a colon could report a
+ * window as though it were the session.
+ */
+function tmuxSessionTarget(sessionName) {
+  if (typeof sessionName !== "string") return null;
+  if (!sessionName || sessionName.includes(":") || sessionName.includes("\0")) {
+    return null;
+  }
+  return `=${sessionName}`;
+}
+
+// A non-zero tmux exit that PROVES no such session exists. Everything outside
+// these two shapes is a failure to ask the question, not an answer to it.
+//
+//   - the server declined to find the session  -> it is not there
+//   - there is no server to ask                -> nothing is there
+//
+// `error connecting to` is matched only for the two errnos that mean the socket
+// leads nowhere. `(Permission denied)` is deliberately excluded: a socket we may
+// not open is one somebody else's server is very likely still listening on.
+const TMUX_NO_SUCH_SESSION = /can't find session|session not found/i;
+const TMUX_NO_SERVER =
+  /no server running|error connecting to .*\((?:no such file or directory|connection refused)\)/i;
+
+/**
+ * What a failed tmux probe actually proves: `absent` or `unknown`.
+ *
+ * Exported so the two probes below cannot drift apart in the one judgement that
+ * matters. A verdict of `unknown` covers the tmux binary being missing (exit
+ * 127), the call timing out (124), and any message this version does not
+ * recognise -- none of which are evidence that a pane died.
+ */
+export function classifyTmuxProbeFailure({ stdout = "", stderr = "" } = {}) {
+  const text = `${stderr}\n${stdout}`;
+  if (TMUX_NO_SUCH_SESSION.test(text)) return "absent";
+  if (TMUX_NO_SERVER.test(text)) return "absent";
+  return "unknown";
+}
+
+/**
+ * Is this tmux session there? `alive` | `absent` | `unknown`.
+ *
+ * The three-valued answer is the point. Collapsing `unknown` into "gone" is how
+ * a ten-second tmux timeout during a long turn became "the partner's pane
+ * exited", aborting a turn that was running perfectly well.
+ */
+export async function probeTmuxSession(sessionName) {
+  const target = tmuxSessionTarget(sessionName);
+  if (!target) return "unknown";
+  let result;
+  try {
+    result = await runTmux(["has-session", "-t", target], { allowFailure: true });
+  } catch {
+    // tmuxBinary()/tmuxSocketName() reject unusable configuration by throwing.
+    // That is a broken question, not a dead pane.
+    return "unknown";
+  }
+  if (result.exitCode === 0) return "alive";
+  return classifyTmuxProbeFailure(result);
+}
+
+/**
+ * `probeTmuxSession()` for callers that cannot await.
+ *
+ * `proveSessionInactive()` is synchronous and decides whether to DELETE a
+ * partner home, so it needs this exact question answered on the same terms --
+ * through the same binary and socket as everything else here. It previously
+ * carried a private copy that shelled out to a bare `tmux`, ignoring
+ * DUALOG_TMUX_BINARY: with that override set, cleanup probed a different tmux
+ * than the one holding the session and read a live pane as absent.
+ */
+export function probeTmuxSessionSync(sessionName) {
+  const target = tmuxSessionTarget(sessionName);
+  if (!target) return "unknown";
+  let result;
+  try {
+    result = spawnSync(tmuxBinary(), buildTmuxArgs(["has-session", "-t", target]), {
+      encoding: "utf-8",
+      timeout: TMUX_EXEC_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return "unknown";
+  }
+  if (result.error) return "unknown";
+  if (result.status === 0) return "alive";
+  // A null status means killed by signal -- our own timeout, most likely.
+  if (result.status == null) return "unknown";
+  return classifyTmuxProbeFailure({
+    stdout: result.stdout || "",
+    stderr: result.stderr || "",
   });
-  return result.exitCode === 0;
+}
+
+/**
+ * Boolean liveness, for callers where "cannot tell" and "gone" are the same
+ * decision. Anything that must not act on a guess wants probeTmuxSession().
+ */
+export async function isTmuxSessionAlive(sessionName) {
+  return (await probeTmuxSession(sessionName)) === "alive";
 }
 
 export async function terminateTmuxSession(handleOrSessionName) {
@@ -168,14 +286,20 @@ export async function terminateTmuxSession(handleOrSessionName) {
           paneTarget: `${handleOrSessionName}:0.0`,
         }
       : handleOrSessionName;
-  if (!handle?.sessionName) return;
-  if (!(await isTmuxSessionAlive(handle.sessionName))) return;
+  if (!handle?.sessionName) return "unknown";
+  // Only a PROVEN absence ends this early. "Cannot tell" must fall through to
+  // the escalation below: giving up there leaves a pane running under a partner
+  // that nobody will terminate again, and the kill attempts are already
+  // failure-tolerant, so trying against a session that turns out to be gone
+  // costs nothing.
+  const probe = () => probeTmuxSession(handle.sessionName);
+  if ((await probe()) === "absent") return "absent";
 
   try {
     await sendTextToTmux(handle, "/exit", { enter: true });
     await new Promise((resolve) => setTimeout(resolve, 1000));
   } catch {}
-  if (!(await isTmuxSessionAlive(handle.sessionName))) return;
+  if ((await probe()) === "absent") return "absent";
 
   try {
     await runTmux(["send-keys", "-t", handle.paneTarget, "C-c"], {
@@ -186,11 +310,15 @@ export async function terminateTmuxSession(handleOrSessionName) {
     });
     await new Promise((resolve) => setTimeout(resolve, 1000));
   } catch {}
-  if (!(await isTmuxSessionAlive(handle.sessionName))) return;
+  if ((await probe()) === "absent") return "absent";
 
   await runTmux(["kill-session", "-t", handle.sessionName], {
     allowFailure: true,
   });
+  // Probe AFTER the kill rather than assuming it worked. `kill-session` runs
+  // with allowFailure, so its own result says nothing, and a caller about to
+  // release a credential lease needs the verdict rather than the attempt.
+  return await probe();
 }
 
 export function currentTerminalStatePath(sessionDir) {
@@ -228,9 +356,11 @@ export async function inspectPartnerTerminal(sessionDir, options = {}) {
   const { current, last } = readTerminalState(sessionDir);
   const terminal = current || last;
   if (!terminal?.session_name) {
+    const availability = await probeTmuxAvailability();
     return {
       active: false,
-      available: await isTmuxAvailable(),
+      available: availability === "available",
+      tmux_availability: availability,
       message: "No tmux-backed partner turn has been started for this session yet.",
     };
   }
@@ -239,8 +369,10 @@ export async function inspectPartnerTerminal(sessionDir, options = {}) {
     sessionName: terminal.session_name,
     paneTarget: terminal.pane_target || `${terminal.session_name}:0.0`,
   };
-  const alive = await isTmuxSessionAlive(terminal.session_name);
+  const liveness = await probeTmuxSession(terminal.session_name);
+  const alive = liveness === "alive";
   let captureText = null;
+  let captureSource = null;
   let captureError = null;
   let captureTruncated = false;
   let fullCapture = null;
@@ -256,19 +388,29 @@ export async function inspectPartnerTerminal(sessionDir, options = {}) {
     : DEFAULT_TAIL_MAX_CHARS;
   const includeFullCapture = options.includeFullCapture === true;
 
-  if (alive) {
+  // Attempt the live pane unless the session is PROVEN gone. Under `unknown`
+  // the pane may well be there, and a capture that succeeds settles the
+  // question far better than the probe did.
+  if (liveness !== "absent") {
     try {
       captureText = await captureTmuxPane(handle, { lines: options.lines });
+      captureSource = "live";
     } catch (err) {
       captureError = err.message;
     }
-  } else {
+  }
+  // Fall back to the last persisted capture whenever no live text was obtained
+  // -- including when the live attempt threw, which previously returned no text
+  // at all despite a perfectly readable capture sitting on disk.
+  if (captureText == null) {
     const fallbackCapturePath = getTerminalCapturePath(terminal);
     if (fallbackCapturePath && fs.existsSync(fallbackCapturePath)) {
       try {
         captureText = fs.readFileSync(fallbackCapturePath, "utf-8");
+        captureSource = "persisted";
+        captureError = null;
       } catch (err) {
-        captureError = err.message;
+        captureError = captureError || err.message;
       }
     }
   }
@@ -284,14 +426,19 @@ export async function inspectPartnerTerminal(sessionDir, options = {}) {
     captureText && tailText && captureText.length > tailText.length
   );
   const activity = analyzeTerminalActivity(captureText, terminal.agent, {
-    alive,
+    liveness,
   });
   const fallbackCapturePath = getTerminalCapturePath(terminal);
+  const availability = await probeTmuxAvailability();
 
   return {
     active: Boolean(current),
-    available: await isTmuxAvailable(),
+    available: availability === "available",
+    tmux_availability: availability,
     alive,
+    // `alive` cannot distinguish "the pane is gone" from "tmux did not answer".
+    // Callers deciding whether a turn died must read this instead.
+    liveness,
     status: terminal.status || "unknown",
     agent: terminal.agent || null,
     session_name: terminal.session_name,
@@ -314,6 +461,7 @@ export async function inspectPartnerTerminal(sessionDir, options = {}) {
       tail_text: tailText,
       full_text: includeFullCapture ? fullCapture : undefined,
       captured_at: captureText ? new Date().toISOString() : null,
+      source: captureSource,
       truncated: captureTruncated,
       full_truncated: includeFullCapture ? fullCaptureTruncated : undefined,
       error: captureError,
@@ -321,14 +469,29 @@ export async function inspectPartnerTerminal(sessionDir, options = {}) {
   };
 }
 
+/**
+ * Classify what a pane is doing.
+ *
+ * Liveness arrives three-valued via `options.liveness`; `options.alive` remains
+ * accepted as the boolean form. `unknown` deliberately does NOT produce
+ * `not_running`: reporting a pane as exited because tmux timed out is a claim
+ * this function has no grounds to make, and drivers act on it.
+ */
 export function analyzeTerminalActivity(captureText, agent, options = {}) {
-  const alive = options.alive !== false;
+  const liveness =
+    options.liveness ?? (options.alive === false ? "absent" : "alive");
+  const alive = liveness === "alive";
+  const provenGone = liveness === "absent";
   const text = captureText || "";
   if (!text.trim()) {
     return {
-      state: alive ? "unknown" : "not_running",
+      state: provenGone ? "not_running" : "unknown",
       confidence: "low",
-      summary: alive ? "No terminal text captured yet." : "No live tmux session.",
+      summary: provenGone
+        ? "No live tmux session."
+        : alive
+          ? "No terminal text captured yet."
+          : "tmux could not be reached, and no terminal text was captured.",
     };
   }
 
@@ -350,7 +513,7 @@ export function analyzeTerminalActivity(captureText, agent, options = {}) {
   let state = "unknown";
   let confidence = "low";
 
-  if (!alive) {
+  if (provenGone) {
     state = "not_running";
     confidence = "high";
   } else if (/\b(thinking|reasoning|warping|pondering|working)\b/u.test(lowerStatus) || tokens != null) {
@@ -387,6 +550,13 @@ export function analyzeTerminalActivity(captureText, agent, options = {}) {
     confidence = "low";
   }
 
+  // Under `unknown` the text above is still the best available reading, but it
+  // may have come from a persisted capture rather than the live pane, so no
+  // conclusion drawn from it is better than low confidence.
+  if (liveness === "unknown") {
+    confidence = "low";
+  }
+
   const parts = [];
   if (model) parts.push(model);
   if (verb) parts.push(verb);
@@ -396,7 +566,12 @@ export function analyzeTerminalActivity(captureText, agent, options = {}) {
   return {
     state,
     confidence,
-    summary: buildActivitySummary(state, parts),
+    liveness,
+    summary:
+      buildActivitySummary(state, parts) +
+      (liveness === "unknown"
+        ? " tmux could not confirm the pane is still running, so this reading may be stale."
+        : ""),
     model,
     verb,
     tokens,
@@ -537,24 +712,44 @@ function buildActivitySummary(state, parts) {
   return `Partner activity is unclear${detail}.`;
 }
 
+/**
+ * Terminate this session's current pane and report what is actually true.
+ *
+ * Returns `{ found, verdict, status }`. The verdict, not a boolean, is the
+ * point: this used to record "terminated" and clear current_terminal.json
+ * unconditionally, so a pane that survived termination was filed as gone. That
+ * is the wrong direction for every consumer -- the host is told the partner is
+ * down, and the cleanup path loses the one record that would have kept it from
+ * reclaiming a live partner's home.
+ *
+ * `current_terminal.json` is now cleared ONLY on a proven absence. Under `alive`
+ * or `unknown` the record is preserved, which keeps the pane discoverable by
+ * end_dialog and by the scratch sweep until something can prove it gone.
+ */
 export async function terminateCurrentPartnerTerminal(sessionDir) {
   const { current } = readTerminalState(sessionDir);
-  if (!current?.session_name) return false;
+  if (!current?.session_name) return { found: false, verdict: null, status: null };
   const handle = {
     sessionName: current.session_name,
     paneTarget: current.pane_target || `${current.session_name}:0.0`,
   };
-  await terminateTmuxSession(handle);
+  const verdict = await terminateTmuxSession(handle);
+  const status =
+    verdict === "absent"
+      ? "terminated"
+      : verdict === "alive"
+        ? "error_terminal_leaked"
+        : "termination_unknown";
   writeTerminalState(
     sessionDir,
     {
       ...current,
-      status: "terminated",
-      completed_at: new Date().toISOString(),
+      status,
+      ...(verdict === "absent" ? { completed_at: new Date().toISOString() } : {}),
     },
-    { active: false }
+    { active: verdict !== "absent" }
   );
-  return true;
+  return { found: true, verdict, status };
 }
 
 function readJson(filePath) {

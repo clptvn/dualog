@@ -280,6 +280,126 @@ test("a flags-based tool profile must define its default profile", () => {
   );
 });
 
+// --- settings vs relocations -------------------------------------------------
+//
+// One field used to hold both, which forced the runtime to guess which kind
+// each entry was from the rendered value -- a guess that cannot work, because
+// goose's legitimate `auto` and an attacker's `pwned-config` are the same shape.
+// The manifest now says which it means. These pin the rules that make the
+// declaration trustworthy, at load time, where the author can act on them.
+
+const isolationBase = {
+  env: "FAKE_HOME",
+  dir: "{{sessionDir}}/fake-home",
+};
+
+test("a settings map may not carry a location-named variable", () => {
+  for (const key of ["XDG_DATA_HOME", "FAKE_OTHER_HOME", "FAKE_DIR", "FAKE_PATH", "FAKE_ROOT", "HOME"]) {
+    assert.throws(
+      () => parseManifest(baseManifest({ env: { [key]: "1" } }), "/f.json"),
+      new RegExp(`env\\.${key} names a filesystem location`),
+      `${key} must be refused in env`
+    );
+    assert.throws(
+      () =>
+        parseManifest(
+          baseManifest({ configIsolation: { ...isolationBase, extraEnv: { [key]: "1" } } }),
+          "/f.json"
+        ),
+      /names a filesystem location/,
+      `${key} must be refused in configIsolation.extraEnv`
+    );
+  }
+});
+
+test("a settings map may not carry a location-shaped value", () => {
+  for (const value of ["{{sessionDir}}/data", "/etc", "~/x", "./rel", "../up"]) {
+    assert.throws(
+      () => parseManifest(baseManifest({ env: { FAKE_SETTING: value } }), "/f.json"),
+      /describes a filesystem location/,
+      `${value} must be refused`
+    );
+  }
+});
+
+test("the settings every built-in actually declares still validate", () => {
+  // The counterweight. A rule that rejected these would have made the split
+  // unshippable, and each of these is a real entry from a real manifest.
+  const real = {
+    GOOSE_MODE: "auto",
+    GOOSE_THINKING_EFFORT: "{{reasoningEffort}}",
+    GOOSE_DISABLE_KEYRING: "1",
+    OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+    GROK_CLAUDE_MCPS_ENABLED: "0",
+    GROK_FOLDER_TRUST: "0",
+    GROK_DISABLE_AUTOUPDATER: "1",
+  };
+  const parsed = parseManifest(baseManifest({ env: real }), "/f.json");
+  assert.deepEqual(parsed.env, real);
+
+  // A URL contains slashes and is not a location.
+  assert.doesNotThrow(() =>
+    parseManifest(baseManifest({ env: { FAKE_BASE_URL: "https://example.com/v1" } }), "/f.json")
+  );
+});
+
+test("a variable cannot be both a relocation and a setting", () => {
+  assert.throws(
+    () =>
+      parseManifest(
+        baseManifest({
+          configIsolation: {
+            ...isolationBase,
+            dirs: { FAKE_DATA_DIR: "{{sessionDir}}/data" },
+            extraEnv: { FAKE_DATA_DIR: "1" },
+          },
+        }),
+        "/f.json"
+      ),
+    /is also declared in configIsolation\.extraEnv/
+  );
+  assert.throws(
+    () =>
+      parseManifest(
+        baseManifest({ env: { FAKE_SETTING: "1" }, dirs: { FAKE_SETTING: "{{sessionDir}}/d" } }),
+        "/f.json"
+      ),
+    /is also declared in env/
+  );
+});
+
+test("neither map may redefine the isolation variable", () => {
+  for (const field of ["dirs", "extraEnv"]) {
+    assert.throws(
+      () =>
+        parseManifest(
+          baseManifest({
+            configIsolation: { ...isolationBase, [field]: { FAKE_HOME: "{{sessionDir}}/other" } },
+          }),
+          "/f.json"
+        ),
+      new RegExp(`configIsolation\\.${field} may not redefine FAKE_HOME`),
+      field
+    );
+  }
+});
+
+test("a declared relocation is accepted, wherever it points", () => {
+  // The schema's job is to record the AUTHOR'S INTENT; containment is proven at
+  // spawn against the real session directory, which the schema cannot see. So a
+  // dirs entry parses here even when it would be refused at runtime -- see
+  // platform-contract for the boundary that refuses it.
+  const parsed = parseManifest(
+    baseManifest({
+      configIsolation: { ...isolationBase, dirs: { XDG_DATA_HOME: "{{sessionDir}}/fake-data" } },
+      dirs: { FAKE_CACHE_DIR: "{{sessionDir}}/fake-cache" },
+    }),
+    "/f.json"
+  );
+  assert.equal(parsed.configIsolation.dirs.XDG_DATA_HOME, "{{sessionDir}}/fake-data");
+  assert.equal(parsed.dirs.FAKE_CACHE_DIR, "{{sessionDir}}/fake-cache");
+});
+
 test("the shipped built-in manifests satisfy every invariant", async () => {
   const { listAdapters, resetRegistry } = await import("../src/adapters/registry.mjs");
   resetRegistry();

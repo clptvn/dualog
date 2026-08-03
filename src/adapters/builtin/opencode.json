@@ -28,13 +28,15 @@
   "mcp": { "strategy": "none" },
   "configIsolation": {
     "env": "OPENCODE_CONFIG_DIR",
-    "dir": "{{sessionDir}}/opencode-config",
+    "dir": "{{scratchDir}}/opencode-config",
     "seedFromEnv": "OPENCODE_CONFIG_DIR",
     "seedFromFallback": "{{home}}/.config/opencode",
     "copyIfExists": ["auth.json"],
     "extraEnv": {
-      "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
-      "XDG_DATA_HOME": "{{sessionDir}}/opencode-data"
+      "OPENCODE_DISABLE_PROJECT_CONFIG": "1"
+    },
+    "dirs": {
+      "XDG_DATA_HOME": "{{scratchDir}}/opencode-data"
     }
   },
   "promptDelivery": { "headless": "argv" },

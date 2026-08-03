@@ -3,7 +3,45 @@
 
 import fs from "fs";
 import path from "path";
-import { assertManagedSessionPath, assertSeedFileName } from "../platform.mjs";
+import {
+  assertManagedLeasePath,
+  assertManagedSessionPath,
+  assertSeedFileName,
+} from "../platform.mjs";
+import { isPathVariableName } from "./schema.mjs";
+
+/**
+ * The boundary every runtime write of this turn must stay inside.
+ *
+ * A turn that has been given a per-turn lease is contained against the LEASE;
+ * one without falls back to its session directory, which is the pre-lease layout.
+ * Both are proven boundaries -- this chooses between two containment checks, it
+ * never skips one -- and the choice is made in exactly one place so no caller
+ * can write without either.
+ *
+ * A manifest still rendering `{{sessionDir}}/...` on a turn that HAS a lease
+ * fails here, loudly and with the fix named. That is deliberate: silently
+ * accepting it would put the credential copy back in the archive, which is the
+ * whole condition this design exists to end.
+ */
+function assertTurnPath(ctx, candidate, { fn }) {
+  if (!ctx.scratchDir) {
+    return assertManagedSessionPath(ctx.sessionDir, candidate, { fn });
+  }
+  try {
+    return assertManagedLeasePath(ctx.scratchDir, candidate, { fn });
+  } catch (err) {
+    if (ctx.sessionDir && candidate.startsWith(ctx.sessionDir)) {
+      throw new Error(
+        `${err.message}\nThis turn has a per-turn runtime lease, so partner homes ` +
+          `must be written under {{scratchDir}}, not {{sessionDir}}. A session ` +
+          `directory is a durable archive; anything seeded with credentials there ` +
+          `is retained for the life of the session.`
+      );
+    }
+    throw err;
+  }
+}
 
 /**
  * Marks a spawned process as a partner so that a nested copy of this MCP server
@@ -41,8 +79,8 @@ export function prepareConfigIsolation(adapter, ctx) {
   // user-supplyable, so until this line the rendered value was simply trusted:
   // whatever it named got created and had credentials copied into it. That is
   // how a live auth.json reached a public repository's working tree.
-  const targetDir = assertManagedSessionPath(
-    ctx.sessionDir,
+  const targetDir = assertTurnPath(
+    ctx,
     render(isolation.dir, ctx, adapter, "configIsolation.dir"),
     { fn: `adapter "${adapter.id}" configIsolation.dir` }
   );
@@ -63,78 +101,83 @@ export function prepareConfigIsolation(adapter, ctx) {
     }
   }
 
-  const extra = {};
-  for (const [key, template] of Object.entries(isolation.extraEnv ?? {})) {
-    // An extraEnv key equal to the isolation variable would REPLACE the
-    // validated home in the returned overlay -- see the spread at the bottom of
-    // this function -- so the containment proof above would be discarded by the
-    // very next statement. There is no legitimate reason to set it twice.
-    if (key === isolation.env) {
-      throw new Error(
-        `Adapter "${adapter.id}": configIsolation.extraEnv may not redefine ` +
-          `${isolation.env}; that variable is set from configIsolation.dir, which is ` +
-          `the value proven to be inside the session.`
-      );
-    }
-    const value = render(template, { ...ctx, isolatedDir: targetDir }, adapter, "configIsolation.extraEnv");
-    // extraEnv mixes two unrelated things under one field: RELOCATIONS
-    // (opencode's XDG_DATA_HOME={{sessionDir}}/opencode-data) and scalar
-    // SWITCHES (goose's GOOSE_DISABLE_KEYRING=1). A relocation is exactly as
-    // dangerous as isolation.dir and must be contained; a switch is not a path.
-    // Splitting the schema is the real fix; until then the DEFAULT must be
-    // containment.
-    //
-    // Inferring "is this a path?" from the rendered string was the first
-    // attempt and it was wrong in the one direction that matters: a relocation
-    // set to a bare relative name -- `cache`, or `pwned-config` -- contains no
-    // separator and is not absolute, so it sailed past and dualog created that
-    // directory relative to its own cwd, i.e. inside the user's project.
-    //
-    // So the test is inverted. A value is a scalar switch only if it is
-    // literally one of the forms a switch takes; everything else is treated as
-    // a path and must prove containment. A future manifest with a non-path
-    // string setting will fail loudly here and need one line added to
-    // isScalarSwitch() -- which is the correct direction to be wrong in.
-    if (!isScalarSwitch(value)) {
-      assertManagedSessionPath(ctx.sessionDir, value, {
-        fn: `adapter "${adapter.id}" configIsolation.extraEnv.${key}`,
-      });
-    }
-    extra[key] = value;
+  // RELOCATIONS. Contained unconditionally -- `dirs` means "this is a place",
+  // so there is nothing left to decide at runtime.
+  const relocations = {};
+  for (const [key, template] of Object.entries(isolation.dirs ?? {})) {
+    assertNotIsolationVariable(adapter, isolation, "configIsolation.dirs", key);
+    relocations[key] = assertTurnPath(
+      ctx,
+      render(
+        template,
+        { ...ctx, isolatedDir: targetDir },
+        adapter,
+        `configIsolation.dirs.${key}`
+      ),
+      { fn: `adapter "${adapter.id}" configIsolation.dirs.${key}` }
+    );
   }
 
-  // `extra` FIRST: the isolation variable is set from the value proven to be
-  // inside the session, and nothing merged afterwards may replace it. The
-  // opposite order let a single extraEnv entry silently discard the containment
-  // proof one statement after it was made.
+  // SETTINGS. Not contained, because they are not places -- and the name rule
+  // below is what makes that safe. Nothing here creates a directory; a setting
+  // only becomes a filesystem location if the partner CLI reads that variable as
+  // one, which is a fact about the NAME.
+  const settings = {};
+  for (const [key, template] of Object.entries(isolation.extraEnv ?? {})) {
+    assertNotIsolationVariable(adapter, isolation, "configIsolation.extraEnv", key);
+    assertSettingVariable(adapter, "configIsolation.extraEnv", key, "configIsolation.dirs");
+    settings[key] = render(
+      template,
+      { ...ctx, isolatedDir: targetDir },
+      adapter,
+      `configIsolation.extraEnv.${key}`
+    );
+  }
+
+  // Uncontained SETTINGS first, contained RELOCATIONS second, the isolation
+  // variable last: every value merged later is one whose location was proven,
+  // so no unchecked entry can displace a checked one. The schema rejects a key
+  // appearing in two of these maps, which makes the ordering belt-and-braces --
+  // but it is the belt that held when the collision guard did not exist.
   //
-  // Belt-and-braces behind the collision guard above, which rejects that key
-  // before this line is reached. Reverting this order alone does NOT go
-  // unnoticed, though: tests/adapter-contract.test.mjs.snapshot pins env key
-  // INSERTION order, so it fails there -- as a confusing snapshot diff rather
-  // than as a security failure. If you are here because of that diff, the
-  // ordering is deliberate; do not regenerate the snapshot to make it go away.
-  return { ...extra, [isolation.env]: targetDir };
+  // tests/adapter-contract.test.mjs.snapshot pins env key INSERTION order, so
+  // reordering these fails there as a confusing snapshot diff rather than as a
+  // security failure. If you are here because of that diff, the ordering is
+  // deliberate; do not regenerate the snapshot to make it go away.
+  return { ...settings, ...relocations, [isolation.env]: targetDir };
 }
 
 /**
- * Is this rendered value a scalar switch rather than a filesystem location?
- *
- * FOUR EXACT LITERALS, and the narrowness is the whole point. A first version
- * exempted any bare integer and matched case-insensitively, which meant
- * `XDG_DATA_HOME=123` and `XDG_DATA_HOME=TRUE` sailed through uncontained --
- * and a partner CLI resolves a relative value like that against its own working
- * directory, i.e. the user's project. Identical to the `pwned-config` hole,
- * spelled with digits.
- *
- * Residual, stated rather than papered over: a manifest could still set a
- * relocation variable to the literal `0`, `1`, `true` or `false` and have the
- * partner resolve it relatively. That is four strings rather than an open set,
- * and closing it properly needs the schema to say which keys are paths
- * (`dirs:`) and which are settings (`env:`) instead of this guessing at it.
+ * A key in either map that equals the isolation variable would REPLACE the
+ * validated home in the returned overlay, discarding the containment proof one
+ * statement after it was made. There is no legitimate reason to set it twice.
  */
-function isScalarSwitch(value) {
-  return value === "0" || value === "1" || value === "true" || value === "false";
+function assertNotIsolationVariable(adapter, isolation, field, key) {
+  if (key !== isolation.env) return;
+  throw new Error(
+    `Adapter "${adapter.id}": ${field} may not redefine ${isolation.env}; ` +
+      `that variable is set from configIsolation.dir, which is the value proven ` +
+      `to be inside the session.`
+  );
+}
+
+/**
+ * Refuse to deliver a filesystem location through a settings map.
+ *
+ * The schema says the same thing at load time; this is the boundary that
+ * actually holds, because a manifest can also reach the runtime through the
+ * registry merge. It replaces isScalarSwitch(), which tried to infer the answer
+ * from the rendered VALUE and could not: `auto` and `pwned-config` are the same
+ * shape, so the check either rejected goose's real mode setting or admitted a
+ * bare relative directory that the partner resolved against the user's project.
+ */
+function assertSettingVariable(adapter, field, key, dirsField) {
+  if (!isPathVariableName(key)) return;
+  throw new Error(
+    `Adapter "${adapter.id}": ${field}.${key} names a filesystem location, which ` +
+      `must be declared under ${dirsField} so the rendered path is proven to be ` +
+      `inside the session.`
+  );
 }
 
 /**
@@ -153,8 +196,25 @@ function isScalarSwitch(value) {
 export function staticEnv(adapter, ctx) {
   const out = {};
   for (const [key, template] of Object.entries(adapter.env ?? {})) {
+    // The hole this closes: `adapter.env` is merged into the launch environment
+    // independently of configIsolation, so before the split a manifest could
+    // hand a partner any directory on the machine through a variable its own
+    // isolation did not happen to relocate -- no containment check ran on this
+    // path at all. A location now has to be declared below, where one does.
+    assertSettingVariable(adapter, "env", key, "dirs");
     const value = renderOptional(template, ctx, adapter, `env.${key}`);
     if (value != null) out[key] = value;
+  }
+
+  // Static RELOCATIONS, contained like every other directory a partner is given.
+  // Merged after settings so a proven path cannot be displaced by an unproven
+  // one, matching the order prepareConfigIsolation uses.
+  for (const [key, template] of Object.entries(adapter.dirs ?? {})) {
+    const value = renderOptional(template, ctx, adapter, `dirs.${key}`);
+    if (value == null) continue;
+    out[key] = assertTurnPath(ctx, value, {
+      fn: `adapter "${adapter.id}" dirs.${key}`,
+    });
   }
   return out;
 }
@@ -254,8 +314,8 @@ export function applyMcpSuppression(adapter, ctx) {
   // free-form Template that this function creates directories for and writes a
   // file to. Containing only the isolation directory would leave an equally
   // unchecked write one field away.
-  const configPath = assertManagedSessionPath(
-    ctx.sessionDir,
+  const configPath = assertTurnPath(
+    ctx,
     render(mcp.path, ctx, adapter, "mcp.path"),
     { fn: `adapter "${adapter.id}" mcp.path` }
   );

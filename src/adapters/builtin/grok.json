@@ -40,7 +40,7 @@
   "mcp": { "strategy": "config-dir" },
   "configIsolation": {
     "env": "GROK_HOME",
-    "dir": "{{sessionDir}}/grok-home",
+    "dir": "{{scratchDir}}/grok-home",
     "seedFromEnv": "GROK_HOME",
     "seedFromFallback": "{{home}}/.grok",
     "copyIfMissing": ["auth.json"],

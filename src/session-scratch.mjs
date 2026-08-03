@@ -31,10 +31,10 @@
 
 import fs from "fs";
 import path from "path";
-import { execFileSync } from "child_process";
 
 import { dialogsDir, legacyDialogsDir } from "./platform.mjs";
-import { tmuxSocketName } from "./tmux-runtime.mjs";
+import { probeTmuxSessionSync } from "./tmux-runtime.mjs";
+import { probeGroup, probeProcess } from "./process-probe.mjs";
 
 /**
  * The exact shape the server generates. Not `isValidSessionId()` plus a prefix.
@@ -47,66 +47,6 @@ import { tmuxSocketName } from "./tmux-runtime.mjs";
 const GENERATED_SESSION_ID = /^(dialog|review)-\d+-[0-9a-f]{8}$/;
 
 /**
- * Three-valued liveness. `isProcessAlive()` is not usable at this boundary.
- *
- * It catches every error as "dead", so a process that exists but belongs to
- * another user answers `false` -- verified: `isProcessAlive(1)` returns false
- * on this machine even though pid 1 obviously exists, because `kill(1, 0)`
- * raises EPERM. For deciding whether to SIGNAL something that conservatism is
- * fine. For deciding whether to DELETE a live CLI's home it is exactly
- * backwards: EPERM means the process is THERE.
- */
-function probeProcess(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return "invalid";
-  try {
-    process.kill(pid, 0);
-    return "alive";
-  } catch (err) {
-    if (err.code === "ESRCH") return "absent";
-    if (err.code === "EPERM") return "alive";
-    return "unknown";
-  }
-}
-
-function probeGroup(pgid) {
-  if (!Number.isSafeInteger(pgid) || pgid <= 0) return "invalid";
-  try {
-    process.kill(-pgid, 0);
-    return "alive";
-  } catch (err) {
-    if (err.code === "ESRCH") return "absent";
-    if (err.code === "EPERM") return "alive";
-    return "unknown";
-  }
-}
-
-/**
- * Is this tmux session still there? Three-valued, deliberately.
- *
- * `isTmuxSessionAlive()` collapses "tmux is not installed" and "that session is
- * gone" into the same `false`, which is safe for its own callers and unsafe
- * here: it would let a machine without tmux declare every preserved pane dead.
- */
-function probeTmuxSession(sessionName) {
-  if (typeof sessionName !== "string" || !sessionName) return "unknown";
-  try {
-    const out = execFileSync("tmux", ["-L", tmuxSocketName(), "list-sessions", "-F", "#{session_name}"], {
-      encoding: "utf-8",
-      timeout: 5000,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    return out.split("\n").some((line) => line.trim() === sessionName) ? "alive" : "absent";
-  } catch (err) {
-    // "no server running" is a definitive absence; anything else (tmux missing,
-    // permission denied, timeout) is not knowledge.
-    const text = `${err?.stderr ?? ""}${err?.message ?? ""}`;
-    if (/no server running|no such file or directory.*tmux/i.test(text)) return "absent";
-    if (err?.code === "ENOENT") return "unknown";
-    return "unknown";
-  }
-}
-
-/**
  * Every directory name dualog has ever generated inside a session as a partner
  * home, by version.
  *
@@ -116,9 +56,12 @@ function probeTmuxSession(sessionName) {
  * this list, because a name that was removed from a manifest is exactly the
  * name still sitting on disk from before.
  *
- * `opencode-data` is here even though it was declared in `extraEnv` rather than
- * `configIsolation.dir`, and `codex-home` predates the manifest refactor
- * entirely. Deriving this list from the schema would have missed both.
+ * `opencode-data` is here even though no `configIsolation.dir` ever named it --
+ * it was declared in `extraEnv`, and is now a `configIsolation.dirs` entry --
+ * and `codex-home` predates the manifest refactor entirely. Deriving this list
+ * from the schema would have missed both, and note that the field those homes
+ * were declared under has already changed once since they were written, which
+ * is the whole argument for an exact ledger over a derived one.
  */
 export const SCRATCH_LEDGER = [
   {
@@ -299,7 +242,17 @@ export function proveSessionInactive(sessionDir) {
   if (terminal.state === "invalid") return block(terminal.reason);
   if (terminal.state === "valid") {
     const sessionName = terminal.value.session_name;
-    const probe = probeTmuxSession(sessionName);
+    // Shared with the runtime rather than reimplemented here. The private copy
+    // this replaces got two things wrong that both showed up on real machines:
+    // it shelled out to a bare `tmux`, so a DUALOG_TMUX_BINARY override meant
+    // cleanup interrogated a different tmux than the one holding the session;
+    // and its absence pattern did not match what tmux 3.5a actually prints when
+    // no server is listening ("error connecting to <socket> (No such file or
+    // directory)"), so on any machine whose server was not running -- after a
+    // reboot, say -- every session carrying a current_terminal.json probed
+    // `unknown` and was retained forever. Credentials that this module exists
+    // to reclaim were never reclaimed.
+    const probe = probeTmuxSessionSync(sessionName);
     if (probe === "alive") return block(`tmux session ${sessionName} is still running`);
     if (probe !== "absent") {
       // Includes tmux being unavailable, which is NOT evidence the pane is gone.

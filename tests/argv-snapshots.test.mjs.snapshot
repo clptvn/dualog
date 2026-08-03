@@ -7,7 +7,7 @@ exports[`argv: claude / effort valid for codex but not claude is dropped 1`] = `
     "--allowedTools",
     "Read,Grep,Glob,Bash,LSP",
     "--mcp-config",
-    "<SESSION_DIR>/claude-empty-mcp.json",
+    "<SCRATCH_DIR>/claude-empty-mcp.json",
     "--strict-mcp-config",
     "--add-dir",
     "/fixture/project",
@@ -35,7 +35,7 @@ exports[`argv: claude / implementation profile 1`] = `
     "--allowedTools",
     "Read,Grep,Glob,Bash,LSP,Edit,MultiEdit,Write",
     "--mcp-config",
-    "<SESSION_DIR>/claude-empty-mcp.json",
+    "<SCRATCH_DIR>/claude-empty-mcp.json",
     "--strict-mcp-config",
     "--add-dir",
     "/fixture/project",
@@ -61,7 +61,7 @@ exports[`argv: claude / model and effort together 1`] = `
     "--allowedTools",
     "Read,Grep,Glob,Bash,LSP,Edit,MultiEdit,Write",
     "--mcp-config",
-    "<SESSION_DIR>/claude-empty-mcp.json",
+    "<SCRATCH_DIR>/claude-empty-mcp.json",
     "--strict-mcp-config",
     "--add-dir",
     "/fixture/project",
@@ -91,7 +91,7 @@ exports[`argv: claude / model only 1`] = `
     "--allowedTools",
     "Read,Grep,Glob,Bash,LSP",
     "--mcp-config",
-    "<SESSION_DIR>/claude-empty-mcp.json",
+    "<SCRATCH_DIR>/claude-empty-mcp.json",
     "--strict-mcp-config",
     "--add-dir",
     "/fixture/project",
@@ -121,7 +121,7 @@ exports[`argv: claude / read profile / no model / no effort 1`] = `
     "--allowedTools",
     "Read,Grep,Glob,Bash,LSP",
     "--mcp-config",
-    "<SESSION_DIR>/claude-empty-mcp.json",
+    "<SCRATCH_DIR>/claude-empty-mcp.json",
     "--strict-mcp-config",
     "--add-dir",
     "/fixture/project",
@@ -149,7 +149,7 @@ exports[`argv: claude / unknown tool profile falls back to read 1`] = `
     "--allowedTools",
     "Read,Grep,Glob,Bash,LSP",
     "--mcp-config",
-    "<SESSION_DIR>/claude-empty-mcp.json",
+    "<SCRATCH_DIR>/claude-empty-mcp.json",
     "--strict-mcp-config",
     "--add-dir",
     "/fixture/project",
@@ -177,7 +177,7 @@ exports[`argv: claude / valid effort 1`] = `
     "--allowedTools",
     "Read,Grep,Glob,Bash,LSP",
     "--mcp-config",
-    "<SESSION_DIR>/claude-empty-mcp.json",
+    "<SCRATCH_DIR>/claude-empty-mcp.json",
     "--strict-mcp-config",
     "--add-dir",
     "/fixture/project",
@@ -215,7 +215,7 @@ exports[`argv: codex / effort not in the codex set is dropped 1`] = `
     "approval_policy=\\"never\\""
   ],
   "env": {
-    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "CODEX_HOME": "<SCRATCH_DIR>/codex-home",
     "DUALOG_ROLE": "partner",
     "DUALOG_DEPTH": "1"
   },
@@ -240,7 +240,7 @@ exports[`argv: codex / implementation profile does not change argv 1`] = `
     "approval_policy=\\"never\\""
   ],
   "env": {
-    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "CODEX_HOME": "<SCRATCH_DIR>/codex-home",
     "DUALOG_ROLE": "partner",
     "DUALOG_DEPTH": "1"
   },
@@ -266,7 +266,7 @@ exports[`argv: codex / initial prompt is appended as a positional 1`] = `
     "Read the prompt file at:\\n/fixture/session/turns/t1/prompt.md"
   ],
   "env": {
-    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "CODEX_HOME": "<SCRATCH_DIR>/codex-home",
     "DUALOG_ROLE": "partner",
     "DUALOG_DEPTH": "1"
   },
@@ -293,7 +293,7 @@ exports[`argv: codex / model only 1`] = `
     "gpt-5.6-sol"
   ],
   "env": {
-    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "CODEX_HOME": "<SCRATCH_DIR>/codex-home",
     "DUALOG_ROLE": "partner",
     "DUALOG_DEPTH": "1"
   },
@@ -323,7 +323,7 @@ exports[`argv: codex / model, effort, and initial prompt together 1`] = `
     "Read the prompt file at:\\n/fixture/session/turns/t1/prompt.md"
   ],
   "env": {
-    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "CODEX_HOME": "<SCRATCH_DIR>/codex-home",
     "DUALOG_ROLE": "partner",
     "DUALOG_DEPTH": "1"
   },
@@ -348,7 +348,7 @@ exports[`argv: codex / read profile / no model / no effort 1`] = `
     "approval_policy=\\"never\\""
   ],
   "env": {
-    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "CODEX_HOME": "<SCRATCH_DIR>/codex-home",
     "DUALOG_ROLE": "partner",
     "DUALOG_DEPTH": "1"
   },
@@ -375,7 +375,7 @@ exports[`argv: codex / valid effort 1`] = `
     "model_reasoning_effort=\\"ultra\\""
   ],
   "env": {
-    "CODEX_HOME": "<SESSION_DIR>/codex-home",
+    "CODEX_HOME": "<SCRATCH_DIR>/codex-home",
     "DUALOG_ROLE": "partner",
     "DUALOG_DEPTH": "1"
   },

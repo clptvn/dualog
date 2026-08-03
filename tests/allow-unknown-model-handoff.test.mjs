@@ -39,7 +39,7 @@ const adapter = (id) =>
 // An earlier version of this file used REPO_ROOT and quietly deposited live
 // credentials in the working tree on every run -- one `git add -A` away from
 // being committed.
-const { home: SESSION_HOME, dir: SESSION_DIR } = managedSession("handoff");
+const { home: SESSION_HOME, dir: SESSION_DIR, scratchDir: SCRATCH_DIR } = managedSession("handoff");
 process.on("exit", () => fs.rmSync(SESSION_HOME, { recursive: true, force: true }));
 
 /** A live, enumerable catalog that does NOT contain the requested id. */
@@ -81,6 +81,7 @@ test("the argv builder honors the flag too -- the turn is where it must survive"
       partnerCommand: "codex",
       projectPath: REPO_ROOT,
       sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
       sessionName: "x",
       model: "some-unlisted-model",
       discoveredModels: CATALOG_WITHOUT,

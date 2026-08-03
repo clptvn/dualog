@@ -14,6 +14,7 @@
 // dialogsDir() resolve normally. node:test runs each FILE in its own process,
 // so mutating the environment at module scope stays inside that file.
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -54,5 +55,29 @@ export function managedSession(label = "test", { keepAdapterSeeds = [] } = {}) {
   const dir = path.join(home, ".dualog", "sessions", sessionId);
   fs.mkdirSync(dir, { recursive: true });
 
-  return { home, sessionId, dir };
+  return { home, sessionId, dir, scratchDir: managedLease() };
+}
+
+/**
+ * A runtime lease directory that satisfies the lease containment boundary.
+ *
+ * Partner homes no longer live in the session directory: they live in a
+ * per-turn lease under `~/.dualog/runtime`, which is removed as soon as the
+ * turn's process is proven gone. `assertManagedLeasePath()` requires a direct,
+ * exactly-named child of that root, so -- exactly as with sessions -- a test
+ * that hands the isolation path an arbitrary temp directory is handing it the
+ * shape the assertion exists to reject.
+ *
+ * This creates the directory directly rather than going through
+ * `allocateLease()`, because these tests exercise argv and env construction
+ * rather than the lease lifecycle: they need a valid destination, not a turn
+ * pointer and a state machine. The lifecycle has its own suite.
+ *
+ * Call after HOME is redirected -- the root resolves from os.homedir().
+ */
+export function managedLease() {
+  const id = crypto.randomBytes(16).toString("hex");
+  const dir = path.join(os.homedir(), ".dualog", "runtime", id);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
 }

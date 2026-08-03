@@ -25,7 +25,7 @@ import { managedSession } from "./helpers/session.mjs";
 // so drop any depth inherited from a dualog partner running this suite.
 clearRecursionSentinel();
 
-const { home: ROOT, dir: SESSION_DIR } = managedSession("contract");
+const { home: ROOT, dir: SESSION_DIR, scratchDir: SCRATCH_DIR } = managedSession("contract");
 process.on("exit", () => fs.rmSync(ROOT, { recursive: true, force: true }));
 
 // Isolate from any adapters this developer has installed locally.
@@ -41,6 +41,7 @@ function invoke(adapter, engine, toolProfile) {
     engine,
     projectPath: "/fixture/project",
     sessionDir: SESSION_DIR,
+    scratchDir: SCRATCH_DIR,
     sessionName: "fixture-session",
     model: "fixture-model",
     reasoningEffort: adapter.reasoningEfforts[0] ?? null,
@@ -216,16 +217,27 @@ test("claude-sonnet-4-6 accepts max but not xhigh", () => {
 
 test("argv for every adapter and engine", (t) => {
   const matrix = {};
+  // SCRATCH_DIR first: the lease path is where partner homes now live, and it
+  // is a sibling of neither the session nor the home, so it needs its own token.
+  const redact = (text) =>
+    text
+      .split(SCRATCH_DIR)
+      .join("<SCRATCH_DIR>")
+      .split(SESSION_DIR)
+      .join("<SESSION_DIR>")
+      .split(os.homedir())
+      .join("<HOME>");
+
   for (const adapter of ADAPTERS) {
     for (const engine of adapter.engines.allowed) {
       const { command, args, env } = invoke(adapter, engine, adapter.defaultToolProfile);
       matrix[`${adapter.id}/${engine}`] = {
         command,
-        args: args.map((a) => a.replace(SESSION_DIR, "<SESSION_DIR>").replace(os.homedir(), "<HOME>")),
+        args: args.map((a) => redact(a)),
         env: Object.fromEntries(
           Object.entries(env).map(([k, v]) => [
             k,
-            String(v).replace(SESSION_DIR, "<SESSION_DIR>").replace(os.homedir(), "<HOME>"),
+            redact(String(v)),
           ])
         ),
       };

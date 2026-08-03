@@ -105,9 +105,54 @@ Rules are evaluated in order; `when` is `{set}`, `{notSet}`, or `{equals}`.
 Values are normalized *before* argv is built — an effort your CLI does not
 accept is already null — so a rule never has to re-validate.
 
-Template variables: `home`, `projectPath`, `sessionDir`, `sessionName`, `model`,
-`reasoningEffort`, `reasoningEffortJson`, `initialPrompt`, `toolProfile`,
-`toolProfileAllowedTools`, `toolProfileDisallowedTools`, `mcpConfigPath`.
+Template variables: `home`, `projectPath`, `sessionDir`, `scratchDir`,
+`sessionName`, `model`, `reasoningEffort`, `reasoningEffortJson`,
+`initialPrompt`, `toolProfile`, `toolProfileAllowedTools`,
+`toolProfileDisallowedTools`, `mcpConfigPath`.
+
+### `scratchDir` for runtime state, `sessionDir` for the record
+
+These two are not interchangeable, and picking the wrong one is the difference
+between a credential copy that lives for one turn and one that lives forever.
+
+| | lifetime | use it for |
+|---|---|---|
+| `{{scratchDir}}` | one turn — deleted as soon as that turn's process is proven gone | config homes, data/cache dirs, MCP config files, settings files |
+| `{{sessionDir}}` | the life of the session, kept as an archive | `--add-dir` grants so the partner can write `result.md` and `done.json` |
+
+**Anything seeded with credentials goes under `{{scratchDir}}`.** Config
+isolation used to point partner homes at the session directory, which is kept so
+a conversation can be reread later — so every session ever run retained a live
+copy of the partner's auth. A manifest that renders `{{sessionDir}}` into a
+config home is now refused at runtime rather than quietly retained.
+
+### Directories go in `dirs`, settings go in `env`
+
+Environment variables split into two kinds, and the manifest has to say which it
+means:
+
+| | field | rule |
+|---|---|---|
+| **A directory** the CLI should use | `dirs`, `configIsolation.dirs` | the rendered path must resolve inside the turn's runtime lease, or the turn is refused |
+| **A setting** the CLI reads | `env`, `configIsolation.extraEnv` | passed through untouched; may not name a location |
+
+```json
+"configIsolation": {
+  "env": "MYCLI_HOME", "dir": "{{scratchDir}}/mycli-home",
+  "dirs":     { "XDG_DATA_HOME": "{{scratchDir}}/mycli-data" },
+  "extraEnv": { "MYCLI_DISABLE_KEYRING": "1" }
+}
+```
+
+Putting a directory in a settings map is refused at load: variables named like
+locations (`XDG_*`, `*_HOME`, `*_DIR`, `*_PATH`, `*_ROOT`) and values that look
+like paths are rejected with a message naming the entry.
+
+This is not stylistic. The two used to share one field, so dualog had to guess
+which kind each entry was by looking at the value — and `auto` (goose's real
+mode setting) is the same shape as `pwned-config`. Whichever way the guess was
+tuned, it either rejected a legitimate setting or created an attacker-named
+directory relative to the user's own project.
 
 ---
 
@@ -157,8 +202,8 @@ which makes it structurally recursion-proof.
                     "addDir": false, "writesFiles": true, "tuiDrivable": "risky" },
   "mcp": { "strategy": "none" },
   "configIsolation": {
-    "env": "CRUSH_GLOBAL_CONFIG", "dir": "{{sessionDir}}/crush-config",
-    "extraEnv": { "CRUSH_GLOBAL_DATA": "{{sessionDir}}/crush-data" }
+    "env": "CRUSH_GLOBAL_CONFIG", "dir": "{{scratchDir}}/crush-config",
+    "dirs": { "CRUSH_GLOBAL_DATA": "{{scratchDir}}/crush-data" }
   },
   "promptDelivery": { "headless": "argv" },
   "argv": { "headless": [
@@ -185,7 +230,7 @@ loads, so isolation is partial.
   "capabilities": { "modelFlag": true, "reasoningEffort": false, "toolProfiles": "none",
                     "addDir": true, "writesFiles": true, "tuiDrivable": "no" },
   "mcp": { "strategy": "none" },
-  "configIsolation": { "env": "COPILOT_HOME", "dir": "{{sessionDir}}/copilot-home" },
+  "configIsolation": { "env": "COPILOT_HOME", "dir": "{{scratchDir}}/copilot-home" },
   "promptDelivery": { "headless": "argv" },
   "argv": { "headless": [
     { "args": ["--allow-all-tools", "--no-ask-user", "--add-dir", "{{sessionDir}}"] },
