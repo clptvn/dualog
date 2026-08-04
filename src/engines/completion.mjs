@@ -112,7 +112,29 @@ export function readCompletion({ turnDir, resultPath, donePath }) {
     typeof done?.result_path === "string" && done.result_path.trim()
       ? done.result_path
       : resultPath;
-  const resolvedResultPath = assertPathInside(turnDir, selectedResultPath);
+
+  // done.json's result_path is ADVISORY, and the only value the protocol ever
+  // asks for is the canonical path this runner built and pasted into the
+  // prompt. So a declared path outside the turn directory is a partner
+  // mislabeling its own work, not a relocation to honor -- observed in practice
+  // with a small model that wrote result.md exactly where it was told and then
+  // reconstructed the long absolute path wrong when echoing it back.
+  //
+  // The old behavior threw here, which discarded a correct, already-written
+  // result over a bad label; three such turns in a row shut the runner down.
+  // Falling back to the canonical path is strictly SAFER than the alternative
+  // anyone would reach for -- the out-of-tree path is still never read, and the
+  // fallback target is one this process chose. It also cannot serve a stale
+  // answer, because the turn directory is created fresh per turn, so a
+  // result.md exists there only if this turn's partner wrote it.
+  let resolvedResultPath;
+  let rejectedDeclaredPath = null;
+  try {
+    resolvedResultPath = assertPathInside(turnDir, selectedResultPath);
+  } catch (err) {
+    rejectedDeclaredPath = err;
+    resolvedResultPath = assertPathInside(turnDir, resultPath);
+  }
 
   let resultExists = false;
   let resultSize = 0;
@@ -135,6 +157,13 @@ export function readCompletion({ turnDir, resultPath, donePath }) {
     );
   }
   if (!resultExists) {
+    // The fallback above only rescues a partner that wrote the file correctly
+    // and described it wrongly. With nothing at the canonical path either,
+    // there is no result to rescue and the bad path is the real diagnosis --
+    // so it is raised rather than swallowed. Returning null here instead would
+    // be worse than the behavior this replaced: the poll loop would spin until
+    // the turn timed out, reporting a hang instead of the actual mistake.
+    if (rejectedDeclaredPath) throw rejectedDeclaredPath;
     if (status === "error") {
       return {
         status,
@@ -160,6 +189,13 @@ export function readCompletion({ turnDir, resultPath, donePath }) {
     status,
     result,
     error: typeof done?.error === "string" ? done.error : null,
+    // Surfaced so a rescued turn is not silently indistinguishable from a
+    // clean one: the partner still got the protocol wrong, and that is worth
+    // seeing in the log even though the turn was saved.
+    warning: rejectedDeclaredPath
+      ? `Partner declared an out-of-turn result_path (${selectedResultPath}); ` +
+        `ignored it and read the canonical ${resultPath}`
+      : null,
   };
 }
 

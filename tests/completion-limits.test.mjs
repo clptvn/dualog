@@ -77,6 +77,84 @@ test("a result exactly at the limit is still accepted", (t) => {
   assert.equal(out.result.length, 1024);
 });
 
+// --- a mislabeled result path ------------------------------------------------
+//
+// Found by running the thing: gpt-5.3-codex-spark wrote result.md exactly where
+// it was told, then rebuilt the long absolute path wrong when echoing it into
+// done.json. The correct answer was on disk and got thrown away, and three such
+// turns in a row shut the runner down.
+
+test("a result written correctly but labeled wrongly is still read", (t) => {
+  const turnDir = makeTurn(t);
+  const resultPath = path.join(turnDir, "result.md");
+  const donePath = path.join(turnDir, "done.json");
+  fs.writeFileSync(resultPath, "4\n");
+  fs.writeFileSync(
+    donePath,
+    JSON.stringify({ status: "ok", result_path: "/somewhere/else/entirely/result.md" })
+  );
+
+  const out = readCompletion({ turnDir, resultPath, donePath });
+  assert.equal(out.result, "4\n", "the canonical path is used when the declared one is bogus");
+  assert.match(out.warning, /out-of-turn result_path/, "the mislabeling is still reported");
+});
+
+test("the out-of-tree path itself is never read", (t) => {
+  const turnDir = makeTurn(t);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-outside-"));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  const decoy = path.join(outside, "result.md");
+  fs.writeFileSync(decoy, "CONTENT FROM OUTSIDE THE TURN DIRECTORY");
+
+  const resultPath = path.join(turnDir, "result.md");
+  const donePath = path.join(turnDir, "done.json");
+  fs.writeFileSync(resultPath, "the real result");
+  fs.writeFileSync(donePath, JSON.stringify({ status: "ok", result_path: decoy }));
+
+  const out = readCompletion({ turnDir, resultPath, donePath });
+  assert.equal(out.result, "the real result", "falling back must not follow the partner's path");
+});
+
+test("a bogus path with nothing at the canonical location still errors", (t) => {
+  // The fallback rescues a misdescribed result; it must not convert a genuine
+  // mistake into an infinite poll. Returning null here would hang the turn
+  // until its timeout and report a hang instead of the real cause.
+  const turnDir = makeTurn(t);
+  const resultPath = path.join(turnDir, "result.md");
+  const donePath = path.join(turnDir, "done.json");
+  fs.writeFileSync(donePath, JSON.stringify({ status: "ok", result_path: "/nope/result.md" }));
+
+  assert.throws(
+    () => readCompletion({ turnDir, resultPath, donePath }),
+    /outside the turn directory/
+  );
+});
+
+test("a traversal path is rejected the same way, not followed", (t) => {
+  const turnDir = makeTurn(t);
+  const resultPath = path.join(turnDir, "result.md");
+  const donePath = path.join(turnDir, "done.json");
+  fs.writeFileSync(resultPath, "the real result");
+  fs.writeFileSync(
+    donePath,
+    JSON.stringify({ status: "ok", result_path: "../../../etc/passwd" })
+  );
+
+  const out = readCompletion({ turnDir, resultPath, donePath });
+  assert.equal(out.result, "the real result");
+  assert.match(out.warning, /out-of-turn result_path/);
+});
+
+test("an ordinary completion carries no warning", (t) => {
+  const turnDir = makeTurn(t);
+  const resultPath = path.join(turnDir, "result.md");
+  const donePath = path.join(turnDir, "done.json");
+  fs.writeFileSync(resultPath, "fine");
+  fs.writeFileSync(donePath, JSON.stringify({ status: "ok", result_path: resultPath }));
+
+  assert.equal(readCompletion({ turnDir, resultPath, donePath }).warning, null);
+});
+
 // --- the conversation log as a whole -----------------------------------------
 
 test("the log has a session-wide ceiling, not just a per-entry one", async (t) => {

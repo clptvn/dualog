@@ -474,6 +474,7 @@ async function runHeadlessTurnInner({
   }
 
   const sidecar = readCompletion({ turnDir, resultPath, donePath });
+  if (sidecar?.warning) log(sidecar.warning);
   const policy = adapter.completion.sidecar;
 
   if (sidecar?.status === "error") {

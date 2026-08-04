@@ -815,6 +815,7 @@ async function waitForSidecarCompletion({
 
     const completion = readCompletion({ turnDir, resultPath, donePath });
     if (completion) {
+      if (completion.warning) log(completion.warning);
       if (completion.status === "error") {
         throw new PartnerTerminalFailureError(
           `${partnerDisplay} reported an interactive turn error: ${completion.error || completion.result}`,
