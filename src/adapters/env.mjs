@@ -99,6 +99,12 @@ export function prepareConfigIsolation(adapter, ctx) {
       assertSeedFileName(name, { fn: `adapter "${adapter.id}" configIsolation.copyIfExists` });
       copyIfExists(path.join(seedDir, name), path.join(targetDir, name));
     }
+    // Applied after BOTH copy passes, so it cannot be skipped by moving a file
+    // between copyIfMissing and copyIfExists.
+    for (const [name, tables] of Object.entries(isolation.dropTomlTables ?? {})) {
+      assertSeedFileName(name, { fn: `adapter "${adapter.id}" configIsolation.dropTomlTables` });
+      applyTomlDrops(path.join(targetDir, name), tables);
+    }
   }
 
   // RELOCATIONS. Contained unconditionally -- `dirs` means "this is a place",
@@ -372,6 +378,98 @@ function copyIfMissing(sourcePath, targetPath) {
     if (!fs.existsSync(targetPath)) copyIfExists(sourcePath, targetPath);
   } catch {
     // Same rationale as copyIfExists.
+  }
+}
+
+/**
+ * Normalize one TOML table path to dotted, unquoted segments.
+ *
+ * `[mcp_servers."dualog"]` and `[mcp_servers.dualog]` name the same table, so a
+ * stripper that only understood one spelling would silently leave the other in
+ * place -- and silently leaving THIS table in place hands the partner dualog.
+ */
+function normalizeTomlPath(raw) {
+  const segments = [];
+  let current = "";
+  let quote = null;
+  for (const ch of raw.trim()) {
+    if (quote) {
+      if (ch === quote) quote = null;
+      else current += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === ".") {
+      segments.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  segments.push(current.trim());
+  return segments.filter(Boolean).join(".");
+}
+
+/**
+ * Remove whole TOML tables, and everything nested beneath them, from a string.
+ *
+ * Line-based rather than parse-and-reserialize on purpose: this file is the
+ * user's real configuration, and a round trip through a TOML writer would
+ * rewrite formatting, drop comments, and normalize values the CLI may read
+ * differently. Only the targeted tables are touched; every other byte survives.
+ *
+ * Multi-line strings are tracked because a `[...]` line inside one is content,
+ * not a table header, and treating it as a header would resume copying in the
+ * middle of a value.
+ */
+export function dropTomlTables(text, tables) {
+  const targets = (tables ?? []).map(normalizeTomlPath).filter(Boolean);
+  if (!targets.length) return text;
+
+  const lines = String(text).split("\n");
+  const kept = [];
+  let dropping = false;
+  let openDelimiter = null;
+
+  for (const line of lines) {
+    if (openDelimiter) {
+      if (line.includes(openDelimiter)) openDelimiter = null;
+      if (!dropping) kept.push(line);
+      continue;
+    }
+
+    const header = /^\s*\[\[?([^\]]+)\]\]?\s*(?:#.*)?$/.exec(line);
+    if (header) {
+      const name = normalizeTomlPath(header[1]);
+      // A table is dropped with its subtables: dropping `mcp_servers.dualog`
+      // while keeping `mcp_servers.dualog.env` would leave an orphan table
+      // that reintroduces the server under a partial definition.
+      dropping = targets.some((t) => name === t || name.startsWith(`${t}.`));
+    } else if (!dropping) {
+      for (const delimiter of ['"""', "'''"]) {
+        const first = line.indexOf(delimiter);
+        if (first !== -1 && line.indexOf(delimiter, first + 3) === -1) {
+          openDelimiter = delimiter;
+          break;
+        }
+      }
+    }
+
+    if (!dropping) kept.push(line);
+  }
+
+  return kept.join("\n");
+}
+
+function applyTomlDrops(targetPath, tables) {
+  try {
+    if (!fs.existsSync(targetPath)) return;
+    const original = fs.readFileSync(targetPath, "utf-8");
+    const stripped = dropTomlTables(original, tables);
+    if (stripped !== original) fs.writeFileSync(targetPath, stripped, { mode: 0o600 });
+  } catch {
+    // A seed we could not rewrite is left as copied. The alternative -- deleting
+    // it -- would take the trust table and every global server with it, turning
+    // a containment miss into a broken turn.
   }
 }
 

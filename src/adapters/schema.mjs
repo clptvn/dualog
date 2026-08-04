@@ -214,6 +214,26 @@ const ConfigIsolation = z
     copyIfExists: z.array(z.string()).default([]),
 
     /**
+     * TOML tables to strip out of a seeded file after it is copied.
+     *
+     * Seeding a CLI's real config is what makes its PROJECT-LOCAL config work:
+     * codex merges a project's `.codex/config.toml` over the global one, so a
+     * project table that overrides a global server (`enabled = false` and
+     * nothing else) has no transport to merge with when the global file is
+     * absent -- and codex rejects the whole file and exits. Isolating the
+     * config home without carrying the config is what produced that.
+     *
+     * But the real config also names dualog's own MCP server, and a partner
+     * that can call dualog can open its own dialogs. Dropping the table is the
+     * containment: `-c mcp_servers.dualog.enabled=false` would instead CREATE a
+     * transport-less table for anyone who has no dualog server configured,
+     * which is the exact failure this whole mechanism exists to avoid.
+     *
+     * Keyed by seed file name; each value is a list of dotted table paths.
+     */
+    dropTomlTables: z.record(z.string(), z.array(z.string())).default({}),
+
+    /**
      * Further RELOCATIONS, each contained exactly as `dir` is.
      *
      * Several CLIs need more than one variable to be fully relocated -- one for

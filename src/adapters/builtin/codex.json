@@ -88,7 +88,8 @@
     "seedFromEnv": "CODEX_HOME",
     "seedFromFallback": "{{home}}/.codex",
     "copyIfMissing": ["auth.json"],
-    "copyIfExists": ["version.json"]
+    "copyIfExists": ["version.json", "config.toml"],
+    "dropTomlTables": { "config.toml": ["mcp_servers.dualog"] }
   },
 
   "promptDelivery": { "tmux-interactive": "argv" },
