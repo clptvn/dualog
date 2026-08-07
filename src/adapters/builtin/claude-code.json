@@ -10,7 +10,7 @@
 
   "engines": {
     "default": "tmux-interactive",
-    "allowed": ["tmux-interactive"]
+    "allowed": ["tmux-interactive", "headless"]
   },
 
   "capabilities": {
@@ -83,10 +83,10 @@
   "toolProfiles": {
     "read": {
       "allowedTools": "Read,Grep,Glob,Bash,LSP",
-      "disallowedTools": "Edit,MultiEdit,Write,NotebookEdit"
+      "disallowedTools": "Edit,Write,NotebookEdit"
     },
     "implementation": {
-      "allowedTools": "Read,Grep,Glob,Bash,LSP,Edit,MultiEdit,Write"
+      "allowedTools": "Read,Grep,Glob,Bash,LSP,Edit,Write"
     }
   },
 
@@ -98,14 +98,14 @@
 
   "configIsolation": null,
 
-  "promptDelivery": { "tmux-interactive": "tui-paste" },
+  "promptDelivery": { "tmux-interactive": "tui-paste", "headless": "argv" },
 
   "argv": {
     "tmux-interactive": [
       {
         "args": [
           "--permission-mode",
-          "bypassPermissions",
+          "dontAsk",
           "--allowedTools",
           "{{toolProfileAllowedTools}}",
           "--mcp-config",
@@ -128,6 +128,35 @@
         "when": { "set": "reasoningEffort" },
         "args": ["--effort", "{{reasoningEffort}}"]
       }
+    ],
+    "headless": [
+      {
+        "args": [
+          "--print",
+          "--no-session-persistence",
+          "--permission-mode",
+          "dontAsk",
+          "--allowedTools",
+          "{{toolProfileAllowedTools}}",
+          "--mcp-config",
+          "{{mcpConfigPath}}",
+          "--strict-mcp-config",
+          "--add-dir",
+          "{{projectPath}}",
+          "--add-dir",
+          "{{sessionDir}}"
+        ]
+      },
+      {
+        "when": { "set": "toolProfileDisallowedTools" },
+        "args": ["--disallowedTools", "{{toolProfileDisallowedTools}}"]
+      },
+      { "when": { "set": "model" }, "args": ["--model", "{{model}}"] },
+      {
+        "when": { "set": "reasoningEffort" },
+        "args": ["--effort", "{{reasoningEffort}}"]
+      },
+      { "when": { "set": "initialPrompt" }, "args": ["{{initialPrompt}}"] }
     ]
   },
 

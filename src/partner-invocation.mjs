@@ -8,12 +8,14 @@ import {
   buildTmuxSessionName,
   captureTmuxPane,
   inspectPartnerTerminal,
-  isTmuxAvailable,
+  prepareTmuxInvocation,
   probeTmuxSession,
   readTerminalState,
   sendTextToTmux,
   startTmuxSession,
   terminateTmuxSession,
+  tmuxPaneProcessStartTime,
+  translateTmuxPath,
   writeTerminalState,
 } from "./tmux-runtime.mjs";
 import { buildInvocationFromAdapter } from "./adapters/argv.mjs";
@@ -34,7 +36,7 @@ import {
   buildBootstrapPrompt,
   readCompletion,
 } from "./engines/completion.mjs";
-import { resolveEngine } from "./engines/index.mjs";
+import { resolveRunnableEngine } from "./engines/index.mjs";
 import { runHeadlessTurn } from "./engines/headless.mjs";
 
 const VALID_TOOL_PROFILES = new Set(["read", "implementation"]);
@@ -218,8 +220,6 @@ export async function runPartnerCommand({
   }
 
   const resolvedAdapter = getAdapter(normalizedAgent);
-  const engine = resolveEngine(resolvedAdapter, { requested: requestedEngine, log });
-
   const turnId = `${tempPrefix || normalizedAgent}-${Date.now()}-${crypto
     .randomBytes(4)
     .toString("hex")}`;
@@ -236,14 +236,13 @@ export async function runPartnerCommand({
     fn: "runPartnerCommand turn directory",
   });
 
-  // Only now: whether tmux happens to be installed is an ENVIRONMENT question,
-  // and it used to be asked first -- so on a machine without tmux an unmanaged
-  // session directory was refused with "tmux is required" instead of the
-  // containment error, and the boundary was effectively gated behind a probe.
-  // A security decision must not depend on what is on PATH.
-  if (engine === "tmux-interactive" && !(await isTmuxAvailable())) {
-    throw new Error("tmux is required for interactive partner sessions but was not found on PATH");
-  }
+  // Runtime availability is deliberately checked after containment. Whether
+  // tmux/WSL is installed must not decide if an unsafe session path is refused.
+  const engine = await resolveRunnableEngine(resolvedAdapter, {
+    requested: requestedEngine,
+    partnerCommand,
+    log,
+  });
 
   fs.mkdirSync(turnDir, { recursive: true });
 
@@ -312,12 +311,18 @@ export async function runPartnerCommand({
       path.basename(sessionDir),
       turnId
     );
+    const [partnerPromptPath, partnerResultPath, partnerDonePath, partnerProjectPath] =
+      await Promise.all(
+        [promptPath, resultPath, donePath, projectPath].map((value) =>
+          translateTmuxPath(value)
+        )
+      );
     const bootstrap = buildBootstrapPrompt({
       partnerDisplay,
-      promptPath,
-      resultPath,
-      donePath,
-      projectPath,
+      promptPath: partnerPromptPath,
+      resultPath: partnerResultPath,
+      donePath: partnerDonePath,
+      projectPath: partnerProjectPath,
       responseInstruction,
     });
     // Whether the bootstrap goes in argv or gets pasted into the TUI is the
@@ -380,6 +385,13 @@ export async function runPartnerCommand({
     }
     if (lease) transitionLease(lease, "ready");
 
+    const tmuxInvocation = await prepareTmuxInvocation({
+      cwd: projectPath,
+      command,
+      args,
+      env,
+    });
+
     const timeoutHint =
       typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
         ? timeoutMs
@@ -390,9 +402,10 @@ export async function runPartnerCommand({
       display_name: partnerDisplay,
       session_name: sessionName,
       pane_target: `${sessionName}:0.0`,
-      cwd: projectPath,
-      command,
-      args,
+      tmux_transport: tmuxInvocation.tmuxTransport,
+      cwd: tmuxInvocation.cwd,
+      command: tmuxInvocation.command,
+      args: tmuxInvocation.args,
       turn_dir: turnDir,
       prompt_path: promptPath,
       result_path: resultPath,
@@ -410,7 +423,7 @@ export async function runPartnerCommand({
 
     try {
       log(
-        `Invoking ${partnerDisplay} interactively via tmux session "${sessionName}" (prompt: ${prompt.length} chars, tool profile: ${normalizedToolProfile}, timeout hint: ${timeoutHint ? `${timeoutHint / 1000}s` : "none"})`
+        `Invoking ${partnerDisplay} interactively via ${tmuxInvocation.tmuxTransport === "wsl" ? "WSL tmux" : "tmux"} session "${sessionName}" (prompt: ${prompt.length} chars, tool profile: ${normalizedToolProfile}, timeout hint: ${timeoutHint ? `${timeoutHint / 1000}s` : "none"})`
       );
 
       // Recorded BEFORE the pane can exist. tmux session names are deterministic
@@ -425,10 +438,10 @@ export async function runPartnerCommand({
       }
       handle = await startTmuxSession({
         sessionName,
-        cwd: projectPath,
-        command,
-        args,
-        env,
+        cwd: tmuxInvocation.cwd,
+        command: tmuxInvocation.command,
+        args: tmuxInvocation.args,
+        env: tmuxInvocation.env,
       });
       if (lease) {
         transitionLease(lease, "active", {
@@ -436,15 +449,23 @@ export async function runPartnerCommand({
           // demonstrably reclaimed the home while the partner was still shutting
           // down, and it then recreated the directory to flush its cache.
           consumer: {
-          kind: "tmux",
-          session_name: sessionName,
-          pane_pid: handle.panePid ?? null,
-          // Distinguishes "we could not identify this pane" from "this record
-          // predates pane identities"; see probeConsumer.
-          pane_pid_unavailable: handle.panePidUnavailable === true,
-          // Qualifies the pid against reuse; see probeRecordedProcess.
-          pane_started_at: handle.panePid ? processStartTime(handle.panePid) : null,
-        },
+            kind: "tmux",
+            session_name: sessionName,
+            tmux_transport: handle.tmuxTransport,
+            pane_pid: handle.panePid ?? null,
+            // Distinguishes "we could not identify this pane" from "this record
+            // predates pane identities"; see probeConsumer.
+            pane_pid_unavailable: handle.panePidUnavailable === true,
+            // Qualifies the pid against reuse; WSL PIDs are never probed as
+            // native Windows processes.
+            pane_started_at: handle.panePid
+              ? handle.tmuxTransport === "wsl"
+                ? tmuxPaneProcessStartTime(handle.panePid, {
+                    transport: handle.tmuxTransport,
+                  })
+                : processStartTime(handle.panePid)
+              : null,
+          },
         });
       }
       state = writeTerminalState(

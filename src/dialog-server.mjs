@@ -47,9 +47,10 @@ import { describeAdapter, negotiate } from "./adapters/negotiate.mjs";
 import { isEnumerable, modelIds } from "./adapters/schema.mjs";
 import { resolveDiscovery } from "./adapters/discovery.mjs";
 import { resolveDiscoveryForValidation } from "./adapters/resolve-for-validation.mjs";
-import { ENGINES, resolveEngine } from "./engines/index.mjs";
+import { ENGINES, resolveRunnableEngine } from "./engines/index.mjs";
 import { reapOrphanedHeadlessChildren } from "./engines/headless.mjs";
 import { sweepLeases } from "./runtime-lease.mjs";
+import { tmuxRoute } from "./tmux-runtime.mjs";
 
 const server = new McpServer({
   name: "dualog",
@@ -357,7 +358,7 @@ async function preflightPartner(partnerAgent, {
 
   let engine;
   try {
-    engine = resolveEngine(adapter);
+    engine = await resolveRunnableEngine(adapter, { partnerCommand });
   } catch (err) {
     return { ok: false, errorText: err.message };
   }
@@ -379,6 +380,10 @@ async function preflightPartner(partnerAgent, {
     result = negotiate(adapter, {
       engine,
       partnerCommand,
+      // resolveRunnableEngine() already ran this exact partner command through
+      // the WSL shell tmux uses. A native PATH probe would reject that verified
+      // WSL executable before a Windows host can start an interactive turn.
+      requireBinary: !(engine === "tmux-interactive" && tmuxRoute().transport === "wsl"),
       toolProfile: toolProfile || "read",
       model: model || null,
       reasoningEffort: requestedEffort,
@@ -404,6 +409,7 @@ async function preflightPartner(partnerAgent, {
 
   return {
     ok: true,
+    engine,
     // What the caller asked for, echoed back untouched. This is the only field
     // that can prove the parameter survived transport: `effort` below is the
     // RESOLVED value, and a legitimate alias translation (goose maps xhigh ->
@@ -871,6 +877,7 @@ server.tool(
       hard_cap: hardCap,
       reasoning_effort: effectiveReasoningEffort,
       model: effectiveModel ?? null,
+      engine: preflight.engine,
       partner_timeout_ms: partnerTimeoutMs,
       tool_profile: tool_profile || "read",
       allow_unknown_model: allow_unknown_model === true,
@@ -956,12 +963,13 @@ server.tool(
               warnings: preflightWarnings,
               notices: preflight.notices ?? [],
               model: effectiveModel ?? "default",
+              engine: preflight.engine,
               partner_timeout_ms: partnerTimeoutMs,
               tool_profile: tool_profile || "read",
               subject_path: subjectPath,
               subject_kind: subjectPath ? (subject_kind || "document") : null,
               message:
-                `Dialog started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${effectiveModel ?? "default"}, reasoning effort: ${describeEffort(effectiveReasoningEffort, preflight.effectiveEffort)}, tool profile: ${tool_profile || "read"}. Partner turns run in detached tmux and are not killed by the wait hint. Send your first message with send_message, then wait for ${partnerDisplay}.`,
+                `Dialog started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${effectiveModel ?? "default"}, reasoning effort: ${describeEffort(effectiveReasoningEffort, preflight.effectiveEffort)}, tool profile: ${tool_profile || "read"}. Partner turns run ${preflight.engine === "headless" ? "headlessly and may be stopped by the wait hint" : "in detached tmux and are not killed by the wait hint"}. Send your first message with send_message, then wait for ${partnerDisplay}.`,
             },
             null,
             2
@@ -1270,6 +1278,7 @@ server.tool(
       hard_cap: hardCap,
       reasoning_effort: effectiveReasoningEffort,
       model: effectiveModel ?? null,
+      engine: preflight.engine,
       partner_timeout_ms: partnerTimeoutMs,
       allow_unknown_model: allow_unknown_model === true,
       runner_pid: null,
@@ -1362,9 +1371,10 @@ server.tool(
               warnings: preflightWarnings,
               notices: preflight.notices ?? [],
               model: effectiveModel ?? "default",
+              engine: preflight.engine,
               partner_timeout_ms: partnerTimeoutMs,
               message:
-                `Code review started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${effectiveModel ?? "default"}, reasoning effort: ${describeEffort(effectiveReasoningEffort, preflight.effectiveEffort)}. ${partnerDisplay} is generating an initial review in detached tmux and is not killed by the wait hint.` +
+                `Code review started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${effectiveModel ?? "default"}, reasoning effort: ${describeEffort(effectiveReasoningEffort, preflight.effectiveEffort)}. ${partnerDisplay} is generating an initial review ${preflight.engine === "headless" ? "headlessly and may be stopped by the wait hint" : "in detached tmux and is not killed by the wait hint"}.` +
                 (diff.length > MAX_REVIEW_DIFF_CHARS
                   ? ` NOTE: this diff is ${diff.length} chars and only the first ${MAX_REVIEW_DIFF_CHARS} (${Math.round((MAX_REVIEW_DIFF_CHARS / diff.length) * 100)}%) are embedded in ${partnerDisplay}'s prompt. It is instructed to read the changed files from ${project_path} for the remainder, but treat any finding that depends on the unembedded portion as unverified unless it cites the file it read.`
                   : ""),
@@ -2109,7 +2119,9 @@ server.tool(
 
     let resolvedEngine;
     try {
-      resolvedEngine = resolveEngine(adapter, { requested: engine ?? null });
+      resolvedEngine = await resolveRunnableEngine(adapter, {
+        requested: engine ?? null,
+      });
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${err.message}` }] };
     }
@@ -2129,6 +2141,9 @@ server.tool(
 
     const result = negotiate(adapter, {
       engine: resolvedEngine,
+      requireBinary: !(
+        resolvedEngine === "tmux-interactive" && tmuxRoute().transport === "wsl"
+      ),
       model: model ?? null,
       reasoningEffort: reasoning_effort ?? null,
       toolProfile: tool_profile ?? null,

@@ -55,7 +55,7 @@ import {
 } from "./platform.mjs";
 import { probeGroup, probeProcess, probeRecordedProcess } from "./process-probe.mjs";
 import { probeDirectoryInUse } from "./directory-usage.mjs";
-import { probeTmuxSessionSync } from "./tmux-runtime.mjs";
+import { probeTmuxSessionSync, probeWslPaneProcess } from "./tmux-runtime.mjs";
 
 const LEASE_SCHEMA_VERSION = 1;
 /**
@@ -657,7 +657,10 @@ function probeConsumer(consumer) {
     // The RECORDED process, not merely its pid: after a crash and pid reuse an
     // unrelated long-lived process would otherwise make this lease look alive
     // forever, retaining a credential copy permanently.
-    const pane = probeRecordedProcess(consumer.pane_pid, consumer.pane_started_at ?? null);
+    const pane =
+      consumer.tmux_transport === "wsl"
+        ? probeWslPaneProcess(consumer.pane_pid, consumer.pane_started_at ?? null)
+        : probeRecordedProcess(consumer.pane_pid, consumer.pane_started_at ?? null);
     if (pane === "invalid") return "unknown";
     return pane;
   }

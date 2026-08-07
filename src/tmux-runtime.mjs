@@ -1,37 +1,124 @@
 import fs from "fs";
 import path from "path";
 import { execFile, spawnSync } from "child_process";
-import { envWithAliases } from "./platform.mjs";
 import { tryGetAdapter } from "./adapters/registry.mjs";
 import { isBlocked, isIdlePrompt } from "./tui/markers.mjs";
 
 const DEFAULT_TMUX_BINARY = "tmux";
 const DEFAULT_TMUX_SOCKET_NAME = "dualog";
+const DEFAULT_WSL_BINARY = "wsl.exe";
 const TMUX_EXEC_TIMEOUT_MS = 10000;
 const DEFAULT_CAPTURE_LINES = 240;
 const DEFAULT_CAPTURE_MAX_CHARS = 30000;
 const DEFAULT_TAIL_LINES = 6;
 const DEFAULT_TAIL_MAX_CHARS = 3000;
 
-function tmuxBinary() {
-  const configured =
-    envWithAliases(
-      ["DUALOG_TMUX_BINARY", "CODEX_DIALOG_TMUX_BINARY", "CONDUCTOR_TMUX_BINARY"],
-      DEFAULT_TMUX_BINARY
-    );
-  const trimmed = configured.trim();
+const TMUX_BINARY_ENV = [
+  "DUALOG_TMUX_BINARY",
+  "CODEX_DIALOG_TMUX_BINARY",
+  "CONDUCTOR_TMUX_BINARY",
+];
+const WSL_BINARY_ENV = [
+  "DUALOG_WSL_BINARY",
+  "CODEX_DIALOG_WSL_BINARY",
+  "CONDUCTOR_WSL_BINARY",
+];
+const WSL_DISTRO_ENV = [
+  "DUALOG_WSL_DISTRO",
+  "CODEX_DIALOG_WSL_DISTRO",
+  "CONDUCTOR_WSL_DISTRO",
+];
+
+function configuredEnvValue(names, env = process.env) {
+  for (const name of names) {
+    const value = env[name];
+    if (value != null && value !== "") return value;
+  }
+  return null;
+}
+
+function tmuxBinary(env = process.env) {
+  const configured = configuredEnvValue(TMUX_BINARY_ENV, env);
+  const trimmed = (configured ?? DEFAULT_TMUX_BINARY).trim();
   if (!trimmed) {
     throw new Error("tmux binary path must not be empty");
   }
   return trimmed;
 }
 
+function wslBinary(env = process.env) {
+  const configured = configuredEnvValue(WSL_BINARY_ENV, env);
+  const trimmed = (configured ?? DEFAULT_WSL_BINARY).trim();
+  if (!trimmed) {
+    throw new Error("WSL binary path must not be empty");
+  }
+  return trimmed;
+}
+
+function wslDistro(env = process.env) {
+  const configured = configuredEnvValue(WSL_DISTRO_ENV, env);
+  return configured ? configured.trim() || null : null;
+}
+
+/**
+ * Which tmux process owns sessions created from this host?
+ *
+ * Native Windows has no usable tmux runtime of its own. When no explicit tmux
+ * binary override is configured, use the user's default WSL distribution. An
+ * explicit DUALOG_TMUX_BINARY retains its historic meaning: the operator owns
+ * that executable and dualog invokes it directly.
+ */
+export function tmuxRoute({ env = process.env, platform = process.platform } = {}) {
+  const configuredTmux = configuredEnvValue(TMUX_BINARY_ENV, env);
+  const binary = tmuxBinary(env);
+  if (platform === "win32" && configuredTmux == null) {
+    return {
+      transport: "wsl",
+      command: wslBinary(env),
+      distro: wslDistro(env),
+      tmuxBinary: binary,
+    };
+  }
+  return { transport: "local", command: binary, distro: null, tmuxBinary: binary };
+}
+
+function wslCommandArgs(commandArgs, env = process.env) {
+  const distro = wslDistro(env);
+  return [
+    ...(distro ? ["--distribution", distro] : []),
+    "--exec",
+    ...commandArgs,
+  ];
+}
+
+function tmuxCommandArgs(args, { env = process.env, platform = process.platform } = {}) {
+  const route = tmuxRoute({ env, platform });
+  const tmuxArgs = buildTmuxArgs(args, { env });
+  return {
+    route,
+    command: route.command,
+    args:
+      route.transport === "wsl"
+        ? wslCommandArgs([route.tmuxBinary, ...tmuxArgs], env)
+        : tmuxArgs,
+  };
+}
+
+export function isWindowsPath(value) {
+  return typeof value === "string" && /^[A-Za-z]:[\\/]/.test(value);
+}
+
 function runExecFile(command, args) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     execFile(
       command,
       args,
-      { encoding: "utf-8", timeout: TMUX_EXEC_TIMEOUT_MS, killSignal: "SIGKILL" },
+      {
+        encoding: "utf-8",
+        timeout: TMUX_EXEC_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+        windowsHide: process.platform === "win32",
+      },
       (error, stdout, stderr) => {
         if (error) {
           const code =
@@ -54,7 +141,8 @@ function runExecFile(command, args) {
 }
 
 export async function runTmux(args, { allowFailure = false } = {}) {
-  const result = await runExecFile(tmuxBinary(), buildTmuxArgs(args));
+  const invocation = tmuxCommandArgs(args);
+  const result = await runExecFile(invocation.command, invocation.args);
   if (!allowFailure && result.exitCode !== 0) {
     throw new Error(
       `tmux ${args.join(" ")} failed with exit ${result.exitCode}: ${result.stderr || result.stdout}`
@@ -70,6 +158,7 @@ export async function runTmux(args, { allowFailure = false } = {}) {
  * caller to stop using a runtime that is merely slow.
  */
 export async function probeTmuxAvailability() {
+  const route = tmuxRoute();
   let result;
   try {
     result = await runTmux(["-V"], { allowFailure: true });
@@ -80,11 +169,150 @@ export async function probeTmuxAvailability() {
   // execFile reports a binary that will not spawn as 127 and a killed call as
   // 124; only the former proves tmux is not there.
   if (result.exitCode === 127) return "missing";
+  if (
+    route.transport === "wsl" &&
+    /(?:execvpe\(tmux\)|tmux: .*not found|no installed distributions)/i.test(
+      `${result.stderr}\n${result.stdout}`
+    )
+  ) {
+    return "missing";
+  }
   return "unknown";
 }
 
 export async function isTmuxAvailable() {
   return (await probeTmuxAvailability()) === "available";
+}
+
+/** Convert a native absolute path for a WSL-hosted tmux command. */
+export async function translateTmuxPath(value, { route = tmuxRoute() } = {}) {
+  if (route.transport !== "wsl" || !isWindowsPath(value)) return value;
+  const result = await runExecFile(
+    route.command,
+    wslCommandArgs(["wslpath", "-a", "-u", value])
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `WSL could not translate path ${value}: ${result.stderr || result.stdout}`
+    );
+  }
+  const translated = result.stdout.trim();
+  if (!translated) throw new Error(`WSL returned no translation for path ${value}`);
+  return translated;
+}
+
+/**
+ * Convert the values a Linux CLI receives while leaving filesystem setup on the
+ * Windows host. Config isolation and sidecars are created before this runs, so
+ * they remain the same files through WSL's /mnt/<drive> mount.
+ */
+export async function prepareTmuxInvocation(
+  { cwd, command, args = [], env = {} },
+  { route = tmuxRoute(), convertPath } = {}
+) {
+  if (route.transport !== "wsl") {
+    return { cwd, command, args: [...args], env: { ...env }, tmuxTransport: route.transport };
+  }
+
+  const cache = new Map();
+  const convert =
+    convertPath ??
+    (async (value) => {
+      if (!isWindowsPath(value)) return value;
+      if (!cache.has(value)) {
+        cache.set(value, translateTmuxPath(value, { route }));
+      }
+      return cache.get(value);
+    });
+
+  const convertedEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    convertedEnv[key] = await convert(value);
+  }
+
+  return {
+    cwd: await convert(cwd),
+    command: await convert(command),
+    args: await Promise.all(args.map((arg) => convert(arg))),
+    env: convertedEnv,
+    tmuxTransport: route.transport,
+  };
+}
+
+/** Is the selected partner command runnable from the WSL distribution tmux uses? */
+export async function probeWslPartnerCommand(command, versionArgs = []) {
+  const route = tmuxRoute();
+  if (route.transport !== "wsl") return "not-applicable";
+  if (typeof command !== "string" || !command.trim()) return "unavailable";
+
+  const executable = await translateTmuxPath(command, { route });
+  const result = await runExecFile(
+    route.command,
+    // Match tmux's payload exactly. WSL's direct --exec path does not include
+    // the Windows-integrated PATH that an interactive /bin/sh receives, so a
+    // valid Claude installation can otherwise look absent during preflight.
+    wslCommandArgs([
+      "sh",
+      "-lc",
+      'exec "$@"',
+      "dualog-wsl-probe",
+      executable,
+      ...versionArgs,
+    ])
+  );
+  return result.exitCode === 0 ? "available" : "unavailable";
+}
+
+export function tmuxPaneProcessStartTime(pid, { transport = tmuxRoute().transport } = {}) {
+  if (transport !== "wsl" || !Number.isSafeInteger(pid) || pid <= 0) return null;
+  const route = tmuxRoute();
+  if (route.transport !== "wsl") return null;
+  try {
+    const result = spawnSync(
+      route.command,
+      wslCommandArgs(["ps", "-o", "lstart=", "-p", String(pid)]),
+      {
+        encoding: "utf-8",
+        timeout: 2000,
+        killSignal: "SIGKILL",
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: process.platform === "win32",
+      }
+    );
+    return result.status === 0 ? result.stdout.trim() || null : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Probe a WSL pane PID from native Windows without mistaking it for a Win32 PID. */
+export function probeWslPaneProcess(pid, recordedStartTime = null) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return "invalid";
+  const route = tmuxRoute();
+  if (route.transport !== "wsl") return "invalid";
+  let result;
+  try {
+    result = spawnSync(
+      route.command,
+      wslCommandArgs(["ps", "-o", "lstart=", "-p", String(pid)]),
+      {
+        encoding: "utf-8",
+        timeout: 2000,
+        killSignal: "SIGKILL",
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: process.platform === "win32",
+      }
+    );
+  } catch {
+    return "unknown";
+  }
+  if (result.error || result.status == null) return "unknown";
+  const startedAt = String(result.stdout || "").trim();
+  if (result.status === 1 && !startedAt && !String(result.stderr || "").trim()) {
+    return "absent";
+  }
+  if (result.status !== 0 || !startedAt) return "unknown";
+  return recordedStartTime && startedAt !== recordedStartTime ? "absent" : "alive";
 }
 
 export function buildTmuxSessionName(sessionId, label) {
@@ -97,6 +325,7 @@ export function buildTmuxSessionName(sessionId, label) {
 }
 
 export async function startTmuxSession({ sessionName, cwd, command, args, env }) {
+  const route = tmuxRoute();
   await prepareTmuxServer();
   const payload = buildTmuxShellPayload({ command, args, env });
   try {
@@ -160,6 +389,7 @@ export async function startTmuxSession({ sessionName, cwd, command, args, env })
       command,
       args: [...args],
       env: env ? { ...env } : undefined,
+      tmuxTransport: route.transport,
       startedAt: new Date().toISOString(),
     };
   } catch (err) {
@@ -303,11 +533,13 @@ export function probeTmuxSessionSync(sessionName) {
   if (!target) return "unknown";
   let result;
   try {
-    result = spawnSync(tmuxBinary(), buildTmuxArgs(["has-session", "-t", target]), {
+    const invocation = tmuxCommandArgs(["has-session", "-t", target]);
+    result = spawnSync(invocation.command, invocation.args, {
       encoding: "utf-8",
       timeout: TMUX_EXEC_TIMEOUT_MS,
       killSignal: "SIGKILL",
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: process.platform === "win32",
     });
   } catch {
     return "unknown";
@@ -823,10 +1055,10 @@ function readJson(filePath) {
  * waiting to happen, so there is one.
  */
 export function tmuxSocketName() {
-  const socketName = envWithAliases(
-    ["DUALOG_TMUX_SOCKET", "CODEX_DIALOG_TMUX_SOCKET", "CONDUCTOR_TMUX_SOCKET"],
-    DEFAULT_TMUX_SOCKET_NAME
-  );
+  const socketName =
+    configuredEnvValue(
+      ["DUALOG_TMUX_SOCKET", "CODEX_DIALOG_TMUX_SOCKET", "CONDUCTOR_TMUX_SOCKET"]
+    ) ?? DEFAULT_TMUX_SOCKET_NAME;
   const trimmedSocketName = socketName.trim();
   if (!trimmedSocketName || trimmedSocketName.includes("/") || trimmedSocketName.includes("\0")) {
     throw new Error("tmux socket name must be a non-empty name, not a path");
@@ -834,8 +1066,21 @@ export function tmuxSocketName() {
   return trimmedSocketName;
 }
 
-function buildTmuxArgs(args) {
-  return ["-f", "/dev/null", "-L", tmuxSocketName(), ...args];
+function buildTmuxArgs(args, { env = process.env } = {}) {
+  const socketName =
+    configuredEnvValue(
+      ["DUALOG_TMUX_SOCKET", "CODEX_DIALOG_TMUX_SOCKET", "CONDUCTOR_TMUX_SOCKET"],
+      env
+    ) ?? DEFAULT_TMUX_SOCKET_NAME;
+  const trimmedSocketName = socketName.trim();
+  if (
+    !trimmedSocketName ||
+    trimmedSocketName.includes("/") ||
+    trimmedSocketName.includes("\0")
+  ) {
+    throw new Error("tmux socket name must be a non-empty name, not a path");
+  }
+  return ["-f", "/dev/null", "-L", trimmedSocketName, ...args];
 }
 
 async function prepareTmuxServer() {

@@ -10,7 +10,7 @@
 
   "engines": {
     "default": "tmux-interactive",
-    "allowed": ["tmux-interactive"]
+    "allowed": ["tmux-interactive", "headless"]
   },
 
   "capabilities": {
@@ -92,7 +92,7 @@
     "dropTomlTables": { "config.toml": ["mcp_servers.dualog"] }
   },
 
-  "promptDelivery": { "tmux-interactive": "argv" },
+  "promptDelivery": { "tmux-interactive": "argv", "headless": "argv" },
 
   "argv": {
     "tmux-interactive": [
@@ -107,6 +107,27 @@
           "--ask-for-approval",
           "never",
           "--no-alt-screen",
+          "-c",
+          "approval_policy=\"never\""
+        ]
+      },
+      { "when": { "set": "model" }, "args": ["--model", "{{model}}"] },
+      {
+        "when": { "set": "reasoningEffort" },
+        "args": ["-c", "model_reasoning_effort={{reasoningEffortJson}}"]
+      },
+      { "when": { "set": "initialPrompt" }, "args": ["{{initialPrompt}}"] }
+    ],
+    "headless": [
+      {
+        "args": [
+          "exec",
+          "--cd",
+          "{{projectPath}}",
+          "--sandbox",
+          "workspace-write",
+          "--add-dir",
+          "{{sessionDir}}",
           "-c",
           "approval_policy=\"never\""
         ]

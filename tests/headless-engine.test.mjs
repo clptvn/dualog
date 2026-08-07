@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { runHeadlessTurn, extractStdoutResult } from "../src/engines/headless.mjs";
-import { resolveEngine } from "../src/engines/index.mjs";
+import { resolveEngine, resolveRunnableEngine } from "../src/engines/index.mjs";
 import { buildBootstrapPrompt } from "../src/engines/completion.mjs";
 import { loadRegistry, resetRegistry } from "../src/adapters/registry.mjs";
 import { writeFakeCli, writeFakeAdapter } from "./helpers/fake-cli.mjs";
@@ -59,6 +59,13 @@ const REG = {
   },
 };
 const registry = loadRegistry(REG);
+
+const WSL_CAPABLE_ADAPTER = {
+  id: "wsl-capable",
+  binary: { default: "partner", versionArgs: ["--version"] },
+  engines: { default: "tmux-interactive", allowed: ["tmux-interactive", "headless"] },
+  __sources: ["wsl-capable.json"],
+};
 
 function setupTurn(name) {
   const sessionDir = fs.mkdtempSync(path.join(ROOT, `session-${name}-`));
@@ -226,8 +233,46 @@ test("an operator-level default is honored when the adapter supports it", () => 
   );
 });
 
+test("a runnable WSL partner keeps the interactive tmux engine", async () => {
+  const engine = await resolveRunnableEngine(WSL_CAPABLE_ADAPTER, {
+    partnerCommand: "partner",
+    tmuxRouteFn: () => ({ transport: "wsl" }),
+    probeTmuxAvailabilityFn: async () => "available",
+    probeWslPartnerCommandFn: async (command, versionArgs) => {
+      assert.equal(command, "partner");
+      assert.deepEqual(versionArgs, ["--version"]);
+      return "available";
+    },
+  });
+  assert.equal(engine, "tmux-interactive");
+});
+
+test("an unavailable WSL partner falls back to its declared headless engine", async () => {
+  const messages = [];
+  const engine = await resolveRunnableEngine(WSL_CAPABLE_ADAPTER, {
+    tmuxRouteFn: () => ({ transport: "wsl" }),
+    probeTmuxAvailabilityFn: async () => "available",
+    probeWslPartnerCommandFn: async () => "unavailable",
+    log: (message) => messages.push(message),
+  });
+  assert.equal(engine, "headless");
+  assert.match(messages.join("\n"), /WSL tmux is available/);
+});
+
+test("an explicit WSL tmux request fails instead of silently falling back", async () => {
+  await assert.rejects(
+    resolveRunnableEngine(WSL_CAPABLE_ADAPTER, {
+      requested: "tmux-interactive",
+      tmuxRouteFn: () => ({ transport: "wsl" }),
+      probeTmuxAvailabilityFn: async () => "available",
+      probeWslPartnerCommandFn: async () => "unavailable",
+    }),
+    /could not run there.*requires a runnable tmux partner session/s
+  );
+});
+
 test("user adapters are discovered via DUALOG_ADAPTER_PATH", () => {
   // The path a user adding a brand-new CLI takes, with no source edit.
   assert.ok(registry.has("fake-sidecar-ok"));
-  assert.match(registry.get("fake-sidecar-ok").__sources[0], /adapters\/fake-sidecar-ok\.json$/);
+  assert.match(registry.get("fake-sidecar-ok").__sources[0], /adapters[\\/]fake-sidecar-ok\.json$/);
 });

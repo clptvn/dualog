@@ -263,7 +263,15 @@ function checkPartnerClis(spawn, logStep) {
   const hasTmux = runCli(spawn, "tmux", ["-V"], { allowFailure: true });
   console.log(hasClaude ? "  Claude Code CLI OK" : "  WARNING: Claude Code CLI not found on PATH.");
   console.log(hasCodex ? "  Codex CLI OK" : "  WARNING: Codex CLI not found on PATH.");
-  console.log(hasTmux ? "  tmux OK" : "  WARNING: tmux not found on PATH. Partner sessions require tmux.");
+  if (hasTmux) {
+    console.log("  tmux OK");
+  } else if (process.platform === "win32") {
+    console.log(
+      "  tmux not found on PATH. Native Windows uses WSL tmux when it is available; compatible partners otherwise use headless mode."
+    );
+  } else {
+    console.log("  WARNING: tmux not found on PATH. Partner sessions require tmux.");
+  }
   return { hasClaude, hasCodex, hasTmux };
 }
 

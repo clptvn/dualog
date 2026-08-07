@@ -79,10 +79,20 @@ else {
 /** A minimal headless-capable manifest pointed at a fake binary. */
 export function writeFakeAdapter(adapterDir, id, binaryPath, overrides = {}) {
   fs.mkdirSync(adapterDir, { recursive: true });
+  const invokeViaNode = process.platform === "win32" && binaryPath.endsWith(".mjs");
+  const binary = invokeViaNode ? process.execPath : binaryPath;
+  const binaryArgs = invokeViaNode ? [binaryPath] : [];
+  const declaredArgs = overrides.argv?.headless ?? [{ args: ["--run", "{{initialPrompt}}"] }];
+  const argv = {
+    ...overrides.argv,
+    headless: declaredArgs.map((entry, index) =>
+      index === 0 ? { ...entry, args: [...binaryArgs, ...(entry.args ?? [])] } : entry
+    ),
+  };
   const manifest = {
     id,
     displayName: id,
-    binary: { default: binaryPath },
+    binary: { default: binary },
     engines: { default: "headless", allowed: ["headless"] },
     capabilities: {
       modelFlag: true,
@@ -94,12 +104,13 @@ export function writeFakeAdapter(adapterDir, id, binaryPath, overrides = {}) {
     },
     mcp: { strategy: "none" },
     promptDelivery: { headless: "argv" },
-    argv: { headless: [{ args: ["--run", "{{initialPrompt}}"] }] },
+    argv,
     completion: {
       sidecar: "always",
       stdoutTrustworthy: false,
     },
     ...overrides,
+    argv,
   };
   const file = path.join(adapterDir, `${id}.json`);
   fs.writeFileSync(file, JSON.stringify(manifest, null, 2));

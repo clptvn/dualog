@@ -22,8 +22,8 @@ Run `list_adapters` to see which are installed on your machine.
 
 | Agent | id | Engine | Notes |
 | --- | --- | --- | --- |
-| Claude Code | `claude` | tmux | Renders inline, no alt screen — the best TUI target |
-| Codex | `codex` | tmux | `--oss --local-provider ollama` drives local models with no extra setup |
+| Claude Code | `claude` | tmux or headless | Renders inline, no alt screen — the best TUI target |
+| Codex | `codex` | tmux or headless | `--oss --local-provider ollama` drives local models with no extra setup |
 | Grok Build | `grok` | tmux or headless | Positional prompt seeds the TUI, so no keystroke injection |
 | opencode | `opencode` | headless | Best route to local/OSS models via an OpenAI-compatible base URL |
 | Qwen Code | `qwen` | headless | Full `OPENAI_BASE_URL` support (Ollama, LM Studio, vLLM, OpenRouter) |
@@ -49,7 +49,16 @@ npm run setup            # or: --claude | --codex | --both
 ```
 
 Requires Node ≥ 18, `tmux` for tmux-engine partners, and whichever agent CLIs
-you actually want to use. macOS, Linux, and WSL.
+you actually want to use. macOS, Linux, Windows, and WSL are supported.
+
+On native Windows, dualog automatically runs interactive sessions through tmux
+in the default WSL distribution, converting project, session, and isolated
+config paths to their WSL locations. It first checks that both tmux and the
+selected partner CLI are available in that distribution. If an adapter supports
+headless mode and its WSL CLI is unavailable, dualog falls back to headless
+instead. Set `DUALOG_WSL_DISTRO` to select a different distribution or
+`DUALOG_WSL_BINARY` to use a non-default WSL launcher. An explicit
+`DUALOG_TMUX_BINARY` continues to run tmux directly rather than through WSL.
 
 Upgrading from `claude-codex-dialog`? The installer migrates you: it removes the
 old `codex-dialog` MCP registration, rewrites hook matchers, and deletes the old
