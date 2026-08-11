@@ -73,12 +73,16 @@ Add `partner:<agent-id>` to any of them to choose who reviews.
 
 `start_dialog`, `start_code_review`, `send_message`, `check_messages`,
 `wait_for_partner_response`, `get_full_history`, `get_review_summary`,
-`check_partner_alive`, `end_dialog`, `list_sessions`, and:
+`check_partner_alive`, `send_key`, `end_dialog`, `list_sessions`, and:
 
 - **`list_adapters`** — every agent this server can drive, its capabilities, and
   whether its binary is actually installed
 - **`check_adapter`** — preflight one agent against the options you intend to
   use, before starting a session
+- **`send_key`** — send one printable or navigation key to the current managed
+  partner pane; `submit: true` follows a menu choice such as `2` with Enter.
+  Inspect the exact prompt with `check_partner_alive` first, and re-check it
+  afterward; the tool reports tmux delivery, not acceptance by the partner TUI
 
 ## How a turn works
 
@@ -95,7 +99,8 @@ delimit. `done.json` also proves the partner actually had working write
 access — a capability several CLIs revoke silently in headless mode.
 
 Turns are never killed by a wall-clock timeout. The host inspects the pane with
-`check_partner_alive` and calls `end_dialog` when a partner is genuinely stuck.
+`check_partner_alive`, uses `send_key` when a visible interactive prompt has an
+authorized answer, and calls `end_dialog` when a partner is genuinely stuck.
 
 ## Adding an agent
 

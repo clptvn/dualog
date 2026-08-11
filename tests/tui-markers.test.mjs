@@ -76,6 +76,13 @@ const PANES = {
     "  2. No, quit",
   ].join("\n"),
 
+  codexMcpApproval: [
+    '  Allow the mcp-search MCP server to run tool "smart_search"?',
+    "    query: artifact read",
+    "    path: /fixture/project",
+    "    1. Allow   2. Allow for this session   3. Always allow   4. Cancel",
+  ].join("\n"),
+
   claudeReady: [
     "Claude Code v2.1.0",
     "",
@@ -284,11 +291,10 @@ test("startup interstitials are detected before the prompt exists", () => {
   );
 });
 
-test("neither built-in adapter declares blocked markers yet", () => {
-  // Guards against a future adapter silently gaining blocked markers that the
-  // engine does not yet consume.
+test("Codex MCP approvals are blocked prompts, while busy panes are not", () => {
   assert.equal(isBlocked(claude.tui, PANES.claudeBusy), false);
   assert.equal(isBlocked(codex.tui, PANES.codexBusy), false);
+  assert.equal(isBlocked(codex.tui, PANES.codexMcpApproval), true);
 });
 
 // --- Cross-contamination --------------------------------------------------

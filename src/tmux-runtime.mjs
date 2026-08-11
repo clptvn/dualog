@@ -13,6 +13,25 @@ const DEFAULT_CAPTURE_MAX_CHARS = 30000;
 const DEFAULT_TAIL_LINES = 6;
 const DEFAULT_TAIL_MAX_CHARS = 3000;
 
+const TMUX_KEY_CODES = Object.freeze({
+  enter: "Enter",
+  escape: "Escape",
+  tab: "Tab",
+  space: "Space",
+  backspace: "BSpace",
+  delete: "DC",
+  up: "Up",
+  down: "Down",
+  left: "Left",
+  right: "Right",
+  home: "Home",
+  end: "End",
+  page_up: "PPage",
+  page_down: "NPage",
+});
+
+export const TMUX_NAMED_KEYS = Object.freeze(Object.keys(TMUX_KEY_CODES));
+
 function tmuxBinary() {
   const configured =
     envWithAliases(
@@ -196,6 +215,41 @@ export async function sendTextToTmux(handle, text, { enter = false, submitDelayM
   }
 }
 
+/**
+ * Send one literal or named key to an already-identified tmux pane.
+ *
+ * Printable characters use tmux's literal mode so a value such as `Enter` is
+ * typed as text rather than interpreted as tmux's Enter key name. Named keys
+ * come only from the closed map above; callers cannot smuggle tmux syntax or a
+ * second command through this API.
+ */
+export async function sendKeyToTmux(handle, key, { submit = false } = {}) {
+  const target = handle?.paneId || handle?.paneTarget;
+  if (typeof target !== "string" || !target) {
+    throw new Error("A tmux pane target is required");
+  }
+
+  const literal = typeof key === "string" && /^[\x20-\x7E]$/u.test(key);
+  const keyCode = typeof key === "string" ? TMUX_KEY_CODES[key] : null;
+  if (!literal && !keyCode) {
+    throw new Error(
+      `Unsupported tmux key ${JSON.stringify(key)}. Use one printable ASCII character or one of: ${TMUX_NAMED_KEYS.join(", ")}`
+    );
+  }
+  if (submit === true && key === "enter") {
+    throw new Error("submit cannot be used when key is already enter");
+  }
+
+  await runTmux(
+    literal
+      ? ["send-keys", "-l", "-t", target, key]
+      : ["send-keys", "-t", target, keyCode]
+  );
+  if (submit === true) {
+    await runTmux(["send-keys", "-t", target, TMUX_KEY_CODES.enter]);
+  }
+}
+
 export async function captureTmuxPane(handleOrSessionName, options = {}) {
   const handle =
     typeof handleOrSessionName === "string"
@@ -328,6 +382,33 @@ export function probeTmuxSessionSync(sessionName) {
  */
 export async function isTmuxSessionAlive(sessionName) {
   return (await probeTmuxSession(sessionName)) === "alive";
+}
+
+/**
+ * Confirm that a stable pane id belongs to one exact Dualog tmux session.
+ *
+ * Pane ids are server-global. Trusting a pane id and a session name merely
+ * because they appeared beside each other in current_terminal.json would let a
+ * stale or modified record address another pane on the same socket. list-panes
+ * against an exact session target binds the two identities before input is
+ * delivered.
+ */
+export async function tmuxPaneBelongsToSession(sessionName, paneId) {
+  const target = tmuxSessionTarget(sessionName);
+  if (!target || typeof paneId !== "string" || !/^%\d+$/u.test(paneId)) {
+    return false;
+  }
+  let result;
+  try {
+    result = await runTmux(
+      ["list-panes", "-t", target, "-F", "#{pane_id}"],
+      { allowFailure: true }
+    );
+  } catch {
+    return false;
+  }
+  if (result.exitCode !== 0) return false;
+  return result.stdout.split(/\r?\n/u).some((id) => id.trim() === paneId);
 }
 
 export async function terminateTmuxSession(handleOrSessionName) {

@@ -130,7 +130,9 @@
       "tip: try the codex app",
       "context "
     ],
-    "blocked": [],
+    "blocked": [
+      "re:Allow the\\s+.+?\\s+MCP server to run tool"
+    ],
     "startupPrompts": [
       {
         "kind": "workspace_trust",

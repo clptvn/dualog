@@ -1,7 +1,7 @@
 ---
 description: Have a partner agent review an implementation plan via the dualog MCP server
 argument-hint: [optional: path/to/plan.md] [optional: rounds:N] [optional: effort:<level>] [optional: model:<id>] [optional: partner:<agent-id>]
-allowed-tools: mcp__dualog__start_dialog, mcp__dualog__check_messages, mcp__dualog__send_message, mcp__dualog__get_full_history, mcp__dualog__check_partner_alive, mcp__dualog__end_dialog, mcp__dualog__list_sessions, mcp__dualog__list_models, mcp__dualog__check_adapter, Bash, Read, Glob, Grep, Edit, Write, AskUserQuestion, LSP, Monitor
+allowed-tools: mcp__dualog__start_dialog, mcp__dualog__check_messages, mcp__dualog__send_message, mcp__dualog__get_full_history, mcp__dualog__check_partner_alive, mcp__dualog__send_key, mcp__dualog__end_dialog, mcp__dualog__list_sessions, mcp__dualog__list_models, mcp__dualog__check_adapter, Bash, Read, Glob, Grep, Edit, Write, AskUserQuestion, LSP, Monitor
 ---
 
 # /dualog-review-plan - Plan Review via Codex Dialog MCP Server
@@ -173,7 +173,7 @@ Use the literal `dialog_dir` value from the start response. Sessions moved from 
 
 When the notification arrives, call `check_messages` with `since_id: 0` (or `get_full_history`) to read the structured content — the notification itself just confirms a new message landed.
 
-**If the Monitor hits its timeout with no event**, call `check_partner_alive`. Inspect `partner_terminal.activity` and `partner_terminal.capture.tail_text` to see Codex's compact live tmux status. If it shows useful progress, continue waiting; restart only if the runner died, `last_error` shows a real failure, or the pane shows an idle/stuck state that you decide cannot recover.
+**If the Monitor hits its timeout with no event**, call `check_partner_alive`. Inspect `partner_terminal.activity` and `partner_terminal.capture.tail_text` to see Codex's compact live tmux status. If it shows useful progress, continue waiting. If it shows a blocked interactive prompt, call `send_key` only when the exact visible choice is already authorized by the user's request and does not broaden or persist permissions; use `submit: true` for a numbered choice, then call `check_partner_alive` again to verify it advanced. Ask the user if the choice is ambiguous or consequential. Restart only if the runner died, `last_error` shows a real failure, or the pane is stuck in a state that cannot be recovered.
 
 Read the review carefully once it arrives.
 

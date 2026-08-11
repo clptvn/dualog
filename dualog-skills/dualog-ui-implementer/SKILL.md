@@ -141,7 +141,8 @@ If `wait_result` is `timeout_processing` or `timeout_idle`:
 2. Inspect `partner_terminal.activity` and `partner_terminal.capture.tail_text` to see Claude's compact live tmux status.
 3. If the runner died or `last_error` is populated, report it honestly.
 4. If the runner and tmux session are alive and the pane shows useful progress, continue waiting.
-5. If the pane shows an idle prompt, repeated unchanged output, a stuck prompt, or malformed sidecar state, end the session or ask the user before restarting. Do not proceed as if Claude completed the UI work.
+5. If the pane shows a blocked interactive prompt, use `mcp__dualog__send_key` only when the exact visible choice is already authorized by the user's request and does not broaden permissions; set `submit: true` for a numbered choice, then call `check_partner_alive` again to verify it advanced.
+6. If the answer is ambiguous, consequential, or would persist permission beyond this session, ask the user. For repeated unchanged output, an unexplained idle prompt, or malformed sidecar state, end the session or ask before restarting. Do not proceed as if Claude completed the UI work.
 
 ## Integration loop
 

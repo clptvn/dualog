@@ -23,8 +23,12 @@ import {
 } from "./shared.mjs";
 import {
   inspectPartnerTerminal,
+  probeTmuxSession,
   readTerminalState,
+  sendKeyToTmux,
   terminateCurrentPartnerTerminal,
+  TMUX_NAMED_KEYS,
+  tmuxPaneBelongsToSession,
 } from "./tmux-runtime.mjs";
 import {
   ALL_REASONING_EFFORTS,
@@ -1798,6 +1802,137 @@ server.tool(
               recent_log: logTail,
               budget,
               review_status: reviewStatus,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "send_key",
+  "Send one key to the current live tmux pane for a Dualog partner turn. Use this only after check_partner_alive shows the exact interactive prompt and the intended response is already authorized by the user or the current task. It cannot target arbitrary tmux sessions. Set submit=true to follow a printable choice such as '2' with Enter. Delivery to tmux does not prove the TUI accepted the key, so inspect the pane again afterward.",
+  {
+    session_id: z.string().describe("The Dualog dialog or review session ID"),
+    key: z
+      .union([
+        z.string().length(1).regex(/^[\x20-\x7E]$/u),
+        z.enum(TMUX_NAMED_KEYS),
+      ])
+      .describe(
+        `One printable ASCII character or a named key: ${TMUX_NAMED_KEYS.join(", ")}`
+      ),
+    submit: z
+      .boolean()
+      .optional()
+      .describe("Also press Enter after this key. Intended for numbered or single-character menu choices."),
+  },
+  async ({ session_id, key, submit }) => {
+    const sessionDir = resolveSessionDir(session_id);
+    if (!fs.existsSync(sessionDir)) {
+      return { content: [{ type: "text", text: "Error: Session not found" }] };
+    }
+
+    const { current } = readTerminalState(sessionDir);
+    if (!current) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: This session has no active tmux-backed partner turn",
+          },
+        ],
+      };
+    }
+    if (current.runtime !== "tmux-interactive") {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: The active partner turn is not running in tmux",
+          },
+        ],
+      };
+    }
+
+    // current_terminal.json is a runtime record, not permission to address an
+    // arbitrary local pane. Tie its identity back to this exact Dualog session
+    // and require the stable pane id captured after tmux created it.
+    const expectedSessionPrefix = `dlg-${session_id}-`;
+    if (
+      typeof current.session_name !== "string" ||
+      !current.session_name.startsWith(expectedSessionPrefix) ||
+      !/^%\d+$/u.test(current.pane_id || "")
+    ) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: The active terminal record does not identify a managed Dualog pane",
+          },
+        ],
+      };
+    }
+
+    const liveness = await probeTmuxSession(current.session_name);
+    if (liveness !== "alive") {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              liveness === "absent"
+                ? "Error: The recorded partner tmux session is no longer running"
+                : "Error: tmux could not confirm that the recorded partner pane is live; no key was sent",
+          },
+        ],
+      };
+    }
+    if (!(await tmuxPaneBelongsToSession(current.session_name, current.pane_id))) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: The recorded pane ID does not belong to this Dualog tmux session; no key was sent",
+          },
+        ],
+      };
+    }
+
+    try {
+      await sendKeyToTmux(
+        { paneId: current.pane_id },
+        key,
+        { submit: submit === true }
+      );
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: Failed to send key: ${err.message}` }],
+      };
+    }
+
+    const status = readStat(session_id);
+    const partnerAgent = getSessionPartnerAgent(status);
+    const partnerDisplay = getAgentDisplayName(partnerAgent);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              sent: true,
+              key,
+              submitted: submit === true,
+              partner_agent: partnerAgent,
+              tmux_session: current.session_name,
+              pane_id: current.pane_id,
+              message:
+                `Sent ${JSON.stringify(key)}` +
+                (submit === true ? " followed by Enter" : "") +
+                ` to ${partnerDisplay}'s active pane. Call check_partner_alive to verify the prompt advanced.`,
             },
             null,
             2
