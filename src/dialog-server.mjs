@@ -1734,11 +1734,13 @@ server.tool(
         .toString()
         .trim();
     } catch {
-      // Not fatal, but not silent either. send_message's uncommitted refresh
-      // uses `status.head_sha || "HEAD"` as its baseline, so a null here means
-      // that once the author commits, the refreshed diff LOSES the committed
-      // work and shows only what is still uncommitted -- a quietly narrower
-      // change than the one under review.
+      // Not fatal, but not silent either. send_message's uncommitted AND staged
+      // refreshes both use `status.head_sha || "HEAD"` as their baseline, so a
+      // null here means that once the author commits, the refreshed diff LOSES
+      // the committed work and shows only what is still uncommitted -- a
+      // quietly narrower change than the one under review. (For `pr` and
+      // `commit:` targets head_sha is never read for refresh, so the notice is
+      // advisory there rather than actionable.)
       startupNotices.push(
         "HEAD could not be resolved, so this session has no fixed baseline; if you commit mid-review, " +
           "the refreshed diff will show only what remains uncommitted"
@@ -2193,13 +2195,17 @@ server.tool(
               phase: panel?.phase ?? (consolidated ? "follow_up" : "panel"),
               panel_complete: Boolean(consolidated),
               // Liveness, because otherwise this tool cannot tell you the panel
-              // is dead. The runner reads its meta and diff before writing any
-              // panel state, so a corrupt sidecar, a lost write permission, or a
-              // full disk kills it with no panel_state.json and no system
-              // message -- and the report then reads `phase: "panel"` with every
-              // aspect pending, forever. A host polling for progress waits on a
-              // corpse. `panel_state_available` distinguishes "no state yet"
-              // from "state exists but is unreadable".
+              // is dead.
+              //
+              // The runner now writes a `starting` marker before reading its
+              // meta and diff, so a corrupt sidecar surfaces as phase
+              // "starting". But writePanelState swallows its own failure, so a
+              // full disk or a lost write permission still kills the runner with
+              // no panel_state.json and no system message -- and the report then
+              // falls back to `phase: "panel"` with every aspect pending,
+              // forever, while a host polls a corpse. `panel_state_available`
+              // separates "the runner never got far enough to write state" from
+              // "state exists".
               // Tri-state on purpose. isSessionRunnerAlive answers "not alive"
               // whenever it cannot READ a command line -- ps missing, sandboxed,
               // slow -- so folding that into `false` reports a healthy panel as
@@ -2360,9 +2366,12 @@ server.tool(
         }
         writeFileAtomic(path.join(sessionDir, "diff_refreshed.patch"), refreshedDiff);
       } catch (err) {
-        // Caught WITH the error, because this is the one refresh that leaves the
-        // machine. A dead network, an expired gh token, a rate limit, a diff
-        // past maxBuffer, or a force-pushed PR all arrived here identically and
+        // Caught WITH the error. This catch covers every refresh target, not
+        // just `pr` -- a branch/staged/uncommitted refresh failing lands here
+        // too -- but the `pr` path is the one that leaves the machine, and its
+        // failure modes are the ones that used to vanish: a dead network, an
+        // expired gh token, a rate limit, a diff past maxBuffer, or a
+        // force-pushed ref all arrived here identically and
         // silently -- while send_message still returned sent: true and the
         // partner was handed the session-start diff under a header calling it
         // current, alongside an instruction to verify fixes against it.

@@ -45,11 +45,15 @@ import {
  * silently, with no error and nothing failing, since the tests carried a third
  * copy and were checking the runner against themselves.
  */
-export function buildAspectHeader({ aspect, title, passIndex, passTotal }) {
-  return `## Panel pass ${passIndex} of ${passTotal} — ${title} (aspect: ${aspect})`;
+export function buildAspectHeader({ aspect, title, passIndex, specialistCount }) {
+  // `specialistCount`, NOT `passTotal`. buildAspectPrompt's `passTotal` counts
+  // the consolidation turn and this header does not, so one name meant two
+  // numbers in the same file -- and the reader of "pass 1 of 2" versus "pass 1
+  // of 3" has no way to know which convention they are looking at.
+  return `## Panel pass ${passIndex} of ${specialistCount} — ${title} (aspect: ${aspect})`;
 }
 
-/** Capture groups: 1 = pass index, 2 = pass total, 3 = title, 4 = aspect id. */
+/** Capture groups: 1 = pass index, 2 = specialist count, 3 = title, 4 = aspect id. */
 export const ASPECT_HEADER_RE =
   /^## Panel pass (\d+) of (\d+) — (.+) \(aspect: ([a-z][a-z0-9-]*)\)/m;
 
@@ -60,14 +64,19 @@ export const CONSOLIDATED_HEADER_RE = /^## Consolidated PR Review/m;
  * The normalized finding vocabulary this module's parser understands.
  *
  * Stated verbatim to every specialist so their reports are machine-readable at
- * all. Note this is NOT the same list as the approval gate's: shared.mjs's
- * BLOCKING_FINDING_RE matches a SUPERSET, carrying the plan/spec categories
- * (GAP, AMBIGUITY, SCOPE, FEASIBILITY, UX, TESTABILITY) that this module has no
- * entry for. So an off-list category fails in the more dangerous direction than
- * it first appears: `[GAP]` would trip hasBlockingFindings and drive the whole
- * session to changes_requested, while extractNormalizedFindings drops it and it
- * never surfaces in get_pr_review_report at all. The gate sees a finding the
- * report cannot show you.
+ * all. Note this is NOT the same list as the approval gate's, and neither
+ * contains the other -- they OVERLAP. shared.mjs's BLOCKING_FINDING_RE matches
+ * the five blocking categories here (CRITICAL, CORRECTNESS, ARCHITECTURE,
+ * SECURITY, ROBUSTNESS), PLUS the plan/spec categories this module has no entry
+ * for (GAP, AMBIGUITY, SCOPE, FEASIBILITY, UX, TESTABILITY), and deliberately
+ * NONE of the four advisory ones (SUGGESTION, QUESTION, PRAISE, NIT) -- which is
+ * what lets an approval carry nits.
+ *
+ * So an off-list category fails in the more dangerous direction than it first
+ * appears: `[GAP]` would trip hasBlockingFindings and drive the whole session to
+ * changes_requested, while extractNormalizedFindings drops it and it never
+ * surfaces in get_pr_review_report at all. The gate sees a finding the report
+ * cannot show you.
  */
 export const FINDING_CATEGORIES = [
   "CRITICAL",
@@ -889,6 +898,15 @@ Respond with ONLY the consolidated report and the footer.`;
  * From here the session behaves like an ordinary review conversation: the panel
  * does not re-run, because re-running six specialists to check one fix would
  * spend the entire round budget confirming a single line.
+ *
+ * `failedAspects` must be threaded in for the same reason consolidation gets it.
+ * Banning APPROVE at consolidation alone made the ban last exactly one turn: the
+ * host says "fixed", the follow-up verifies those fixes, finds nothing material
+ * remaining, and approves -- over a change whose failed lens was never reviewed.
+ * The ban also eroded on its own, because the context window keeps the first two
+ * messages as anchors (for a panel, specialist passes 1 and 2), so in a longer
+ * conversation the failure notice and the consolidated report both fall out of
+ * the window while the APPROVE instruction stays.
  */
 export function buildFollowUpPrompt({
   meta,
@@ -903,6 +921,7 @@ export function buildFollowUpPrompt({
   roundsUsed,
   softCap,
   hardCap,
+  failedAspects = [],
 }) {
   const { text: diffText } = diffSection(diff, maxDiffChars);
 
@@ -945,8 +964,16 @@ Follow-up round ${roundsUsed + 1}. Soft cap ${softCap}, hard cap ${hardCap}.
 - Raise genuinely new issues only if they meet the same bar the panel used.
 - Deliver the complete follow-up in this message rather than spreading it across
   rounds.
-- When nothing material remains, set REVIEW_VERDICT: APPROVE and summarize what
-  was reviewed and resolved.
+${
+    failedAspects.length
+      ? `- **You may NOT emit APPROVE in this session.** ${failedAspects.length} specialist pass(es)
+  FAILED (${failedAspects.join(", ")}) and were never re-run, so part of this change
+  has still never been reviewed. Fixing everything that WAS found does not fill
+  that hole. Use CHANGES_REQUESTED or NEEDS_DISCUSSION and restate which aspects
+  went unreviewed.`
+      : `- When nothing material remains, set REVIEW_VERDICT: APPROVE and summarize what
+  was reviewed and resolved.`
+  }
 
 ## Machine-Readable Footer (REQUIRED)
 

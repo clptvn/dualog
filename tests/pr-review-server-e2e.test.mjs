@@ -4,10 +4,10 @@
 // hypothetical: it hid a shipped bug that made the feature's documented workflow
 // non-functional. pr-review-panel.test.mjs spawns the runner directly and
 // appends host messages straight to conversation.jsonl; start-response-contract
-// .test.mjs calls start_pr_review and never touches the session again. So
-// nothing ever asked the server whether a live panel session was reachable --
-// and the answer was no, for every panel session, for its entire life, because
-// isSessionRunnerAlive() mapped the new type onto the wrong runner script.
+// .test.mjs starts a panel and then inspects only its status.json and its
+// list_sessions entry. So nothing ever ASSERTED that a live panel session was
+// reachable -- and it was not, for every panel session, for its entire life,
+// because isSessionRunnerAlive() mapped the new type onto the wrong runner.
 //
 // Every assertion below therefore goes through a tool a real caller would use.
 // The rule this file exists to enforce: if the documented workflow says to call
@@ -56,6 +56,33 @@ const HEAD_SHA = execFileSync("git", ["rev-parse", "HEAD"], { cwd: REPO_ROOT })
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// end_dialog is not synchronous with the runner's death: it writes end_signal and
+// only WAITS when isSessionRunnerAlive says the runner is alive, which answers
+// "not alive" whenever it cannot read a command line. So the deadline has to
+// cover a poll interval plus process startup, not just the grace period.
+const RUNNER_EXIT_DEADLINE_MS = Number(
+  process.env.DUALOG_TEST_RUNNER_EXIT_DEADLINE_MS || 20000
+);
+
+const pidAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+function readStatus(sessionsRoot, sessionId) {
+  try {
+    return JSON.parse(
+      fs.readFileSync(path.join(sessionsRoot, sessionId, "status.json"), "utf-8")
+    );
+  } catch {
+    return null;
+  }
+}
+
 async function withServer(t, body) {
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -83,18 +110,60 @@ async function withServer(t, body) {
     return await body(client);
   } finally {
     // Driven by what is on disk rather than by what the body remembered: a
-    // detached runner that outlives the test is invisible to node:test.
+    // detached runner that outlives the test is invisible to node:test, and
+    // these runners idle for up to 24 hours.
+    //
+    // Failures are COLLECTED and asserted, not swallowed. An earlier version
+    // caught them with a comment promising "reported by the assertions below" --
+    // and there were no assertions below, so a session that refused to close and
+    // a runner that ignored SIGTERM both passed silently.
     const sessionsRoot = path.join(HOME, ".dualog", "sessions");
     const onDisk = fs.existsSync(sessionsRoot) ? fs.readdirSync(sessionsRoot) : [];
+
+    const pids = new Map();
+    for (const sessionId of onDisk) {
+      const pid = readStatus(sessionsRoot, sessionId)?.runner_pid;
+      if (Number.isSafeInteger(pid) && pid > 0) pids.set(sessionId, pid);
+    }
+
+    const failures = [];
     for (const sessionId of onDisk) {
       try {
-        await client.callTool({ name: "end_dialog", arguments: { session_id: sessionId } });
-      } catch {
-        /* reported by the assertions below if it mattered */
+        const res = await client.callTool({
+          name: "end_dialog",
+          arguments: { session_id: sessionId },
+        });
+        const parsed = JSON.parse(res.content[0].text);
+        if (!parsed.ended) failures.push(`${sessionId}: ${res.content[0].text.slice(0, 160)}`);
+      } catch (err) {
+        failures.push(`${sessionId}: ${err.message}`);
       }
     }
+
+    // Observed, not assumed, and BEFORE the client closes -- shutting the
+    // transport first kills the server's child-exit watcher, so runner_state
+    // would never reach "exited".
+    const stragglers = [];
+    for (const [sessionId, pid] of pids) {
+      const giveUpAt = Date.now() + RUNNER_EXIT_DEADLINE_MS;
+      while (pidAlive(pid) && readStatus(sessionsRoot, sessionId)?.runner_state !== "exited") {
+        if (Date.now() >= giveUpAt) {
+          stragglers.push(`${sessionId}: runner ${pid} still alive after end_dialog`);
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {
+            /* exited between the poll and here */
+          }
+          break;
+        }
+        await sleep(100);
+      }
+    }
+
     await client.close();
-    await sleep(500);
+
+    assert.deepEqual(failures, [], "every session created under this home must close cleanly");
+    assert.deepEqual(stragglers, [], "every runner started under this home must be gone");
   }
 }
 
@@ -132,10 +201,14 @@ test("a live panel session is reachable through the tools its own docs name", as
       since_id: 0,
       timeout_ms: 120000,
     });
-    assert.notEqual(
+    // Asserted positively. `notEqual(..., "runner_exited")` also passes on
+    // "error" -- and classifyWaitResult checks last_error BEFORE liveness, so a
+    // panel whose first pass failed outright would satisfy that assertion, plus
+    // the two below it, while being entirely broken.
+    assert.equal(
       waited.wait_result,
-      "runner_exited",
-      "the server declared its own freshly-spawned runner dead"
+      "message",
+      `expected the wait to return the first panel pass, got ${waited.wait_result}`
     );
     assert.equal(waited.partner_runner_alive, true);
     assert.ok(

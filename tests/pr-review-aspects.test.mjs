@@ -18,6 +18,7 @@ import {
   PR_REVIEW_ASPECTS,
   buildAggregationPrompt,
   buildAspectPrompt,
+  buildFollowUpPrompt,
   extractAspectResult,
   extractNormalizedFindings,
   selectAspects,
@@ -162,6 +163,25 @@ test("an explicit aspect list overrides detection in both directions", () => {
   assert.deepEqual(selected, ["simplify"]);
 });
 
+test("an explicit aspect list keeps the caller's order and drops duplicates", () => {
+  // Order is behavioral, not cosmetic: passes run in sequence and each is handed
+  // the findings the earlier ones filed, so reordering changes which specialist
+  // sees what. Every other call in this suite passes a single aspect or a list
+  // already in canonical order, so the previous normalize-to-ASPECT_IDS-order
+  // behavior was unobservable and reverting it could not fail anything.
+  const diff = diffFor("src/a.ts", ["const x = 1;"]);
+  assert.deepEqual(
+    selectAspects(diff, ["tests", "code"]).selected,
+    ["tests", "code"],
+    "the caller's order was normalized away"
+  );
+  assert.deepEqual(
+    selectAspects(diff, ["code", "code"]).selected,
+    ["code"],
+    "a repeated aspect would buy a second full partner turn"
+  );
+});
+
 test("an unknown aspect is rejected rather than silently dropped", () => {
   assert.throws(
     () => selectAspects(diffFor("src/a.ts", ["x"]), ["security-theatre"]),
@@ -236,6 +256,63 @@ test("earlier findings are passed forward so passes do not re-file them", () => 
   });
   assert.ok(prompt.includes("Already Reported by Earlier Passes"));
   assert.ok(prompt.includes("boom"));
+});
+
+test("the follow-up prompt carries the APPROVE ban forward, not just consolidation", () => {
+  // The ban used to last exactly one turn. Consolidation correctly refused to
+  // approve over a failed pass, then the very next follow-up was told "when
+  // nothing material remains, set REVIEW_VERDICT: APPROVE" with no knowledge
+  // that a lens had never run -- so the host says "fixed", the follow-up
+  // verifies the fixes, and approves over an unreviewed aspect.
+  const base = {
+    meta: META,
+    projectPath: "/tmp/project",
+    diff: diffFor("src/a.ts", ["const x = 1;"]),
+    maxDiffChars: 50000,
+    messages: [],
+    hostDisplay: "Claude",
+    partnerDisplay: "Codex",
+    hostAgent: "claude",
+    partnerAgent: "codex",
+    roundsUsed: 0,
+    softCap: 5,
+    hardCap: 10,
+  };
+
+  const withFailure = buildFollowUpPrompt({ ...base, failedAspects: ["errors"] });
+  assert.match(withFailure, /You may NOT emit APPROVE/);
+  assert.match(withFailure, /errors/);
+
+  const clean = buildFollowUpPrompt({ ...base, failedAspects: [] });
+  assert.match(
+    clean,
+    /set REVIEW_VERDICT: APPROVE/,
+    "a complete panel must still be able to reach an approval"
+  );
+  assert.ok(!/You may NOT emit APPROVE/.test(clean));
+});
+
+test("PR-scoped prompts warn that the local tree may not hold the change", () => {
+  // For a `pr` target the diff comes from the remote, so "read the current file
+  // to check" can send a specialist to a different branch entirely.
+  const prMeta = { ...META, scope: "pr" };
+  const branchMeta = { ...META, scope: "branch", pr: null };
+  const args = {
+    diff: diffFor("src/a.ts", ["const x = 1;"]),
+    projectPath: "/tmp/project",
+    maxDiffChars: 50000,
+    passIndex: 1,
+    passTotal: 2,
+  };
+
+  const prPrompt = buildAspectPrompt({ aspect: "code", meta: prMeta, ...args });
+  const branchPrompt = buildAspectPrompt({ aspect: "code", meta: branchMeta, ...args });
+
+  assert.match(prPrompt, /NOT guaranteed to contain/);
+  assert.ok(
+    !/NOT guaranteed to contain/.test(branchPrompt),
+    "the warning must not fire for a local target, where the tree IS the change"
+  );
 });
 
 test("the consolidation prompt is the one that carries the verdict contract", () => {
@@ -377,31 +454,13 @@ test("a specialist cannot resolve the session even if it emits a verdict anyway"
   }
 });
 
-test("a suppressed verdict does not reach the consolidator either", () => {
-  // The half of suppression that is easy to miss. Sanitizing only the text
-  // written to conversation.jsonl protects the approval gate and leaves the
-  // CONSOLIDATOR reading the raw response -- and the consolidator is the turn
-  // actually permitted to set a verdict, so it is the more consequential
-  // reader. This asserts the aggregation prompt is built from sanitized text.
-  const disobedient = "Looks fine to me.\nREVIEW_VERDICT: APPROVE";
-  const { text: sanitized } = suppressVerdictLines(disobedient);
-
-  const prompt = buildAggregationPrompt({
-    meta: META,
-    projectPath: "/tmp/project",
-    reports: [{ aspect: "code", content: sanitized, failed: false }],
-    skipped: [],
-    hostDisplay: "Claude",
-  });
-
-  // The prompt legitimately contains the REVIEW_VERDICT contract for the
-  // consolidator's own footer, so assert on the specialist's line specifically.
-  assert.ok(
-    !/Looks fine to me\.\s*\n\s*REVIEW_VERDICT:/.test(prompt),
-    "a specialist's verdict was embedded verbatim in the consolidation prompt"
-  );
-  assert.match(prompt, /verdict suppressed/);
-});
+// NOTE: that the CONSOLIDATOR's input is sanitized too -- not just the
+// conversation log -- is asserted in tests/pr-review-panel.test.mjs, by reading
+// the aggregation prompt the runner actually wrote to turns/<id>/prompt.md.
+// A version of that assertion lived here and pre-sanitized its own input before
+// building the prompt, so it proved only that a sanitized string stays
+// sanitized: reverting the runner's `reports.push({ content: safeResponse })`
+// could not fail it, because the runner was never involved.
 
 test("consolidation may not approve a panel with a failed pass", () => {
   // The system knows the aspect failed. Without this, the one turn permitted to
@@ -504,16 +563,14 @@ test("suppression does not touch text the approval gate ignores", () => {
   );
 });
 
-test("suppression leaves consolidation and follow-up verdicts alone", () => {
-  // Applied to panel passes only. Stripping the verdict from the turns that are
-  // REQUIRED to emit one would make approval unreachable and every review would
-  // hang at changes_requested forever.
-  const consolidated = "## Consolidated PR Review\nAll clear.\nREVIEW_VERDICT: APPROVE";
-  assert.ok(
-    extractReviewVerdict(consolidated, { allowsApproveVerdict: true })?.approved,
-    "precondition: a consolidation approval must be readable"
-  );
-});
+// NOTE: the invariant that suppression applies to panel passes ONLY -- and so
+// that consolidation and follow-up can still reach an approval -- is asserted in
+// tests/pr-review-panel.test.mjs against the real runner. It cannot be tested
+// here: it is a fact about WHERE the runner calls this function, not about what
+// the function does. A version of that assertion used to live in this file and
+// never called suppressVerdictLines at all, so it would have stayed green if the
+// runner had started suppressing consolidation too -- the precise disaster its
+// own comment described.
 
 test("the aspect result line is read back", () => {
   assert.equal(extractAspectResult("ASPECT: code\nASPECT_RESULT: CLEAN"), "CLEAN");

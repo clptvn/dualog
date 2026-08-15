@@ -155,11 +155,20 @@ test("every session type the server can write has a runner mapping", () => {
   // Anchored to the status-object literal, not to any `type:` key. A bare scan
   // also matches the `type: "text"` of every MCP content block in the file.
   const written = new Set(
-    [...server.matchAll(/const status = \{[\s\S]{0,240}?\n\s*type:\s*"([a-z_]+)"/gu)].map(
+    [...server.matchAll(/const status = \{[\s\S]{0,600}?\n\s*type:\s*"([a-z_]+)"/gu)].map(
       (m) => m[1]
     )
   );
+  // Both guards matter. The count check catches a rotted regex that silently
+  // matches nothing; the window is generous because a status literal that puts
+  // `type:` further down would otherwise be skipped and this case would still
+  // pass on the count alone — a scan that misses the very type it exists to
+  // catch, while looking healthy.
   assert.ok(written.size > 0, "the status-object scan matched nothing — the regex has rotted");
+  assert.ok(
+    written.size >= 2,
+    `the scan found only ${[...written]} — the server writes more session types than that`
+  );
   // start_dialog writes no `type` at all; dialog is the documented default.
   written.add("dialog");
 

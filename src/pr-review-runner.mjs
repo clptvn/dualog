@@ -125,7 +125,8 @@ function log(msg) {
   } catch {
     // A logger must never be the thing that kills the process it exists to
     // diagnose. This is a detached runner with stdio ignored, and log() is the
-    // first statement in both the signal handler and the fatal catch -- so an
+    // first statement that can THROW in both the signal handler and the fatal
+    // catch (the signal handler's re-entrancy guard precedes it) -- so an
     // unwritable log (ENOSPC, session dir removed by cleanup, permissions)
     // would throw before the processing marker is cleared and before the exit
     // is recorded, pinning the session "running" behind a dead process. That
@@ -264,7 +265,9 @@ async function main() {
   // meta leaves a record rather than a void. Both reads are unguarded on
   // purpose -- there is no sane way to review without them -- but without this
   // marker a failure there produced no panel_state.json at all, and the report
-  // tool then showed a permanently "starting" panel with every aspect pending.
+  // tool fell back to `phase: "panel"` with every aspect pending: a runner that
+  // died before it started rendering identically to one genuinely working its
+  // first pass. `starting` is what it shows now, and only because of this line.
   writePanelState({ phase: "starting", completed: [], started_at: new Date().toISOString() });
 
   const originalDiff = fs.readFileSync(DIFF_PATH, "utf-8");
@@ -365,8 +368,9 @@ async function main() {
       // A turn can exit successfully having produced no text: a partner whose
       // write tools were silently denied, a turn stopped by a content filter, a
       // done.json that raced result.md. Recorded as success, that aspect lands
-      // in aspects_reported with findings: [] -- byte-for-byte identical to a
-      // specialist that ran and found nothing. Worse, `anyReport` would still be
+      // in aspects_reported with findings: [] -- indistinguishable, in the
+      // findings index, from a specialist that ran and found nothing. Worse,
+      // `anyReport` would still be
       // true, so consolidation would run over empty sections, read them as
       // "this lens found nothing", and be free to emit APPROVE for a panel that
       // reviewed nothing at all. Throwing routes it through the catch below,
@@ -383,7 +387,7 @@ async function main() {
           aspect: aspectId,
           title: spec.title,
           passIndex,
-          passTotal: selected.length,
+          specialistCount: selected.length,
         }) +
         `\n_${passIndex < selected.length ? `${selected.length - passIndex} more specialist pass(es) and then consolidation still to come.` : "Consolidation pass still to come."}_\n\n`;
       const { text: safeResponse, suppressed } = suppressVerdictLines(response);
@@ -566,8 +570,8 @@ async function main() {
   // whole host turn: a message sent while the panel was running would be marked
   // processed before this loop ever looked at it, and send_message would have
   // told the host it "will be invoked to respond" while nothing ever did. The
-  // window is up to one per-pass timeout times the number of aspects, which is
-  // precisely when an impatient host is most likely to write.
+  // window is up to one per-pass timeout times the number of aspects PLUS the
+  // consolidation turn, which is precisely when an impatient host writes.
   let lastProcessedId = 0;
   let followUpTurns = 0;
   let lastActivityTime = Date.now();
@@ -632,6 +636,9 @@ async function main() {
           roundsUsed: followUpTurns,
           softCap: FOLLOWUP_SOFT_CAP,
           hardCap: FOLLOWUP_HARD_CAP,
+          // Carried for the whole session, not just consolidation. A hole in
+          // the panel does not close because a turn went by.
+          failedAspects: reports.filter((r) => r.failed).map((r) => r.aspect),
         });
 
         const response = await runTurn(prompt, `${PARTNER_AGENT}-pr-followup`);
