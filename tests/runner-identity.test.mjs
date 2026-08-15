@@ -106,6 +106,17 @@ for (const { type, script } of RUNNERS) {
       `a running ${script} was not recognized for session type "${type}" — ` +
         `every tool that gates on runner liveness is broken for this type`
     );
+
+    // The tri-state probe walks the same pid → command line → table → token
+    // chain in a second function body, so it can drift from isSessionRunnerAlive
+    // exactly the way the old ternary drifted from reality. Asserted together,
+    // per type, or this file would be preventing recurrence of the round-1 bug
+    // in one function while the other quietly reintroduced it.
+    assert.equal(
+      probeSessionRunner(status, sessionDir),
+      "alive",
+      `probeSessionRunner disagrees with isSessionRunnerAlive for "${type}"`
+    );
   });
 }
 

@@ -1739,9 +1739,9 @@ server.tool(
       // refreshes both use `status.head_sha || "HEAD"` as their baseline, so a
       // null here means that once the author commits, the refreshed diff LOSES
       // the committed work and shows only what is still uncommitted -- a
-      // quietly narrower change than the one under review. (For `pr` and
-      // `commit:` targets head_sha is never read for refresh, so the notice is
-      // advisory there rather than actionable.)
+      // quietly narrower change than the one under review. (The `branch`
+      // default, and the `pr` and `commit:` targets, never read head_sha for
+      // refresh at all, so the notice is advisory rather than actionable there.)
       startupNotices.push(
         "HEAD could not be resolved, so this session has no fixed baseline; if you commit mid-review, " +
           "the refreshed diff will show only what remains uncommitted"
@@ -2201,8 +2201,9 @@ server.tool(
               // The runner now writes a `starting` marker before reading its
               // meta and diff, so a corrupt sidecar surfaces as phase
               // "starting". But writePanelState swallows its own failure, so a
-              // full disk or a lost write permission still kills the runner with
-              // no panel_state.json and no system message -- and the report then
+              // full disk or a lost write permission leaves no state and then
+              // kills the runner at its first unguarded write -- no
+              // panel_state.json, no system message -- and the report then
               // falls back to `phase: "panel"` with every aspect pending,
               // forever, while a host polls a corpse. `panel_state_available`
               // separates "the runner never got far enough to write state" from

@@ -87,6 +87,50 @@ const DISOBEDIENT_BIN = writeFakeCli(BIN_DIR, "fake-disobedient.mjs", "sidecar-o
   reply: DISOBEDIENT_REPLY,
 });
 
+/**
+ * A partner that fails ONE named aspect and answers normally for everything
+ * else, by reading the aspect id out of the prompt it was handed.
+ *
+ * This is the only way to reach a panel with survivors, which is the state three
+ * separate pieces of shipped safety code exist for and none had ever executed.
+ */
+function writeSelectiveFailureCli(name, failingAspect) {
+  const target = path.join(BIN_DIR, name);
+  fs.writeFileSync(
+    target,
+    `#!/usr/bin/env node
+import fs from "fs";
+const failing = ${JSON.stringify(failingAspect)};
+const reply = ${JSON.stringify(FAKE_REPLY)};
+function readPrompt() {
+  const positional = process.argv.slice(2).filter((a) => !a.startsWith("-"));
+  const fromArgv = positional[positional.length - 1];
+  if (fromArgv && fromArgv.includes("Completion protocol is mandatory")) return fromArgv;
+  try { return fs.readFileSync(0, "utf-8"); } catch { return fromArgv ?? ""; }
+}
+const prompt = readPrompt();
+const resultPath = (prompt.match(/^(.*result\\.md)$/mu) || [])[1];
+const donePath = (prompt.match(/^(.*done\\.json)$/mu) || [])[1];
+// The bootstrap names the per-turn prompt file; the aspect id lives in it.
+const promptPath = (prompt.match(/^(.*prompt\\.md)$/mu) || [])[1];
+let body = "";
+try { body = fs.readFileSync(promptPath, "utf-8"); } catch {}
+if (body.includes("ASPECT: " + failing)) {
+  fs.writeFileSync(resultPath, "");
+  fs.writeFileSync(donePath, JSON.stringify({ status: "ok", result_path: resultPath }));
+  process.exit(0);
+}
+fs.writeFileSync(resultPath, reply);
+fs.writeFileSync(donePath, JSON.stringify({ status: "ok", result_path: resultPath }));
+process.exit(0);
+`
+  );
+  fs.chmodSync(target, 0o755);
+  return target;
+}
+
+const SELECTIVE_FAIL_BIN = writeSelectiveFailureCli("fake-selective.mjs", "code");
+
 const DIFF = [
   "diff --git a/src/app.ts b/src/app.ts",
   "--- a/src/app.ts",
@@ -460,6 +504,56 @@ test("a disobedient specialist cannot approve the session through the real runne
       /verdict suppressed/,
       "the consolidator should see the suppression marker where the verdict was"
     );
+  } finally {
+    await stopRunner(child, sessionDir);
+  }
+});
+
+test("a panel with survivors consolidates, and carries the hole into every verdict prompt", async () => {
+  // The state this system's worst failure mode lives in, and until now the only
+  // one never exercised: SOME passes fail and others succeed. Three separate
+  // pieces of shipped safety code exist solely for it -- the failedAspects
+  // APPROVE ban at consolidation, the same ban threaded into the follow-up
+  // prompt, and the aspects_pending subtraction -- and none of the three had
+  // ever executed end to end, in any test, at any point in this branch.
+  const aspects = ["code", "types"];
+  const { sessionDir } = setupSession("aaaaaaa6", aspects);
+  const child = startRunner(sessionDir, 2, SELECTIVE_FAIL_BIN);
+
+  try {
+    // One survivor plus consolidation. The failed pass appends a system message,
+    // not a partner one.
+    const messages = await waitForPartnerMessages(sessionDir, 2);
+    const partner = messages.filter((m) => m.from === "fake-panel");
+
+    const passes = partner.filter((m) => ASPECT_HEADER_RE.test(m.content));
+    assert.equal(passes.length, 1, "the surviving specialist did not report");
+    assert.equal(passes[0].content.match(ASPECT_HEADER_RE)[4], "types");
+
+    // Consolidation must still run over the survivors. Abandoning the panel
+    // because one lens failed would throw away the work that succeeded.
+    const consolidated = partner.find((m) => CONSOLIDATED_HEADER_RE.test(m.content));
+    assert.ok(consolidated, "consolidation was abandoned because one pass failed");
+
+    const panel = JSON.parse(fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8"));
+    const failed = panel.completed.find((c) => c.aspect === "code");
+    assert.equal(failed.status, "failed");
+
+    // The aggregation prompt must forbid APPROVE and name the hole.
+    const turnsDir = path.join(sessionDir, "turns");
+    const prompts = fs
+      .readdirSync(turnsDir)
+      .map((id) => path.join(turnsDir, id, "prompt.md"))
+      .filter((p) => fs.existsSync(p))
+      .map((p) => fs.readFileSync(p, "utf-8"));
+    const aggregation = prompts.filter((p) => /^## Specialist Reports$/m.test(p));
+    assert.equal(aggregation.length, 1, "expected exactly one consolidation prompt");
+    assert.match(
+      aggregation[0],
+      /You may NOT emit APPROVE/,
+      "consolidation was free to certify a review with a known unreviewed aspect"
+    );
+    assert.match(aggregation[0], /UNREVIEWED/);
   } finally {
     await stopRunner(child, sessionDir);
   }

@@ -82,8 +82,10 @@ export function isReviewApprovalDialog(problem) {
 /**
  * The prefix of a line this module will read as a session verdict.
  *
- * Exported because it is one contract with two ends, and they were written
- * separately once already. The PR review panel must SUPPRESS exactly the lines
+ * Not consumed directly outside this file -- the panel reaches it through
+ * matchVerdictLine() below -- but kept as the single definition both halves
+ * derive from, because they were written separately once already and diverged.
+ * The PR review panel must SUPPRESS exactly the lines
  * this file would ACT on -- suppress fewer and a single specialist can approve a
  * review whose other passes have not run; suppress more and it rewrites the
  * reviewer's own prose. Both happened: a hand-written suppressor missed
@@ -142,10 +144,20 @@ export function gateReadableLineMask(content) {
       for (let i = 0; i < lines.length; i++) {
         const lineStart = starts[i];
         const lineEnd = lineStart + lines[i].length;
-        // Strict overlap. Ambiguity resolves toward READABLE, because a line the
-        // suppressor rewrites unnecessarily is cosmetic damage, while one it
-        // skips unnecessarily is a verdict reaching the gate.
-        if (lineStart < spanEnd && spanStart < lineEnd) blocked[i] = true;
+        // WHOLLY inside, never merely overlapping.
+        //
+        // This is the only test that is safe by construction. stripMarkdownNoise
+        // excises the SPAN and keeps scanning what remains of the line, so if any
+        // part of a line falls outside every span, the gate may still read that
+        // part -- and a consumer of this mask must therefore examine it.
+        //
+        // An earlier version blocked on partial overlap and broke exactly that
+        // property, in the direction that matters: a finding line containing an
+        // inline ``` pairs with a later fence, so the span covered the line's
+        // tail and the whole line vanished. `[CRITICAL] ... an unclosed ``` ...`
+        // stopped being a blocking finding and the review flipped to approved --
+        // for every session type, not just PR panels.
+        if (spanStart <= lineStart && lineEnd <= spanEnd) blocked[i] = true;
       }
     }
   }
@@ -153,10 +165,23 @@ export function gateReadableLineMask(content) {
   return lines.map((line, i) => !blocked[i] && !isNoiseLine(line));
 }
 
+/**
+ * Left exactly as it was, deliberately.
+ *
+ * The suppressor needed to stop modelling markdown noise for itself; the GATE
+ * did not need to change, and rewriting it on top of the mask is what produced
+ * the regression described above. Excision semantics -- remove the span, keep
+ * the rest of the line -- are preserved here, and gateReadableLineMask is only
+ * ever a conservative "could the gate read any of this line".
+ */
 function stripMarkdownNoise(content) {
-  const lines = String(content || "").split("\n");
-  const readable = gateReadableLineMask(content);
-  return lines.filter((_, i) => readable[i]).join("\n");
+  return String(content || "")
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/~~~[\s\S]*?~~~/g, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .split("\n")
+    .filter((line) => !isNoiseLine(line))
+    .join("\n");
 }
 
 function normalizeStructuredVerdict(raw) {

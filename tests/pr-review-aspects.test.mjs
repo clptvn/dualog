@@ -496,8 +496,10 @@ test("suppression neutralizes every shape the approval gate would act on", () =>
   // Checking suppression against itself is precisely what let `## VERDICT:
   // APPROVE` through -- a heading, which is the shape a model naturally writes
   // under a section the prompt itself calls "Machine-Readable Footer". Five
-  // shapes leaked, and the runner logged `suppressed: 0` for all of them,
-  // indistinguishable from a pass that emitted no verdict at all.
+  // EIGHT of the twelve shapes below leaked under the old suppressor -- five
+  // verdict forms it under-matched, plus all three LGTM forms, which it had no
+  // handling for at all. The runner logged `suppressed: 0` for every one,
+  // indistinguishable from a pass that emitted no verdict.
   const shapes = [
     "VERDICT: APPROVE",
     "**VERDICT**: APPROVE",
@@ -563,6 +565,49 @@ test("suppression and the gate agree about fenced regions, including malformed o
   const fenced = ["```", "REVIEW_VERDICT: APPROVE", "```"].join("\n");
   assert.equal(extractReviewVerdict(fenced, { allowsApproveVerdict: true }), null);
   assert.equal(suppressVerdictLines(fenced).suppressed, 0);
+});
+
+test("the approval gate still reads a finding line that merely mentions a fence", () => {
+  // A regression I shipped and had to take back. Rebuilding stripMarkdownNoise
+  // on top of the line mask made it drop any line OVERLAPPING a noise span,
+  // where it had excised only the span and kept scanning the rest of the line.
+  // A finding whose text contains an inline ``` pairs with a later fence, so the
+  // span covered the line's tail and the entire finding vanished -- flipping the
+  // review from changes_requested to approved, for every session type, not just
+  // PR panels. Nothing in the suite covered shared.mjs's gate directly, so it
+  // passed 621 tests.
+  const report = [
+    "### Normalized Findings",
+    "[CRITICAL] src/a.mjs:1064 — an unclosed ``` latches the fence flag",
+    "",
+    "Example of the malformed output:",
+    "```",
+    "some example",
+    "```",
+    "",
+    "REVIEW_VERDICT: APPROVE",
+  ].join("\n");
+
+  const state = computeReviewStatus(
+    { partner_agent: "codex", max_rounds: 8, hard_cap: 13 },
+    [{ id: 1, from: "codex", content: report }],
+    { problem: "" }
+  );
+  assert.equal(
+    state.state,
+    "changes_requested",
+    "a blocking finding was dropped because its own text mentioned a fence"
+  );
+
+  // The same mechanism, smaller blast radius: a trailing HTML comment must not
+  // swallow the approval it sits beside, or a clean review never becomes
+  // closable.
+  assert.ok(
+    extractReviewVerdict("REVIEW_VERDICT: APPROVE <!-- rationale -->", {
+      allowsApproveVerdict: true,
+    }),
+    "an inline HTML comment swallowed a legitimate approval"
+  );
 });
 
 test("quoted example findings are not indexed as real ones", () => {

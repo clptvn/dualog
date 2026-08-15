@@ -171,9 +171,12 @@ process.once("SIGINT", () => {
  * so "every accepted result fits in a conversation entry" -- an invariant this
  * runner BREAKS, because it prepends a pass header and the verdict suppressor
  * can lengthen the text it rewrites. A maximal report that legitimately cleared
- * the completion gate would therefore throw in appendMessage, land in the catch,
- * and the catch's own appendMessage would throw identically: fatal, with every
- * completed pass's work stranded and only "Fatal:" to explain it.
+ * the completion gate would therefore throw in appendMessage and land in the
+ * per-pass catch, which files a complete, successful report as UNREVIEWED -- the
+ * review-that-happened rendering as one that did not, which is the failure this
+ * file exists to prevent. (The catch's own append is a ~300-byte system message
+ * against a 2 MiB ceiling, so it does not throw in turn; an earlier version of
+ * this comment claimed a fatal cascade that does not occur.)
  *
  * Truncation is marked, never silent. Losing the tail of a report without saying
  * so is the exact failure this whole design exists to prevent.
@@ -197,10 +200,24 @@ function appendBoundedPartnerMessage(content) {
   const budget = MAX_MESSAGE_BYTES - Buffer.byteLength(marker, "utf-8");
   const buf = Buffer.from(content, "utf-8");
 
-  // Decoded with a whole-buffer toString so a split multi-byte character is
-  // repaired rather than emitted as a lone replacement char.
-  const tail = buf.subarray(buf.length - TAIL_BYTES).toString("utf-8");
-  const head = buf.subarray(0, budget - Buffer.byteLength(tail, "utf-8")).toString("utf-8");
+  // Both cuts land on a character boundary, or this helper can hand
+  // appendMessage something LARGER than the slice it made.
+  //
+  // A cut inside a multi-byte sequence decodes to U+FFFD, which re-encodes to 3
+  // bytes -- so a naive `subarray(0, budget).toString()` can exceed
+  // MAX_MESSAGE_BYTES by up to 2, and shared.mjs throws on strictly greater.
+  // Two bytes is enough, and these reports are unusually dense in multi-byte
+  // characters: the prompt asks for `path:LINE — one-sentence statement`, so
+  // there is an em dash per finding. The throw would land in the per-pass catch
+  // and file a complete, successful report as UNREVIEWED.
+  const isContinuation = (byte) => (byte & 0xc0) === 0x80;
+  let headEnd = Math.min(budget - TAIL_BYTES, buf.length);
+  while (headEnd > 0 && isContinuation(buf[headEnd])) headEnd--;
+  let tailStart = Math.max(buf.length - TAIL_BYTES, headEnd);
+  while (tailStart < buf.length && isContinuation(buf[tailStart])) tailStart++;
+
+  const head = buf.subarray(0, headEnd).toString("utf-8");
+  const tail = buf.subarray(tailStart).toString("utf-8");
 
   log(`Report exceeded the conversation entry limit; kept the head and the trailing ${TAIL_BYTES} bytes`);
   appendMessage(sessionDir, PARTNER_AGENT, head + marker + tail);

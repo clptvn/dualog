@@ -902,10 +902,12 @@ Respond with ONLY the consolidated report and the footer.`;
  * Banning APPROVE at consolidation alone made the ban last exactly one turn: the
  * host says "fixed", the follow-up verifies those fixes, finds nothing material
  * remaining, and approves -- over a change whose failed lens was never reviewed.
- * The ban also eroded on its own, because the context window keeps the first two
- * messages as anchors (for a panel, specialist passes 1 and 2), so in a longer
- * conversation the failure notice and the consolidated report both fall out of
- * the window while the APPROVE instruction stays.
+ * The ban also eroded on its own, because the context window keeps only the
+ * first two messages as anchors, so in a longer conversation the failure notice
+ * and the consolidated report can both fall out of the window while the APPROVE
+ * instruction stays. (Not always: if one of the first two passes is the one that
+ * failed, its notice IS an anchor and survives -- which is the ordering where
+ * this mattered least.)
  */
 export function buildFollowUpPrompt({
   meta,
