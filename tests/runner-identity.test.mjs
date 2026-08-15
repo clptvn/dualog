@@ -220,6 +220,12 @@ test("every session type the server can write has a runner mapping", () => {
     written.size >= 2,
     `the scan found only ${[...written]} — the server writes more session types than that`
   );
+  // Named explicitly, so the scan is proven to reach the type that motivated
+  // this whole file rather than merely reaching more than one.
+  assert.ok(
+    written.has("pr_review"),
+    "the scan no longer reaches the pr_review status literal it exists to catch"
+  );
   // start_dialog writes no `type` at all; dialog is the documented default.
   written.add("dialog");
 

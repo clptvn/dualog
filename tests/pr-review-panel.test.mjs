@@ -554,6 +554,48 @@ test("a panel with survivors consolidates, and carries the hole into every verdi
       "consolidation was free to certify a review with a known unreviewed aspect"
     );
     assert.match(aggregation[0], /UNREVIEWED/);
+
+    // And the ban must survive into the follow-up, tested AS APPLIED.
+    //
+    // The runner threading `failedAspects` into buildFollowUpPrompt was covered
+    // as a function and not at all as wiring: deleting that argument from the
+    // call site left the whole suite green. This is the third instance of that
+    // shape in this branch -- the header regex and verdict suppression were the
+    // other two, and both were live defects -- so it gets pinned rather than
+    // read. The regression it guards: consolidation refuses to approve over the
+    // hole, then the very next turn is told "when nothing material remains, set
+    // REVIEW_VERDICT: APPROVE", the host says fixed, and the follow-up approves
+    // over an aspect nobody ever reviewed.
+    const convPath = path.join(sessionDir, "conversation.jsonl");
+    const seen = readConversation(sessionDir);
+    fs.appendFileSync(
+      convPath,
+      JSON.stringify({
+        id: seen.reduce((max, m) => Math.max(max, m.id), 0) + 1,
+        from: "claude",
+        content: "I fixed everything the panel found.",
+        timestamp: new Date().toISOString(),
+      }) + "\n"
+    );
+
+    await waitForPartnerMessages(sessionDir, 3);
+
+    const followUps = fs
+      .readdirSync(turnsDir)
+      .map((id) => path.join(turnsDir, id, "prompt.md"))
+      .filter((p) => fs.existsSync(p))
+      .map((p) => fs.readFileSync(p, "utf-8"))
+      .filter((p) => /## Your Task — Follow-up/.test(p));
+    assert.equal(followUps.length, 1, "expected exactly one follow-up prompt");
+    assert.match(
+      followUps[0],
+      /You may NOT emit APPROVE in this session/,
+      "the ban lasted exactly one turn — the follow-up could approve over the hole"
+    );
+    assert.ok(
+      !/set REVIEW_VERDICT: APPROVE and summarize/.test(followUps[0]),
+      "the follow-up was still being invited to approve"
+    );
   } finally {
     await stopRunner(child, sessionDir);
   }
