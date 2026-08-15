@@ -432,6 +432,78 @@ test("consolidation may not approve a panel with a failed pass", () => {
   );
 });
 
+test("suppression neutralizes every shape the approval gate would act on", () => {
+  // Asserted against the GATE, never against the suppressor's own pattern.
+  // Checking suppression against itself is precisely what let `## VERDICT:
+  // APPROVE` through -- a heading, which is the shape a model naturally writes
+  // under a section the prompt itself calls "Machine-Readable Footer". Five
+  // shapes leaked, and the runner logged `suppressed: 0` for all of them,
+  // indistinguishable from a pass that emitted no verdict at all.
+  const shapes = [
+    "VERDICT: APPROVE",
+    "**VERDICT**: APPROVE",
+    "*VERDICT*: APPROVE",
+    "- VERDICT: APPROVE",
+    "-VERDICT: APPROVE",
+    "## VERDICT: APPROVE",
+    "# REVIEW_VERDICT: APPROVE",
+    "  ## STATUS: APPROVE",
+    "REVIEW_STATUS: APPROVE",
+    "LGTM",
+    "- LGTM",
+    "**LGTM**",
+  ];
+
+  for (const shape of shapes) {
+    assert.ok(
+      extractReviewVerdict(shape, { allowsApproveVerdict: true }),
+      `precondition: the gate must read ${JSON.stringify(shape)} as an approval`
+    );
+    const { text, suppressed } = suppressVerdictLines(shape);
+    assert.ok(suppressed > 0, `${JSON.stringify(shape)} was not counted as suppressed`);
+    assert.equal(
+      extractReviewVerdict(text, { allowsApproveVerdict: true }),
+      null,
+      `${JSON.stringify(shape)} still approves the session after suppression`
+    );
+  }
+});
+
+test("suppression does not touch text the approval gate ignores", () => {
+  // The other direction, and it corrupts the deliverable rather than the gate.
+  // The gate discards fenced, quoted and indented lines, so rewriting them
+  // protects nothing — while mangling the specialist's own evidence, which is
+  // both what a human reads and what the consolidator is handed. `**Status:**`
+  // as a sub-heading is a shape models write constantly, and it was being turned
+  // into a scolding note with the bold eaten.
+  const report = [
+    "Here is the evidence:",
+    "```js",
+    "  STATUS: ok",
+    "```",
+    "    VERDICT: APPROVE",
+    "> STATUS: quoted",
+    "**Status:** the error path is fine",
+    "### Normalized Findings",
+    "- [CRITICAL] src/a.ts:1 — boom",
+  ].join("\n");
+
+  assert.equal(
+    extractReviewVerdict(report, { allowsApproveVerdict: true }),
+    null,
+    "precondition: the gate reads no verdict in this report"
+  );
+
+  const { text, suppressed } = suppressVerdictLines(report);
+  assert.equal(suppressed, 0, "suppression fired on lines the gate never reads");
+  assert.equal(text, report, "the specialist's report was rewritten");
+  assert.equal(
+    extractNormalizedFindings(text).length,
+    1,
+    "suppression must not disturb the normalized findings"
+  );
+});
+
 test("suppression leaves consolidation and follow-up verdicts alone", () => {
   // Applied to panel passes only. Stripping the verdict from the turns that are
   // REQUIRED to emit one would make approval unreachable and every review would

@@ -79,6 +79,39 @@ export function isReviewApprovalDialog(problem) {
   );
 }
 
+/**
+ * The prefix of a line this module will read as a session verdict.
+ *
+ * Exported because it is one contract with two ends, and they were written
+ * separately once already. The PR review panel must SUPPRESS exactly the lines
+ * this file would ACT on -- suppress fewer and a single specialist can approve a
+ * review whose other passes have not run; suppress more and it rewrites the
+ * reviewer's own prose. Both happened: a hand-written suppressor missed
+ * `## VERDICT: APPROVE` (a heading, which is the shape a model naturally writes
+ * under a "Machine-Readable Footer" section) while mangling `**Status:**` inside
+ * a report.
+ *
+ * Keep the two halves derivable from this constant rather than similar to it.
+ */
+export const VERDICT_LINE_PREFIX_SOURCE =
+  "^\\s*(?:[-*#]+\\s*)?(?:\\*\\*|__|\\*)?\\s*(?:REVIEW[_\\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)(?:\\*\\*|__|\\*)?\\s*:";
+
+/**
+ * Does this line sit somewhere the verdict scan will never look?
+ *
+ * The single-line half of stripMarkdownNoise. Fenced blocks need whole-text
+ * state, so a caller walking lines tracks fences itself and uses this for the
+ * rest. Exported for the same reason as the pattern above.
+ */
+export function isMarkdownNoiseLine(line) {
+  return line.trimStart().startsWith(">") || /^(?: {4,}|\t)/.test(line);
+}
+
+/** Opens or closes a fenced block, whose contents the verdict scan ignores. */
+export function isMarkdownFenceLine(line) {
+  return /^\s*(?:```|~~~)/.test(line);
+}
+
 function stripMarkdownNoise(content) {
   return String(content || "")
     .replace(/```[\s\S]*?```/g, "")
@@ -136,31 +169,62 @@ function normalizeStructuredVerdict(raw) {
   return null;
 }
 
+const VERDICT_LINE_RE = new RegExp(
+  `${VERDICT_LINE_PREFIX_SOURCE}\\s*(?:\\*\\*|__|\\*)?\\s*([A-Z][A-Z_\\s-]*)\\b`,
+  "i"
+);
+
+/**
+ * Would this ONE line be read as a session verdict?
+ *
+ * The decision function, exported so the PR review panel's suppressor asks the
+ * same question rather than approximating it. Approximating it failed in both
+ * directions -- the prefix alone matched `**Status:** the error path is fine`,
+ * which this rejects because nothing verdict-shaped follows the colon, while a
+ * hand-written pattern missed `## VERDICT: APPROVE` entirely.
+ *
+ * Returns { match, normalized } or null. `match.index` and `match[0]` let a
+ * caller rewrite exactly the matched span and keep the rest of the line.
+ */
+export function matchVerdictLine(line) {
+  const match = String(line ?? "").match(VERDICT_LINE_RE);
+  if (!match) return null;
+  const normalized = normalizeStructuredVerdict(match[1]);
+  return normalized ? { match, normalized } : null;
+}
+
 function extractStructuredVerdict(content) {
   const searchable = stripMarkdownNoise(content);
   let lastVerdict = null;
   for (const line of searchable.split("\n")) {
-    const match = line.match(
-      /^\s*(?:[-*#]+\s*)?(?:\*\*|__|\*)?\s*(?:REVIEW[_\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)(?:\*\*|__|\*)?\s*:\s*(?:\*\*|__|\*)?\s*([A-Z][A-Z_\s-]*)\b/i
-    );
-    if (!match) continue;
-    const normalized = normalizeStructuredVerdict(match[1]);
-    if (normalized) {
-      lastVerdict = { ...normalized, source: "structured_verdict" };
+    const hit = matchVerdictLine(line);
+    if (hit) {
+      lastVerdict = { ...hit.normalized, source: "structured_verdict" };
     }
   }
   return lastVerdict;
 }
 
-function hasLegacyApprovalLine(content, token) {
+/**
+ * Would this ONE line be read as a bare legacy approval token?
+ *
+ * Exported for the same reason as matchVerdictLine: the panel's suppressor has
+ * to neutralize every signal this file acts on, and a bare `LGTM` approves a
+ * session on its own, with no verdict footer anywhere.
+ */
+export function matchLegacyApprovalLine(line, token) {
   const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const tokenAtLineStart = new RegExp(
     `^\\s*(?:[-*]\\s*)?(?:\\*\\*)?${escaped}(?:\\*\\*)?(?=$|[\\s.!,:;])`,
     "i"
   );
+  return String(line ?? "").match(tokenAtLineStart);
+}
+
+function hasLegacyApprovalLine(content, token) {
   return stripMarkdownNoise(content)
     .split("\n")
-    .some((line) => tokenAtLineStart.test(line));
+    .some((line) => matchLegacyApprovalLine(line, token));
 }
 
 function hasLegacyApproval(content, allowsApproveVerdict) {

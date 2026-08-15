@@ -34,6 +34,7 @@ import fs from "fs";
 import path from "path";
 import { envWithAliases } from "./platform.mjs";
 import {
+  MAX_MESSAGE_BYTES,
   appendMessage,
   getAgentDisplayName,
   normalizeAgent,
@@ -161,6 +162,48 @@ process.once("SIGTERM", () => {
 process.once("SIGINT", () => {
   exitFromSignal("SIGINT");
 });
+
+/**
+ * Append a partner message that is guaranteed to fit.
+ *
+ * completion.mjs sets MAX_RESULT_BYTES equal to MAX_MESSAGE_BYTES deliberately,
+ * so "every accepted result fits in a conversation entry" -- an invariant this
+ * runner BREAKS, because it prepends a pass header and the verdict suppressor
+ * can lengthen the text it rewrites. A maximal report that legitimately cleared
+ * the completion gate would therefore throw in appendMessage, land in the catch,
+ * and the catch's own appendMessage would throw identically: fatal, with every
+ * completed pass's work stranded and only "Fatal:" to explain it.
+ *
+ * Truncation is marked, never silent. Losing the tail of a report without saying
+ * so is the exact failure this whole design exists to prevent.
+ */
+function appendBoundedPartnerMessage(content) {
+  const marker = "\n\n[report truncated: it did not fit in one conversation entry]";
+  let text = content;
+  if (Buffer.byteLength(text, "utf-8") > MAX_MESSAGE_BYTES) {
+    const budget = MAX_MESSAGE_BYTES - Buffer.byteLength(marker, "utf-8");
+    text = Buffer.from(text, "utf-8").subarray(0, budget).toString("utf-8") + marker;
+    log(`Report exceeded the conversation entry limit and was truncated to fit`);
+  }
+  appendMessage(sessionDir, PARTNER_AGENT, text);
+}
+
+/**
+ * Best-effort recovery I/O, for use INSIDE a catch.
+ *
+ * An error handler that throws turns a recoverable pass failure into a fatal one
+ * that abandons the whole panel -- the same principle as the guarded spec.title
+ * dereference, applied to the writes beside it. The conversation log is the most
+ * likely thing to be failing at the moment we are trying to write the failure to
+ * it.
+ */
+function tryRecovery(what, fn) {
+  try {
+    fn();
+  } catch (err) {
+    log(`Recovery step "${what}" failed: ${err.message}`);
+  }
+}
 
 /**
  * Record panel progress where the server can read it.
@@ -349,7 +392,7 @@ async function main() {
           `Suppressed ${suppressed} verdict line(s) in the "${aspectId}" pass; only consolidation and follow-up turns may set a session verdict`
         );
       }
-      appendMessage(sessionDir, PARTNER_AGENT, header + safeResponse);
+      appendBoundedPartnerMessage(header + safeResponse);
       // The SANITIZED text, not the raw response.
       //
       // Suppressing the verdict only on the way into conversation.jsonl
@@ -365,7 +408,12 @@ async function main() {
       // The specialist's own machine-readable claim that it worked its rubric to
       // the end. A pass that omits the footer completed, but did not confirm it
       // finished -- worth distinguishing from one that did.
-      const aspectResult = extractAspectResult(response);
+      // Read from the SANITIZED text, like the finding extraction beside it.
+      // Two parsers over one response reading different sources is how the last
+      // divergence started; today the suppressor cannot touch an ASPECT_RESULT
+      // line, but the next widening of it would make that luck rather than
+      // design.
+      const aspectResult = extractAspectResult(safeResponse);
       panelState.completed.push({
         aspect: aspectId,
         status: aspectResult ? "complete" : "complete_unverified",
@@ -383,16 +431,22 @@ async function main() {
       // because a panel quietly missing its security lens reads exactly like a
       // panel whose security lens came back clean.
       log(`Panel pass ${aspectId} FAILED: ${err.message}`);
-      fs.writeFileSync(ERROR_PATH, `Panel pass ${aspectId} failed: ${err.message}`);
-      appendMessage(
-        sessionDir,
-        "system",
-        // spec may be undefined here -- an unknown aspect id is one of the
-        // things this catch now handles -- and an error handler that throws
-        // escalates a recoverable pass failure into a fatal one that abandons
-        // the whole panel.
-        `Panel pass "${aspectId}"${spec ? ` (${spec.title})` : ""} failed: ${err.message}\n\n` +
-          `This aspect is UNREVIEWED. Do not read its absence as a clean result.`
+      // Every write in this handler is best-effort. An error handler that throws
+      // escalates a recoverable pass failure into a fatal one that abandons the
+      // whole panel -- and the conversation log is the single most likely thing
+      // to be failing at the moment we try to record a failure into it. `spec`
+      // may also be undefined, since an unknown aspect id is one of the cases
+      // this catch now handles.
+      tryRecovery("write last_error.txt", () =>
+        fs.writeFileSync(ERROR_PATH, `Panel pass ${aspectId} failed: ${err.message}`)
+      );
+      tryRecovery("append the UNREVIEWED notice", () =>
+        appendMessage(
+          sessionDir,
+          "system",
+          `Panel pass "${aspectId}"${spec ? ` (${spec.title})` : ""} failed: ${err.message}\n\n` +
+            `This aspect is UNREVIEWED. Do not read its absence as a clean result.`
+        )
       );
       reports.push({ aspect: aspectId, content: "", failed: true, error: err.message });
       panelState.completed.push({
@@ -428,9 +482,20 @@ async function main() {
         hostDisplay: HOST_DISPLAY,
       });
       const response = await runTurn(prompt, `${PARTNER_AGENT}-pr-aggregate`);
-      appendMessage(
-        sessionDir,
-        PARTNER_AGENT,
+
+      // Same rule as a panel pass, and it matters more here. An empty aggregate
+      // was appended as a header-only message reading "Panel complete: 5 of 5
+      // specialist pass(es) reported." with nothing beneath it -- a literal,
+      // affirmative claim of completeness over no content at all, and
+      // panel_complete would go true on the strength of it. That is the review
+      // rendering as finished, one level up from the aspect case.
+      if (!response.trim()) {
+        throw new Error(
+          `${PARTNER_DISPLAY} returned an empty consolidation. The turn exited cleanly but produced no report.`
+        );
+      }
+
+      appendBoundedPartnerMessage(
         `${CONSOLIDATED_HEADER}\n_Panel complete: ${reports.filter((r) => !r.failed).length} of ${selected.length} specialist pass(es) reported._\n\n${response}`
       );
       panelState.completed.push({ aspect: "__aggregate__", status: "complete" });
@@ -440,13 +505,17 @@ async function main() {
         log("Consolidation cancelled by end_dialog");
       } else {
         log(`Consolidation FAILED: ${err.message}`);
-        fs.writeFileSync(ERROR_PATH, `Consolidation failed: ${err.message}`);
-        appendMessage(
-          sessionDir,
-          "system",
-          `The consolidation pass failed: ${err.message}\n\n` +
-            `The individual specialist reports above are intact and complete — read them directly. ` +
-            `Send a message to ask ${PARTNER_DISPLAY} to consolidate them.`
+        tryRecovery("write last_error.txt", () =>
+          fs.writeFileSync(ERROR_PATH, `Consolidation failed: ${err.message}`)
+        );
+        tryRecovery("append the consolidation-failure notice", () =>
+          appendMessage(
+            sessionDir,
+            "system",
+            `The consolidation pass failed: ${err.message}\n\n` +
+              `The individual specialist reports above are intact and complete — read them directly. ` +
+              `Send a message to ask ${PARTNER_DISPLAY} to consolidate them.`
+          )
         );
         panelState.completed.push({
           aspect: "__aggregate__",
@@ -566,7 +635,20 @@ async function main() {
         });
 
         const response = await runTurn(prompt, `${PARTNER_AGENT}-pr-followup`);
-        appendMessage(sessionDir, PARTNER_AGENT, response);
+
+        // Without this, an empty reply was appended as an empty partner message
+        // and then treated as a successful turn: followUpTurns++, activity
+        // refreshed, consecutiveErrors reset to 0. A partner returning empty
+        // every time would burn the entire follow-up budget to the hard cap and
+        // never trip MAX_CONSECUTIVE_ERRORS -- the error counter defeated by the
+        // one failure mode that raises no error. Throwing lets it do its job.
+        if (!response.trim()) {
+          throw new Error(
+            `${PARTNER_DISPLAY} returned an empty follow-up. The turn exited cleanly but produced no text.`
+          );
+        }
+
+        appendBoundedPartnerMessage(response);
         followUpTurns++;
         lastActivityTime = Date.now();
         consecutiveErrors = 0;

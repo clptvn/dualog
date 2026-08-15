@@ -27,6 +27,13 @@
  *     read a panel whose six members each score differently.
  */
 
+import {
+  isMarkdownFenceLine,
+  isMarkdownNoiseLine,
+  matchLegacyApprovalLine,
+  matchVerdictLine,
+} from "./shared.mjs";
+
 /**
  * The header the runner stamps on each specialist's report, and the pattern that
  * reads it back.
@@ -1008,14 +1015,58 @@ export function extractNormalizedFindings(content) {
  * a specialist ignoring an explicit instruction is worth noticing.
  */
 export function suppressVerdictLines(response) {
+  // Acts on EXACTLY the lines shared.mjs would read as a verdict -- no fewer, no
+  // more. Both directions had already gone wrong with a hand-written pattern:
+  //
+  //   too narrow: `## VERDICT: APPROVE` sailed through, and a heading is the
+  //   natural shape under a section the prompt itself calls "Machine-Readable
+  //   Footer". One specialist could resolve the whole review, and the runner
+  //   logged `suppressed: 0` -- indistinguishable from a clean pass.
+  //
+  //   too broad: it rewrote `STATUS: ok` inside a ```js fence and turned a
+  //   `**Status:**` sub-heading into a scolding note with the bold eaten. The
+  //   gate discards fenced, quoted and indented lines, so rewriting them
+  //   protects nothing and corrupts the report a human reads and the
+  //   consolidator is handed.
   let suppressed = 0;
-  const text = String(response ?? "").replace(
-    /^([ \t]*)(?:[-*+]\s+)?(?:\*\*|__)?\s*(?:REVIEW[_\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)\s*(?:\*\*|__)?\s*:/gim,
-    (_match, indent) => {
-      suppressed++;
-      return `${indent}ASPECT_NOTE (verdict suppressed — a specialist pass may not resolve the review):`;
-    }
-  );
+  let inFence = false;
+
+  const text = String(response ?? "")
+    .split("\n")
+    .map((line) => {
+      if (isMarkdownFenceLine(line)) {
+        inFence = !inFence;
+        return line;
+      }
+      if (inFence || isMarkdownNoiseLine(line)) return line;
+
+      const hit = matchVerdictLine(line);
+      if (hit) {
+        suppressed++;
+        const { match } = hit;
+        return (
+          `${line.slice(0, match.index)}ASPECT_NOTE (verdict suppressed — a specialist pass may not resolve the review):` +
+          line.slice(match.index + match[0].length)
+        );
+      }
+
+      // A bare `LGTM` approves a session on its own, with no footer anywhere, so
+      // it has to go too. `APPROVE` is deliberately left alone: it only counts
+      // for plan/spec review dialogs, never for a PR panel, and suppressing it
+      // would rewrite ordinary prose like "Approve this once the test lands".
+      const legacy = matchLegacyApprovalLine(line, "LGTM");
+      if (legacy) {
+        suppressed++;
+        return (
+          `${line.slice(0, legacy.index)}ASPECT_NOTE (approval suppressed — a specialist pass may not resolve the review)` +
+          line.slice(legacy.index + legacy[0].length)
+        );
+      }
+
+      return line;
+    })
+    .join("\n");
+
   return { text, suppressed };
 }
 

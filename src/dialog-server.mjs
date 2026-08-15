@@ -2200,7 +2200,21 @@ server.tool(
               // aspect pending, forever. A host polling for progress waits on a
               // corpse. `panel_state_available` distinguishes "no state yet"
               // from "state exists but is unreadable".
-              runner_alive: isSessionRunnerAlive(status, sessionDir),
+              // Tri-state on purpose. isSessionRunnerAlive answers "not alive"
+              // whenever it cannot READ a command line -- ps missing, sandboxed,
+              // slow -- so folding that into `false` reports a healthy panel as
+              // dead in exactly the environments where nothing is wrong. That is
+              // a milder replay of the round-1 defect on the same polling path,
+              // and it would sit next to `runner_state: "running"` contradicting
+              // it in one document. `null` means "could not determine";
+              // runner_state is the authoritative record, this is a probe.
+              //
+              // Skipped once the runner is known exited, which also keeps a `ps`
+              // spawn off every poll of a finished review.
+              runner_alive:
+                status?.runner_state === "exited"
+                  ? false
+                  : isSessionRunnerAlive(status, sessionDir) || null,
               runner_state: status?.runner_state ?? null,
               runner_exit_reason: status?.runner_exit_reason ?? null,
               last_error: readOptionalText(path.join(sessionDir, "last_error.txt")),
@@ -2358,6 +2372,11 @@ server.tool(
         // regresses the partner to strictly older content, which is worth
         // saying out loud.
         refreshError = err.message;
+        // The fallback notice describes a refresh that was computed and then
+        // thrown away -- emitting both would tell the caller in one breath that
+        // the diff could not be refreshed and that the refresh included extra
+        // commits, with no way to tell which diff the partner actually has.
+        refreshNotice = null;
         try { fs.unlinkSync(path.join(sessionDir, "diff_refreshed.patch")); } catch {}
       }
     }
@@ -2381,18 +2400,18 @@ server.tool(
               partner_timeout_ms: normalizePartnerTimeout(status?.partner_timeout_ms),
               budget,
               review_status: reviewStatus,
-              ...(refreshError || refreshNotice
-                ? {
-                    notices: [
-                      ...(refreshError
-                        ? [
-                            `The diff could not be refreshed (${refreshError}). ${partnerDisplay} is reviewing the diff captured when the review started, not the current state — treat any claim about a fix as unverified.`,
-                          ]
-                        : []),
-                      ...(refreshNotice ? [refreshNotice] : []),
-                    ],
-                  }
-                : {}),
+              // Always present, never conditionally spread. start_pr_review
+              // returns `notices` unconditionally, so a caller writing
+              // `result.notices.length` worked against one tool and threw
+              // against the other.
+              notices: [
+                ...(refreshError
+                  ? [
+                      `The diff could not be refreshed (${refreshError}). ${partnerDisplay} is reviewing the diff captured when the review started, not the current state — treat any claim about a fix as unverified.`,
+                    ]
+                  : []),
+                ...(refreshNotice ? [refreshNotice] : []),
+              ],
               message:
                 `Message sent (id: ${msg.id}). ${partnerDisplay} will be invoked to respond.` +
                 (refreshError || refreshNotice ? ` NOTE: see notices about the refreshed diff.` : ""),
