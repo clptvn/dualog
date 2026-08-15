@@ -435,12 +435,25 @@ test("a disobedient specialist cannot approve the session through the real runne
       .map((id) => path.join(turnsDir, id, "prompt.md"))
       .filter((p) => fs.existsSync(p))
       .map((p) => fs.readFileSync(p, "utf-8"));
-    const aggregationPrompt = prompts.find((p) => /Specialist Reports/.test(p));
-
-    assert.ok(aggregationPrompt, "no consolidation prompt was written");
-    assert.ok(
-      !/^\s*#*\s*REVIEW_VERDICT:\s*APPROVE/m.test(aggregationPrompt.split("## Your Task")[0]),
-      "the specialist's verdict was embedded verbatim in the consolidation prompt"
+    // Selected by the aggregation prompt's unique heading, and asserted to be
+    // unique. readdirSync order is unspecified, so a loose `find` over these
+    // would silently pick a different turn's prompt if the marker ever appeared
+    // in two of them -- and then assert something true about the wrong document.
+    const aggregationPrompts = prompts.filter((p) => /^## Specialist Reports$/m.test(p));
+    assert.equal(
+      aggregationPrompts.length,
+      1,
+      `expected exactly one consolidation prompt among ${prompts.length} turns, found ${aggregationPrompts.length}`
+    );
+    const aggregationPrompt = aggregationPrompts[0];
+    const reportsSection = aggregationPrompt.split("## Your Task")[0];
+    const offending = reportsSection
+      .split("\n")
+      .filter((l) => /^\s*#*\s*REVIEW_VERDICT:\s*APPROVE/.test(l));
+    assert.deepEqual(
+      offending,
+      [],
+      `the specialist's verdict was embedded verbatim in the consolidation prompt: ${JSON.stringify(offending)}`
     );
     assert.match(
       aggregationPrompt,

@@ -179,14 +179,31 @@ process.once("SIGINT", () => {
  * so is the exact failure this whole design exists to prevent.
  */
 function appendBoundedPartnerMessage(content) {
-  const marker = "\n\n[report truncated: it did not fit in one conversation entry]";
-  let text = content;
-  if (Buffer.byteLength(text, "utf-8") > MAX_MESSAGE_BYTES) {
-    const budget = MAX_MESSAGE_BYTES - Buffer.byteLength(marker, "utf-8");
-    text = Buffer.from(text, "utf-8").subarray(0, budget).toString("utf-8") + marker;
-    log(`Report exceeded the conversation entry limit and was truncated to fit`);
+  if (Buffer.byteLength(content, "utf-8") <= MAX_MESSAGE_BYTES) {
+    appendMessage(sessionDir, PARTNER_AGENT, content);
+    return;
   }
-  appendMessage(sessionDir, PARTNER_AGENT, text);
+
+  // Cut from the MIDDLE, keeping the tail.
+  //
+  // get_pr_review_report re-parses each pass out of the conversation message, and
+  // both things it looks for -- the "### Normalized Findings" block and the
+  // ASPECT_RESULT footer -- sit at the end. Truncating from the end therefore
+  // turned a pass that ran and reported into one that, in the findings index,
+  // found nothing: panel_state would say complete with a real aspect_result while
+  // the report showed `result: null` and `findings: []` for the same pass.
+  const marker = "\n\n[report truncated in the middle: it did not fit in one conversation entry]\n\n";
+  const TAIL_BYTES = 8 * 1024;
+  const budget = MAX_MESSAGE_BYTES - Buffer.byteLength(marker, "utf-8");
+  const buf = Buffer.from(content, "utf-8");
+
+  // Decoded with a whole-buffer toString so a split multi-byte character is
+  // repaired rather than emitted as a lone replacement char.
+  const tail = buf.subarray(buf.length - TAIL_BYTES).toString("utf-8");
+  const head = buf.subarray(0, budget - Buffer.byteLength(tail, "utf-8")).toString("utf-8");
+
+  log(`Report exceeded the conversation entry limit; kept the head and the trailing ${TAIL_BYTES} bytes`);
+  appendMessage(sessionDir, PARTNER_AGENT, head + marker + tail);
 }
 
 /**
@@ -476,6 +493,18 @@ async function main() {
     panelState.phase = "consolidating";
     writePanelState(panelState);
     log("Consolidation pass starting");
+
+    // Clear the error marker here too, the way each pass and each follow-up turn
+    // does. A failure in the LAST pass otherwise survives into the consolidation
+    // window -- the longest single wait in the session, and the one a host is
+    // most likely to be polling -- where classifyWaitResult checks last_error
+    // first and returns `error` instantly, and get_pr_review_report now reports
+    // it as the review's current error. Two surfaces showing a handled failure
+    // as live. The durable record stays in panel_state.json and the system
+    // message.
+    try {
+      fs.unlinkSync(ERROR_PATH);
+    } catch {}
     try {
       const prompt = buildAggregationPrompt({
         meta,

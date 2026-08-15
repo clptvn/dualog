@@ -39,6 +39,49 @@ export function readRunnerToken(argv = process.argv) {
   return arg ? arg.slice(RUNNER_TOKEN_PREFIX.length) : null;
 }
 
+/**
+ * Three-valued liveness: "alive" | "dead" | "unknown".
+ *
+ * isSessionRunnerAlive collapses the last two into `false`, which is right for
+ * its callers -- they gate an action, and refusing to act on an unprovable
+ * runner is the safe default. It is wrong for anything REPORTING liveness: a
+ * caller that maps `false` to "could not determine" throws away a proven death,
+ * and a proven death behind a stale `runner_state: "running"` is exactly the
+ * case a host most needs told. watchRunnerExit only fires inside the server
+ * process that spawned the runner, so a SIGKILL, an OOM kill, a reboot, or a
+ * server restart all leave that stale record behind a corpse.
+ */
+export function probeSessionRunner(status, sessionDir) {
+  const pid = status?.runner_pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0 || !isProcessAlive(pid)) {
+    return "dead";
+  }
+
+  const commandLine = readProcessCommandLine(pid);
+  // The only genuinely indeterminate case: the process exists but we could not
+  // read what it is. readProcessCommandLine swallows every failure and returns
+  // "" -- ps missing, sandboxed, or timing out.
+  if (!commandLine) return "unknown";
+
+  const runnerName =
+    RUNNER_SCRIPT_BY_SESSION_TYPE[status?.type] ?? DEFAULT_RUNNER_SCRIPT;
+  const expectedRunnerPath = path.join(SOURCE_DIR, runnerName);
+  if (
+    !commandLine.includes(expectedRunnerPath) ||
+    !commandLine.includes(sessionDir)
+  ) {
+    return "dead";
+  }
+
+  if (typeof status.runner_token === "string" && status.runner_token) {
+    return commandLine.includes(buildRunnerTokenArg(status.runner_token))
+      ? "alive"
+      : "dead";
+  }
+
+  return "alive";
+}
+
 export function isSessionRunnerAlive(status, sessionDir) {
   const pid = status?.runner_pid;
   if (!Number.isSafeInteger(pid) || pid <= 0 || !isProcessAlive(pid)) {

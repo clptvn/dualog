@@ -28,8 +28,7 @@
  */
 
 import {
-  isMarkdownFenceLine,
-  isMarkdownNoiseLine,
+  gateReadableLineMask,
   matchLegacyApprovalLine,
   matchVerdictLine,
 } from "./shared.mjs";
@@ -1008,7 +1007,19 @@ export function extractNormalizedFindings(content) {
     `^\\s*(?:[-*+]\\s+|\\d+[.)]\\s+)?\\**\\[(${FINDING_CATEGORIES.join("|")})\\]\\**\\s*(.+)$`,
     "i"
   );
-  for (const line of String(content || "").split("\n")) {
+  // Skips the same fenced, quoted and indented regions the approval gate skips.
+  //
+  // Without this, a specialist QUOTING the taxonomy as an example -- which the
+  // prompt itself invites, since it lists every category -- had those examples
+  // indexed as real findings. That over-reports, which is the safe direction for
+  // the gate. But these lines also feed `priorFindings`, handed to later passes
+  // under "Do not re-file these", so a quoted example could tell pass 4 that a
+  // real defect had already been filed when nobody filed it. That is an
+  // UNDER-reporting path one step removed.
+  const lines = String(content || "").split("\n");
+  const readable = gateReadableLineMask(content || "");
+  for (const [i, line] of lines.entries()) {
+    if (!readable[i]) continue;
     const match = line.match(categoryRe);
     if (!match) continue;
     findings.push({
@@ -1056,16 +1067,16 @@ export function suppressVerdictLines(response) {
   //   protects nothing and corrupts the report a human reads and the
   //   consolidator is handed.
   let suppressed = 0;
-  let inFence = false;
+  // The gate's OWN answer to "which lines do you read", not a second model of
+  // it. Tracking fences here with a local boolean diverged on unclosed fences:
+  // the boolean latched and skipped the rest of the document while the gate,
+  // which pairs its fences, read straight past the unmatched one.
+  const readable = gateReadableLineMask(response ?? "");
 
   const text = String(response ?? "")
     .split("\n")
-    .map((line) => {
-      if (isMarkdownFenceLine(line)) {
-        inFence = !inFence;
-        return line;
-      }
-      if (inFence || isMarkdownNoiseLine(line)) return line;
+    .map((line, i) => {
+      if (!readable[i]) return line;
 
       const hit = matchVerdictLine(line);
       if (hit) {

@@ -28,6 +28,7 @@ import {
   RUNNER_SCRIPT_BY_SESSION_TYPE,
   buildRunnerTokenArg,
   isSessionRunnerAlive,
+  probeSessionRunner,
 } from "../src/runner-lifecycle.mjs";
 
 const SRC_DIR = path.resolve(fileURLToPath(new URL("../src", import.meta.url)));
@@ -107,6 +108,45 @@ for (const { type, script } of RUNNERS) {
     );
   });
 }
+
+test("the probe distinguishes a proven death from an unreadable process", async (t) => {
+  // The distinction get_pr_review_report needs and isSessionRunnerAlive cannot
+  // express. Folding both into `false` calls a healthy panel dead wherever `ps`
+  // is unavailable; folding both into "unknown" erases a proven death -- which
+  // is the case the field exists for, since watchRunnerExit only fires inside
+  // the server process that spawned the runner, so a SIGKILL, an OOM kill or a
+  // server restart leaves `runner_state: "running"` behind a corpse.
+  const sessionDir = makeSession(t, "probe");
+  const child = await spawnRunnerLookalike(
+    t,
+    path.join(SRC_DIR, "pr-review-runner.mjs"),
+    sessionDir
+  );
+  const status = { type: "pr_review", runner_pid: child.pid, runner_token: TOKEN };
+
+  assert.equal(probeSessionRunner(status, sessionDir), "alive");
+
+  // A dead pid whose status.json still claims it is running.
+  child.kill("SIGKILL");
+  await sleep(500);
+  assert.equal(
+    probeSessionRunner({ ...status, runner_state: "running" }, sessionDir),
+    "dead",
+    "a proven death must not be reported as indeterminate"
+  );
+
+  // A live process that is not this session's runner is also a proven death,
+  // not an unknown.
+  const stranger = await spawnRunnerLookalike(
+    t,
+    path.join(SRC_DIR, "dialog-runner.mjs"),
+    sessionDir
+  );
+  assert.equal(
+    probeSessionRunner({ ...status, runner_pid: stranger.pid }, sessionDir),
+    "dead"
+  );
+});
 
 test("a runner belonging to a different session type is not recognized", async (t) => {
   // The other half of the contract. Mapping every type onto one script would

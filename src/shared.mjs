@@ -96,31 +96,67 @@ export function isReviewApprovalDialog(problem) {
 export const VERDICT_LINE_PREFIX_SOURCE =
   "^\\s*(?:[-*#]+\\s*)?(?:\\*\\*|__|\\*)?\\s*(?:REVIEW[_\\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)(?:\\*\\*|__|\\*)?\\s*:";
 
-/**
- * Does this line sit somewhere the verdict scan will never look?
- *
- * The single-line half of stripMarkdownNoise. Fenced blocks need whole-text
- * state, so a caller walking lines tracks fences itself and uses this for the
- * rest. Exported for the same reason as the pattern above.
- */
-export function isMarkdownNoiseLine(line) {
+/** Blockquoted or indented: content the verdict scan never reads. */
+function isNoiseLine(line) {
   return line.trimStart().startsWith(">") || /^(?: {4,}|\t)/.test(line);
 }
 
-/** Opens or closes a fenced block, whose contents the verdict scan ignores. */
-export function isMarkdownFenceLine(line) {
-  return /^\s*(?:```|~~~)/.test(line);
+const NOISE_BLOCKS = [/```[\s\S]*?```/g, /~~~[\s\S]*?~~~/g, /<!--[\s\S]*?-->/g];
+
+/**
+ * Which lines of `content` would the verdict scan actually read?
+ *
+ * Returns a boolean per line, parallel to `content.split("\n")`. THE one
+ * implementation of that question, exported so the PR review panel's suppressor
+ * consumes it rather than modelling it a second time.
+ *
+ * Modelling it twice has now failed twice, the same way both times. The most
+ * recent: the suppressor walked lines toggling an `inFence` boolean, so an
+ * UNCLOSED fence latched it for the rest of the document and it skipped
+ * everything after -- while this scan uses PAIRED, non-greedy regexes, which
+ * match nothing when a fence is unclosed and therefore read straight past it.
+ * They diverged in the dangerous direction: the gate reading text the suppressor
+ * had decided not to look at, so `` ```diff `` left open (a very ordinary model
+ * malformation) let a verdict through with `suppressed: 0` logged.
+ *
+ * Pairing is deliberately preserved here rather than "fixed": an unbalanced
+ * fence is now wrong in BOTH halves identically, which is safe, instead of wrong
+ * in one, which is not.
+ */
+export function gateReadableLineMask(content) {
+  const text = String(content || "");
+  const lines = text.split("\n");
+
+  const starts = [];
+  let offset = 0;
+  for (const line of lines) {
+    starts.push(offset);
+    offset += line.length + 1;
+  }
+
+  const blocked = new Array(lines.length).fill(false);
+  for (const pattern of NOISE_BLOCKS) {
+    for (const match of text.matchAll(pattern)) {
+      const spanStart = match.index;
+      const spanEnd = match.index + match[0].length;
+      for (let i = 0; i < lines.length; i++) {
+        const lineStart = starts[i];
+        const lineEnd = lineStart + lines[i].length;
+        // Strict overlap. Ambiguity resolves toward READABLE, because a line the
+        // suppressor rewrites unnecessarily is cosmetic damage, while one it
+        // skips unnecessarily is a verdict reaching the gate.
+        if (lineStart < spanEnd && spanStart < lineEnd) blocked[i] = true;
+      }
+    }
+  }
+
+  return lines.map((line, i) => !blocked[i] && !isNoiseLine(line));
 }
 
 function stripMarkdownNoise(content) {
-  return String(content || "")
-    .replace(/```[\s\S]*?```/g, "")
-    .replace(/~~~[\s\S]*?~~~/g, "")
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .split("\n")
-    .filter((line) => !line.trimStart().startsWith(">"))
-    .filter((line) => !/^(?: {4,}|\t)/.test(line))
-    .join("\n");
+  const lines = String(content || "").split("\n");
+  const readable = gateReadableLineMask(content);
+  return lines.filter((_, i) => readable[i]).join("\n");
 }
 
 function normalizeStructuredVerdict(raw) {

@@ -39,6 +39,7 @@ import {
   buildRunnerTokenArg,
   isSessionRunnerAlive,
   markSessionRunnerStarted,
+  probeSessionRunner,
   watchRunnerExit,
 } from "./runner-lifecycle.mjs";
 import {
@@ -2206,21 +2207,18 @@ server.tool(
               // forever, while a host polls a corpse. `panel_state_available`
               // separates "the runner never got far enough to write state" from
               // "state exists".
-              // Tri-state on purpose. isSessionRunnerAlive answers "not alive"
-              // whenever it cannot READ a command line -- ps missing, sandboxed,
-              // slow -- so folding that into `false` reports a healthy panel as
-              // dead in exactly the environments where nothing is wrong. That is
-              // a milder replay of the round-1 defect on the same polling path,
-              // and it would sit next to `runner_state: "running"` contradicting
-              // it in one document. `null` means "could not determine";
-              // runner_state is the authoritative record, this is a probe.
+              // Tri-state, resolved in the probe rather than at this call site.
               //
-              // Skipped once the runner is known exited, which also keeps a `ps`
-              // spawn off every poll of a finished review.
-              runner_alive:
-                status?.runner_state === "exited"
-                  ? false
-                  : isSessionRunnerAlive(status, sessionDir) || null,
+              // isSessionRunnerAlive folds "cannot read the command line" into
+              // `false`, so reporting it directly calls a healthy panel dead in
+              // any sandboxed environment. But mapping its `false` to `null`
+              // was worse: it erased a PROVEN death, which is the case this
+              // field exists for -- a runner killed without recording it, sitting
+              // behind a stale `runner_state: "running"`. Now `null` means only
+              // "the process exists and we could not identify it".
+              runner_alive: { alive: true, dead: false, unknown: null }[
+                probeSessionRunner(status, sessionDir)
+              ],
               runner_state: status?.runner_state ?? null,
               runner_exit_reason: status?.runner_exit_reason ?? null,
               last_error: readOptionalText(path.join(sessionDir, "last_error.txt")),
