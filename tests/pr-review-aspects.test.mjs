@@ -22,6 +22,7 @@ import {
   extractNormalizedFindings,
   selectAspects,
   summarizeDiff,
+  suppressVerdictLines,
 } from "../src/pr-review-aspects.mjs";
 import { computeReviewStatus, extractReviewVerdict } from "../src/shared.mjs";
 
@@ -285,6 +286,106 @@ test("normalized findings are extracted with their categories", () => {
 
 test("an empty panel report yields no findings", () => {
   assert.deepEqual(extractNormalizedFindings("### Normalized Findings\n(none)"), []);
+});
+
+test("findings are extracted from the markdown shapes a model actually writes", () => {
+  // The parser used to anchor hard at `^\s*\[`, so every one of these was
+  // dropped -- and dropped in the most dangerous direction, because shared.mjs's
+  // gate matches the category ANYWHERE in the line. A bulleted [CRITICAL] drove
+  // the session to changes_requested while findings_by_category came back empty,
+  // so the structured report read as a clean panel for a change that had a
+  // critical finding against it. A list is the overwhelmingly common shape and
+  // nothing in the prompt forbids it.
+  const shapes = [
+    ["plain", "[CRITICAL] src/a.ts:12 — unbounded loop"],
+    ["dash bullet", "- [CRITICAL] src/a.ts:12 — unbounded loop"],
+    ["star bullet", "* [CRITICAL] src/a.ts:12 — unbounded loop"],
+    ["plus bullet", "+ [CRITICAL] src/a.ts:12 — unbounded loop"],
+    ["numbered", "1. [CRITICAL] src/a.ts:12 — unbounded loop"],
+    ["numbered paren", "2) [CRITICAL] src/a.ts:12 — unbounded loop"],
+    ["bold wrapped", "**[CRITICAL]** src/a.ts:12 — unbounded loop"],
+    ["bulleted and bold", "- **[CRITICAL]** src/a.ts:12 — unbounded loop"],
+  ];
+
+  for (const [label, line] of shapes) {
+    const findings = extractNormalizedFindings(line);
+    assert.equal(findings.length, 1, `the ${label} form was dropped`);
+    assert.equal(findings[0].category, "CRITICAL", `the ${label} form lost its category`);
+    assert.match(findings[0].text, /unbounded loop/, `the ${label} form lost its text`);
+  }
+});
+
+test("the finding parser and the approval gate agree about what is a finding", () => {
+  // The real invariant: anything the gate will BLOCK on must be visible in the
+  // report. A finding the gate acts on but the report cannot show is a review
+  // that blocks for a reason its own report does not contain.
+  const status = { partner_agent: "codex", max_rounds: 8, hard_cap: 13 };
+  for (const line of [
+    "[CRITICAL] src/a.ts:1 — plain",
+    "- [CRITICAL] src/a.ts:1 — bulleted",
+    "1. [SECURITY] src/a.ts:1 — numbered",
+    "**[CORRECTNESS]** src/a.ts:1 — bold",
+  ]) {
+    const blocked =
+      computeReviewStatus(status, [{ id: 1, from: "codex", content: line }], { problem: "" })
+        .state === "changes_requested";
+    const indexed = extractNormalizedFindings(line).length > 0;
+    assert.equal(
+      indexed,
+      blocked,
+      `disagreement on ${JSON.stringify(line)}: gate blocked=${blocked}, report indexed=${indexed}`
+    );
+  }
+});
+
+test("a specialist cannot resolve the session even if it emits a verdict anyway", () => {
+  // The prompt forbids this, but a prompt is a request. The runner owns the
+  // append, so it enforces: any verdict line in a PANEL PASS is rewritten before
+  // it reaches the log, where shared.mjs would otherwise read it as the whole
+  // session's answer and approve a review whose other passes had not run.
+  const disobedient = [
+    "## Panel pass 1 of 3 — General code review (aspect: code)",
+    "Looks fine to me.",
+    "REVIEW_VERDICT: APPROVE",
+  ].join("\n");
+
+  assert.ok(
+    extractReviewVerdict(disobedient, { allowsApproveVerdict: true }),
+    "precondition: shared.mjs must read this raw response as an approval"
+  );
+  const { text, suppressed } = suppressVerdictLines(disobedient);
+  assert.equal(suppressed, 1, "the verdict line was not counted as suppressed");
+  assert.equal(
+    extractReviewVerdict(text, { allowsApproveVerdict: true }),
+    null,
+    "a specialist's verdict survived into the conversation log"
+  );
+
+  // Bare "VERDICT:" and "STATUS:", bulleted or bolded, are all read by
+  // shared.mjs as session verdicts, so all of them have to be caught.
+  for (const line of [
+    "VERDICT: APPROVE",
+    "- VERDICT: APPROVE",
+    "**STATUS**: APPROVE",
+    "REVIEW_STATUS: APPROVE",
+  ]) {
+    assert.equal(
+      extractReviewVerdict(suppressVerdictLines(line).text, { allowsApproveVerdict: true }),
+      null,
+      `"${line}" survived suppression`
+    );
+  }
+});
+
+test("suppression leaves consolidation and follow-up verdicts alone", () => {
+  // Applied to panel passes only. Stripping the verdict from the turns that are
+  // REQUIRED to emit one would make approval unreachable and every review would
+  // hang at changes_requested forever.
+  const consolidated = "## Consolidated PR Review\nAll clear.\nREVIEW_VERDICT: APPROVE";
+  assert.ok(
+    extractReviewVerdict(consolidated, { allowsApproveVerdict: true })?.approved,
+    "precondition: a consolidation approval must be readable"
+  );
 });
 
 test("the aspect result line is read back", () => {

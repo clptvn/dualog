@@ -62,7 +62,9 @@ import {
   buildAspectHeader,
   buildAspectPrompt,
   buildFollowUpPrompt,
+  extractAspectResult,
   extractNormalizedFindings,
+  suppressVerdictLines,
 } from "./pr-review-aspects.mjs";
 
 const sessionDir = process.argv[2];
@@ -117,7 +119,17 @@ function parsePositiveInt(value, fallback) {
 
 function log(msg) {
   const ts = new Date().toISOString();
-  fs.appendFileSync(LOG_PATH, `[${ts}] ${msg}\n`);
+  try {
+    fs.appendFileSync(LOG_PATH, `[${ts}] ${msg}\n`);
+  } catch {
+    // A logger must never be the thing that kills the process it exists to
+    // diagnose. This is a detached runner with stdio ignored, and log() is the
+    // first statement in both the signal handler and the fatal catch -- so an
+    // unwritable log (ENOSPC, session dir removed by cleanup, permissions)
+    // would throw before the processing marker is cleared and before the exit
+    // is recorded, pinning the session "running" behind a dead process. That
+    // zombie state is exactly what the lifecycle code works to prevent.
+  }
 }
 
 let terminatingFromSignal = false;
@@ -173,7 +185,17 @@ function readActiveDiff(originalDiff) {
       const refreshed = fs.readFileSync(REFRESHED_DIFF_PATH, "utf-8");
       if (refreshed.trim()) return refreshed;
     }
-  } catch {}
+  } catch (err) {
+    // NOT a bare swallow like the unlink idioms elsewhere in this file. Those
+    // are "delete if present", where ENOENT is the expected case. Here the file
+    // was observed to EXIST and then could not be read -- a truncated write, a
+    // permissions change, a replacement mid-read -- and the fallback shows the
+    // partner the session-start diff under a header calling it current. Silence
+    // would make stale content indistinguishable from fresh.
+    log(
+      `Could not read the refreshed diff (${err.message}); falling back to the diff captured at review start`
+    );
+  }
   return originalDiff;
 }
 
@@ -195,6 +217,13 @@ async function runTurn(prompt, tempPrefix) {
 }
 
 async function main() {
+  // Written BEFORE the reads below, so a crash while loading the diff or the
+  // meta leaves a record rather than a void. Both reads are unguarded on
+  // purpose -- there is no sane way to review without them -- but without this
+  // marker a failure there produced no panel_state.json at all, and the report
+  // tool then showed a permanently "starting" panel with every aspect pending.
+  writePanelState({ phase: "starting", completed: [], started_at: new Date().toISOString() });
+
   const originalDiff = fs.readFileSync(DIFF_PATH, "utf-8");
   const meta = JSON.parse(fs.readFileSync(META_PATH, "utf-8"));
   const selected = Array.isArray(meta.aspects) ? meta.aspects : [];
@@ -242,6 +271,20 @@ async function main() {
     const passTotal = selected.length + 1;
     log(`Panel pass ${passIndex}/${selected.length}: ${aspectId}`);
 
+    // Clear the error marker before each pass, the way the follow-up loop does.
+    //
+    // A per-pass failure here is RECOVERABLE -- the panel continues -- but
+    // classifyWaitResult checks last_error before anything else, so leaving the
+    // file in place made every subsequent wait_for_partner_response return
+    // `error` instantly for the entire rest of the panel. The host loses the
+    // documented way to watch the panel finish, keeps being re-notified of a
+    // failure already handled, and a genuinely new failure hides under the old
+    // one. The durable record of the failure lives in panel_state.json and the
+    // system message, which is where it belongs.
+    try {
+      fs.unlinkSync(ERROR_PATH);
+    } catch {}
+
     const prompt = buildAspectPrompt({
       aspect: aspectId,
       meta,
@@ -258,6 +301,25 @@ async function main() {
 
     try {
       const response = await runTurn(prompt, `${PARTNER_AGENT}-pr-${aspectId}`);
+
+      // An empty response is a FAILED pass, not a clean one.
+      //
+      // A turn can exit successfully having produced no text: a partner whose
+      // write tools were silently denied, a turn stopped by a content filter, a
+      // done.json that raced result.md. Recorded as success, that aspect lands
+      // in aspects_reported with findings: [] -- byte-for-byte identical to a
+      // specialist that ran and found nothing. Worse, `anyReport` would still be
+      // true, so consolidation would run over empty sections, read them as
+      // "this lens found nothing", and be free to emit APPROVE for a panel that
+      // reviewed nothing at all. Throwing routes it through the catch below,
+      // which already records the hole in all three places.
+      if (!response.trim()) {
+        throw new Error(
+          `${PARTNER_DISPLAY} returned an empty report for aspect "${aspectId}". ` +
+            `The turn exited cleanly but produced no text, so this aspect is unreviewed.`
+        );
+      }
+
       const header =
         buildAspectHeader({
           aspect: aspectId,
@@ -266,14 +328,25 @@ async function main() {
           passTotal: selected.length,
         }) +
         `\n_${passIndex < selected.length ? `${selected.length - passIndex} more specialist pass(es) and then consolidation still to come.` : "Consolidation pass still to come."}_\n\n`;
-      appendMessage(sessionDir, PARTNER_AGENT, header + response);
+      const { text: safeResponse, suppressed } = suppressVerdictLines(response);
+      if (suppressed > 0) {
+        log(
+          `Suppressed ${suppressed} verdict line(s) in the "${aspectId}" pass; only consolidation and follow-up turns may set a session verdict`
+        );
+      }
+      appendMessage(sessionDir, PARTNER_AGENT, header + safeResponse);
       reports.push({ aspect: aspectId, content: response, failed: false });
       for (const finding of extractNormalizedFindings(response)) {
         priorFindings.push(`[${finding.category}] ${finding.text}`);
       }
+      // The specialist's own machine-readable claim that it worked its rubric to
+      // the end. A pass that omits the footer completed, but did not confirm it
+      // finished -- worth distinguishing from one that did.
+      const aspectResult = extractAspectResult(response);
       panelState.completed.push({
         aspect: aspectId,
-        status: "complete",
+        status: aspectResult ? "complete" : "complete_unverified",
+        aspect_result: aspectResult,
         chars: response.length,
       });
       log(`Panel pass ${aspectId} complete (${response.length} chars)`);

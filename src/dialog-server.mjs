@@ -1746,13 +1746,16 @@ server.tool(
     let prInfo = null;
     const target = pr ? "pr" : diff_target || "branch";
 
-    // `pr` selects the change wholesale, so the local-diff parameters have
-    // nothing left to decide. Reporting that is not pedantry: a caller who
-    // passed both believes one of them is shaping the review, and the reviewed
-    // change would differ from the one they think they asked for. Warnings
-    // rather than an error -- the request is still unambiguous, just
-    // over-specified.
-    const ignoredParams = [];
+    // Anything the caller must know about how the reviewed change was resolved,
+    // surfaced in the start response's `notices`.
+    //
+    // Two kinds land here, and both share one property: the review still runs,
+    // but over a change that is not quite the one the caller believes they
+    // asked for. `pr` selects the change wholesale, so the local-diff
+    // parameters have nothing left to decide; and the merge-base diff can fall
+    // back to a two-dot range that includes commits the author never wrote.
+    // Neither is fatal, and neither may be silent.
+    const startupNotices = [];
     if (pr) {
       for (const [name, value] of [
         ["diff_target", diff_target],
@@ -1760,7 +1763,7 @@ server.tool(
         ["base_branch", base_branch],
       ]) {
         if (value != null) {
-          ignoredParams.push(
+          startupNotices.push(
             `${name} was ignored: "pr" selects the change, and the two cannot both define it`
           );
         }
@@ -1797,7 +1800,16 @@ server.tool(
         try {
           diff = execFileSync("git", ["diff", `${baseBranch}...${headBranch}`], execOpts).toString();
         } catch {
+          // Keep the fallback -- it is the right recovery for a stale base, a
+          // shallow clone, or a detached HEAD -- but say so. Three dots is
+          // merge-base; two dots also includes everything the base gained since
+          // the branch point, so the panel can end up reviewing commits the
+          // author never wrote and filing findings against them, all under a
+          // label that still reads "branch X vs Y".
           diff = execFileSync("git", ["diff", `${baseBranch}..${headBranch}`], execOpts).toString();
+          startupNotices.push(
+            `the three-dot (merge-base) diff of ${baseBranch}...${headBranch} failed, so a two-dot diff was used instead: the review may include commits added to ${baseBranch} since the branch point`
+          );
         }
         scopeLabel = `branch ${headBranch} vs ${baseBranch}`;
       } else {
@@ -1982,7 +1994,7 @@ server.tool(
     watchRunnerExit(runner, sessionDir, { runnerToken });
 
     const totalPasses = panelPasses + 1;
-    const notices = [...(preflight.notices ?? []), ...ignoredParams];
+    const notices = [...(preflight.notices ?? []), ...startupNotices];
     if (prInfo?.is_draft) notices.push("pull request is a DRAFT");
     if (prInfo?.state && prInfo.state !== "OPEN") {
       notices.push(`pull request state is ${prInfo.state}, not OPEN`);
@@ -2163,6 +2175,19 @@ server.tool(
                 : null,
               phase: panel?.phase ?? (consolidated ? "follow_up" : "panel"),
               panel_complete: Boolean(consolidated),
+              // Liveness, because otherwise this tool cannot tell you the panel
+              // is dead. The runner reads its meta and diff before writing any
+              // panel state, so a corrupt sidecar, a lost write permission, or a
+              // full disk kills it with no panel_state.json and no system
+              // message -- and the report then reads `phase: "panel"` with every
+              // aspect pending, forever. A host polling for progress waits on a
+              // corpse. `panel_state_available` distinguishes "no state yet"
+              // from "state exists but is unreadable".
+              runner_alive: isSessionRunnerAlive(status, sessionDir),
+              runner_state: status?.runner_state ?? null,
+              runner_exit_reason: status?.runner_exit_reason ?? null,
+              last_error: readOptionalText(path.join(sessionDir, "last_error.txt")),
+              panel_state_available: panel != null,
               aspects_planned: planned,
               aspects_reported: [...ran],
               aspects_pending: planned.filter(
@@ -2230,6 +2255,7 @@ server.tool(
 
     // Auto-refresh diff BEFORE appending message so it's ready when the runner
     // sees the new message and immediately starts building the prompt.
+    let refreshError = null;
     const isReviewSession = status?.type === "review" || status?.type === "pr_review";
     if (isReviewSession && status.diff_target && !status.diff_target.startsWith("commit:")) {
       try {
@@ -2282,8 +2308,19 @@ server.tool(
           }
         }
         writeFileAtomic(path.join(sessionDir, "diff_refreshed.patch"), refreshedDiff);
-      } catch {
-        // On failure, remove stale refreshed diff so runner falls back to original
+      } catch (err) {
+        // Caught WITH the error, because this is the one refresh that leaves the
+        // machine. A dead network, an expired gh token, a rate limit, a diff
+        // past maxBuffer, or a force-pushed PR all arrived here identically and
+        // silently -- while send_message still returned sent: true and the
+        // partner was handed the session-start diff under a header calling it
+        // current, alongside an instruction to verify fixes against it.
+        //
+        // Removing the stale file is still right (the runner falls back to the
+        // original), but a refresh that worked last round and fails this one
+        // regresses the partner to strictly older content, which is worth
+        // saying out loud.
+        refreshError = err.message;
         try { fs.unlinkSync(path.join(sessionDir, "diff_refreshed.patch")); } catch {}
       }
     }
@@ -2307,7 +2344,16 @@ server.tool(
               partner_timeout_ms: normalizePartnerTimeout(status?.partner_timeout_ms),
               budget,
               review_status: reviewStatus,
-              message: `Message sent (id: ${msg.id}). ${partnerDisplay} will be invoked to respond.`,
+              ...(refreshError
+                ? {
+                    notices: [
+                      `The diff could not be refreshed (${refreshError}). ${partnerDisplay} is reviewing the diff captured when the review started, not the current state — treat any claim about a fix as unverified.`,
+                    ],
+                  }
+                : {}),
+              message:
+                `Message sent (id: ${msg.id}). ${partnerDisplay} will be invoked to respond.` +
+                (refreshError ? ` NOTE: the diff refresh failed; see notices.` : ""),
             },
             null,
             2

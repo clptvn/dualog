@@ -58,6 +58,14 @@ const FAKE_BIN = writeFakeCli(BIN_DIR, "fake-panel.mjs", "sidecar-ok", {
 });
 writeFakeAdapter(ADAPTER_DIR, "fake-panel", FAKE_BIN);
 
+// A partner that exits cleanly having written an empty result. This is a real
+// shape, not a contrived one: a CLI whose write tools were silently denied, a
+// turn stopped by a content filter, or a done.json that raced result.md all
+// arrive exactly like this.
+// Passed as the runner's partner COMMAND, so it runs under the same adapter --
+// only the binary's behavior differs.
+const EMPTY_BIN = writeFakeCli(BIN_DIR, "fake-empty.mjs", "sidecar-ok", { reply: "" });
+
 const DIFF = [
   "diff --git a/src/app.ts b/src/app.ts",
   "--- a/src/app.ts",
@@ -132,14 +140,14 @@ function setupSession(label, aspects) {
   return { sessionId, sessionDir };
 }
 
-function startRunner(sessionDir, followUpRounds = 2) {
+function startRunner(sessionDir, followUpRounds = 2, binary = FAKE_BIN) {
   const child = spawn(
     process.execPath,
     [
       RUNNER_PATH,
       sessionDir,
       ROOT, // project path
-      FAKE_BIN,
+      binary,
       String(followUpRounds),
       "", // reasoning effort
       "", // model
@@ -279,6 +287,57 @@ test("panel progress is recorded on disk while the panel is still running", asyn
       assert.equal(entry.status, "complete", `${entry.aspect} did not complete: ${entry.error}`);
     }
     assert.equal(panel.phase, "follow_up", "the panel must hand off to the conversation phase");
+  } finally {
+    await stopRunner(child, sessionDir);
+  }
+});
+
+test("a pass that returns nothing is recorded as failed, not as clean", async () => {
+  // The highest-value invariant in this system: a review that did not happen
+  // must never render as a review that found nothing. A turn can exit
+  // successfully having produced no text, and recorded as success that aspect
+  // lands in aspects_reported with an empty finding list -- indistinguishable
+  // from a specialist that ran and cleared the code.
+  const aspects = ["code"];
+  const { sessionDir } = setupSession("aaaaaaa4", aspects);
+  const child = startRunner(sessionDir, 2, EMPTY_BIN);
+
+  try {
+    // The failure is announced as a system message, so wait on that rather than
+    // on a partner message that will never come.
+    const giveUpAt = Date.now() + 90000;
+    let panel;
+    for (;;) {
+      try {
+        panel = JSON.parse(fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8"));
+      } catch {
+        panel = null;
+      }
+      if (panel?.completed?.some((c) => c.aspect === "code")) break;
+      if (Date.now() >= giveUpAt) assert.fail("the empty pass never resolved either way");
+      await sleep(500);
+    }
+
+    const entry = panel.completed.find((c) => c.aspect === "code");
+    assert.equal(entry.status, "failed", "an empty response was recorded as a completed pass");
+    assert.match(entry.error, /empty report/i);
+
+    const messages = readConversation(sessionDir);
+    const partner = messages.filter((m) => m.from === "fake-panel");
+    assert.equal(partner.length, 0, "an empty response was appended as if it were a report");
+
+    const system = messages.filter((m) => m.from === "system");
+    assert.ok(
+      system.some((m) => /UNREVIEWED/.test(m.content)),
+      "the log must say the aspect is unreviewed, not merely go quiet"
+    );
+
+    // And with no surviving report, consolidation must not run and quietly
+    // approve a panel that reviewed nothing.
+    assert.ok(
+      !partner.some((m) => CONSOLIDATED_HEADER_RE.test(m.content)),
+      "consolidation ran over a panel with no reports at all"
+    );
   } finally {
     await stopRunner(child, sessionDir);
   }

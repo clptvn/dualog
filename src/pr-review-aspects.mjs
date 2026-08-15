@@ -660,6 +660,22 @@ ${projectPath}
 Read any file here for context beyond the diff. You are expected to — the diff
 alone rarely contains enough to judge a change fairly.
 `;
+
+  // A PR's contents live on the remote. The working tree may be on another
+  // branch entirely, so "read the current file to check" -- which every prompt
+  // here tells a specialist to do -- can silently send it to bytes that have
+  // nothing to do with the change under review. Saying so is the difference
+  // between a specialist that reads the tree carefully and one that trusts it.
+  if (meta.scope === "pr") {
+    block += `
+**This is a pull request, and the directory above is NOT guaranteed to contain
+it.** The diff was fetched from the remote; the local tree may sit on a different
+branch, or predate the PR entirely. Use the directory to understand surrounding
+code, conventions, and callers — but treat the DIFF as the authoritative statement
+of what changed. If a file on disk disagrees with the diff, the diff is the change
+and the file is not; say so rather than reviewing the local copy.
+`;
+  }
   return block;
 }
 
@@ -749,6 +765,13 @@ export function buildAggregationPrompt({
   reviewFocus,
   hostDisplay,
 }) {
+  // A panel with a failed pass has a KNOWN hole, and until this block existed
+  // nothing stopped consolidation from emitting APPROVE over it -- which
+  // computeReviewStatus turns into approved/close_allowed, the gate end_dialog
+  // enforces. The prompt marked the pass UNREVIEWED and then left the verdict
+  // contract free to ignore it, so the system knew the aspect had failed and
+  // still let the review say otherwise.
+  const failedAspects = reports.filter((r) => r.failed).map((r) => r.aspect);
   const sections = reports
     .map(
       (r) =>
@@ -836,6 +859,16 @@ REFERENCED_FILES: path/one.ext, path/two.ext
 APPROVE only when nothing material remains. CHANGES_REQUESTED when there are
 issues to address. NEEDS_DISCUSSION when you need ${hostDisplay} or the user to
 answer something before you can conclude.
+${
+  failedAspects.length
+    ? `
+**You may NOT emit APPROVE.** ${failedAspects.length} specialist pass(es) FAILED
+(${failedAspects.join(", ")}), so this panel is incomplete and part of this change
+went unreviewed. Use NEEDS_DISCUSSION, and name each unreviewed aspect in your
+Coverage section. Approving here would certify a review that was never performed.
+`
+    : ""
+}
 
 Paths in REFERENCED_FILES are relative to ${projectPath}, and the line is parsed
 so your partner can verify your claims against the real code.
@@ -871,7 +904,7 @@ panel has reported and been consolidated; ${hostDisplay} is now responding.
 
 ${contextBlock(meta, projectPath)}
 
-## Current State of the Change
+## ${meta.scope === "pr" ? "The Change, As Last Fetched From The Pull Request" : "Current State of the Change"}
 ${diffText}
 
 ## Conversation So Far
@@ -895,8 +928,11 @@ Follow-up round ${roundsUsed + 1}. Soft cap ${softCap}, hard cap ${hardCap}.
 ## Your Task — Follow-up
 
 - Address ${hostDisplay}'s responses to the review.
-- Where something was fixed, VERIFY it by reading the current file. Do not take
-  the claim of a fix as the fact of one.
+- Where something was fixed, VERIFY it${
+    meta.scope === "pr"
+      ? " against the refreshed diff above, which is re-fetched from the pull request. Do NOT verify against the local working tree: it may be on a different branch and can show you a fix that is not in the PR, or hide one that is."
+      : " by reading the current file."
+  } Do not take the claim of a fix as the fact of one.
 - Where ${hostDisplay} disagreed, either accept the reasoning and say so, or
   explain concretely why the concern stands.
 - Raise genuinely new issues only if they meet the same bar the panel used.
@@ -923,7 +959,21 @@ Respond with ONLY your message and the footer.`;
  */
 export function extractNormalizedFindings(content) {
   const findings = [];
-  const categoryRe = new RegExp(`^\\s*\\[(${FINDING_CATEGORIES.join("|")})\\]\\s*(.+)$`, "i");
+  // Bullets, numbering, and bold wrapping are all accepted around the category.
+  //
+  // The prompt asks for a bare `[CATEGORY] path — text` line, but a model
+  // writing a list of findings as a markdown list is the overwhelmingly common
+  // shape and nothing forbids it. A strict anchor dropped every one of them,
+  // and the failure was invisible in the worst way: shared.mjs's gate matches
+  // the category ANYWHERE in the line, so a bulleted [CRITICAL] still drove the
+  // session to changes_requested while this parser returned nothing -- an empty
+  // findings index for a panel that had raised a critical finding, plus an empty
+  // priorFindings list, so later passes were told nothing had been filed and
+  // duplicated each other.
+  const categoryRe = new RegExp(
+    `^\\s*(?:[-*+]\\s+|\\d+[.)]\\s+)?\\**\\[(${FINDING_CATEGORIES.join("|")})\\]\\**\\s*(.+)$`,
+    "i"
+  );
   for (const line of String(content || "").split("\n")) {
     const match = line.match(categoryRe);
     if (!match) continue;
@@ -934,6 +984,39 @@ export function extractNormalizedFindings(content) {
     });
   }
   return findings;
+}
+
+/**
+ * Neutralize any session-level verdict a SPECIALIST pass tried to emit.
+ *
+ * The panel's load-bearing invariant is that no single lens resolves the whole
+ * review, and aspectFooter() only ASKS for that. shared.mjs reads a verdict from
+ * any partner message, so one disobedient pass-1 response carrying
+ * "REVIEW_VERDICT: APPROVE" approved a review whose other five passes had not
+ * run -- bounded only by whether a later pass happened to emit a blocking
+ * category. The runner owns the append, so it can enforce what the prompt
+ * requests.
+ *
+ * Lives here rather than in the runner so it sits beside the footer that
+ * declares the rule, and so it is testable at all: the runner is a process entry
+ * point and executes on import.
+ *
+ * For PANEL PASSES ONLY. Consolidation and follow-up turns are required to emit
+ * a verdict; stripping theirs would make approval unreachable.
+ *
+ * Returns { text, suppressed } — the count is the caller's cue to log it, since
+ * a specialist ignoring an explicit instruction is worth noticing.
+ */
+export function suppressVerdictLines(response) {
+  let suppressed = 0;
+  const text = String(response ?? "").replace(
+    /^([ \t]*)(?:[-*+]\s+)?(?:\*\*|__)?\s*(?:REVIEW[_\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)\s*(?:\*\*|__)?\s*:/gim,
+    (_match, indent) => {
+      suppressed++;
+      return `${indent}ASPECT_NOTE (verdict suppressed — a specialist pass may not resolve the review):`;
+    }
+  );
+  return { text, suppressed };
 }
 
 /** Read the ASPECT_RESULT line a specialist pass is required to emit. */
