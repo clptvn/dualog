@@ -285,21 +285,36 @@ async function main() {
       fs.unlinkSync(ERROR_PATH);
     } catch {}
 
-    const prompt = buildAspectPrompt({
-      aspect: aspectId,
-      meta,
-      diff: readActiveDiff(originalDiff),
-      projectPath,
-      maxDiffChars: MAX_REVIEW_DIFF_CHARS,
-      passIndex,
-      passTotal,
-      reviewFocus,
-      // Headlines only. Handing a specialist the full text of every earlier
-      // report would re-couple the lenses this design exists to keep apart.
-      priorFindings: priorFindings.slice(0, 40),
-    });
-
     try {
+      // Prompt construction belongs INSIDE the try, because it can throw.
+      // buildAspectPrompt rejects an id it does not know, and spec would be
+      // undefined for one -- which is reachable without anyone hand-editing
+      // anything: a session started under one version and resumed after an
+      // upgrade that renamed or removed an aspect. Outside the try, that threw
+      // clean out of the loop into the fatal handler and abandoned every OTHER
+      // pass in the panel over one bad id, leaving nothing but "Fatal:" in
+      // last_error.txt. Inside, it costs exactly the pass it belongs to.
+      if (!spec) {
+        throw new Error(
+          `Unknown review aspect "${aspectId}" in this session's saved panel. ` +
+            `It may have been renamed or removed since the review started; this aspect is unreviewed.`
+        );
+      }
+
+      const prompt = buildAspectPrompt({
+        aspect: aspectId,
+        meta,
+        diff: readActiveDiff(originalDiff),
+        projectPath,
+        maxDiffChars: MAX_REVIEW_DIFF_CHARS,
+        passIndex,
+        passTotal,
+        reviewFocus,
+        // Headlines only. Handing a specialist the full text of every earlier
+        // report would re-couple the lenses this design exists to keep apart.
+        priorFindings: priorFindings.slice(0, 40),
+      });
+
       const response = await runTurn(prompt, `${PARTNER_AGENT}-pr-${aspectId}`);
 
       // An empty response is a FAILED pass, not a clean one.
@@ -335,8 +350,16 @@ async function main() {
         );
       }
       appendMessage(sessionDir, PARTNER_AGENT, header + safeResponse);
-      reports.push({ aspect: aspectId, content: response, failed: false });
-      for (const finding of extractNormalizedFindings(response)) {
+      // The SANITIZED text, not the raw response.
+      //
+      // Suppressing the verdict only on the way into conversation.jsonl
+      // protected the gate and left the consolidator exposed -- and the
+      // consolidator is the turn actually permitted to set a verdict, so it is
+      // the more consequential reader of the two. A specialist's
+      // "REVIEW_VERDICT: APPROVE" would have been scrubbed from the record while
+      // being embedded verbatim in the prompt of the turn deciding the outcome.
+      reports.push({ aspect: aspectId, content: safeResponse, failed: false });
+      for (const finding of extractNormalizedFindings(safeResponse)) {
         priorFindings.push(`[${finding.category}] ${finding.text}`);
       }
       // The specialist's own machine-readable claim that it worked its rubric to
@@ -364,7 +387,11 @@ async function main() {
       appendMessage(
         sessionDir,
         "system",
-        `Panel pass "${aspectId}" (${spec.title}) failed: ${err.message}\n\n` +
+        // spec may be undefined here -- an unknown aspect id is one of the
+        // things this catch now handles -- and an error handler that throws
+        // escalates a recoverable pass failure into a fatal one that abandons
+        // the whole panel.
+        `Panel pass "${aspectId}"${spec ? ` (${spec.title})` : ""} failed: ${err.message}\n\n` +
           `This aspect is UNREVIEWED. Do not read its absence as a clean result.`
       );
       reports.push({ aspect: aspectId, content: "", failed: true, error: err.message });

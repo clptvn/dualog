@@ -1715,13 +1715,35 @@ server.tool(
       return { content: [{ type: "text", text: `Error: ${preflight.errorText}` }] };
     }
 
+    // Anything the caller must know about how the reviewed change was resolved,
+    // surfaced in the start response's `notices`. Declared before the first
+    // thing that can append to it, which is the HEAD lookup immediately below.
+    //
+    // Everything here shares one property: the review still runs, but over a
+    // change that is not quite the one the caller believes they asked for. `pr`
+    // selects the change wholesale, so the local-diff parameters have nothing
+    // left to decide; the merge-base diff can fall back to a two-dot range that
+    // includes commits the author never wrote; an unresolvable HEAD leaves the
+    // refresh baseline floating. None is fatal, and none may be silent.
+    const startupNotices = [];
+
     const execOpts = { cwd: project_path, timeout: 30000, maxBuffer: 10 * 1024 * 1024 };
     let currentBranch, headSha;
     try {
       headSha = execSync("git rev-parse HEAD", { cwd: project_path, timeout: 10000 })
         .toString()
         .trim();
-    } catch {}
+    } catch {
+      // Not fatal, but not silent either. send_message's uncommitted refresh
+      // uses `status.head_sha || "HEAD"` as its baseline, so a null here means
+      // that once the author commits, the refreshed diff LOSES the committed
+      // work and shows only what is still uncommitted -- a quietly narrower
+      // change than the one under review.
+      startupNotices.push(
+        "HEAD could not be resolved, so this session has no fixed baseline; if you commit mid-review, " +
+          "the refreshed diff will show only what remains uncommitted"
+      );
+    }
     try {
       currentBranch = execSync("git rev-parse --abbrev-ref HEAD", {
         cwd: project_path,
@@ -1746,16 +1768,6 @@ server.tool(
     let prInfo = null;
     const target = pr ? "pr" : diff_target || "branch";
 
-    // Anything the caller must know about how the reviewed change was resolved,
-    // surfaced in the start response's `notices`.
-    //
-    // Two kinds land here, and both share one property: the review still runs,
-    // but over a change that is not quite the one the caller believes they
-    // asked for. `pr` selects the change wholesale, so the local-diff
-    // parameters have nothing left to decide; and the merge-base diff can fall
-    // back to a two-dot range that includes commits the author never wrote.
-    // Neither is fatal, and neither may be silent.
-    const startupNotices = [];
     if (pr) {
       for (const [name, value] of [
         ["diff_target", diff_target],
@@ -1865,6 +1877,11 @@ server.tool(
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${err.message}` }] };
     }
+    // Defence in depth, not a live path: `code` always applies, an empty
+    // explicit list is rejected above, and an unknown id throws in
+    // selectAspects. It stays because a future aspect-selection change could
+    // make it reachable, and a panel with no passes would otherwise start a
+    // runner that reports nothing and explains nothing.
     if (selection.selected.length === 0) {
       return {
         content: [
@@ -2197,6 +2214,16 @@ server.tool(
                 aspect: c.aspect,
                 error: c.error,
               })),
+              // A pass that produced a report but omitted its mandatory
+              // ASPECT_RESULT footer. It ran, so it is not failed -- but it
+              // never confirmed it worked its rubric to the end, and without a
+              // top-level field the only trace is `result: null` buried in
+              // aspect_reports, which a reader scanning the summary will not
+              // see. Same class the whole design defends against: a pass that
+              // did not confirm it finished reading as one that did.
+              aspects_unverified: (panel?.completed ?? [])
+                .filter((c) => c.status === "complete_unverified")
+                .map((c) => c.aspect),
               // Carried through verbatim from the start call. The report is the
               // place a reader decides what this review actually covered, and a
               // skipped aspect is invisible here unless it is stated.
@@ -2256,6 +2283,7 @@ server.tool(
     // Auto-refresh diff BEFORE appending message so it's ready when the runner
     // sees the new message and immediately starts building the prompt.
     let refreshError = null;
+    let refreshNotice = null;
     const isReviewSession = status?.type === "review" || status?.type === "pr_review";
     if (isReviewSession && status.diff_target && !status.diff_target.startsWith("commit:")) {
       try {
@@ -2297,7 +2325,16 @@ server.tool(
           try {
             refreshedDiff = execFileSync("git", ["diff", `${base}...${head}`], refreshOpts).toString();
           } catch {
+            // Same fallback as the start path, and the same hazard: two dots
+            // also includes whatever the base gained since the branch point, so
+            // the reviewed change can quietly GROW between rounds while the
+            // scope label stays identical. The partner would then file findings
+            // against commits the author never wrote, mid-conversation, with
+            // nothing marking the change of subject.
             refreshedDiff = execFileSync("git", ["diff", `${base}..${head}`], refreshOpts).toString();
+            refreshNotice =
+              `the merge-base diff of ${base}...${head} failed, so this refresh used a two-dot diff: ` +
+              `the reviewed change may now include commits ${base} gained since the branch point`;
           }
         } else {
           // uncommitted: diff against the original HEAD SHA to keep baseline stable
@@ -2344,16 +2381,21 @@ server.tool(
               partner_timeout_ms: normalizePartnerTimeout(status?.partner_timeout_ms),
               budget,
               review_status: reviewStatus,
-              ...(refreshError
+              ...(refreshError || refreshNotice
                 ? {
                     notices: [
-                      `The diff could not be refreshed (${refreshError}). ${partnerDisplay} is reviewing the diff captured when the review started, not the current state — treat any claim about a fix as unverified.`,
+                      ...(refreshError
+                        ? [
+                            `The diff could not be refreshed (${refreshError}). ${partnerDisplay} is reviewing the diff captured when the review started, not the current state — treat any claim about a fix as unverified.`,
+                          ]
+                        : []),
+                      ...(refreshNotice ? [refreshNotice] : []),
                     ],
                   }
                 : {}),
               message:
                 `Message sent (id: ${msg.id}). ${partnerDisplay} will be invoked to respond.` +
-                (refreshError ? ` NOTE: the diff refresh failed; see notices.` : ""),
+                (refreshError || refreshNotice ? ` NOTE: see notices about the refreshed diff.` : ""),
             },
             null,
             2
