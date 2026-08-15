@@ -62,6 +62,8 @@ Existing sessions under `~/.claude/dialogs` stay readable.
 ```
 /dualog-review-code                       review uncommitted changes
 /dualog-review-code staged security       narrow the diff and the focus
+/dualog-review-pr pr:123                  multi-specialist panel on a PR
+/dualog-review-pr aspects:code,tests      pin the panel to two specialists
 /dualog-review-plan path/to/plan.md
 /dualog-review-spec docs/specs/foo.md
 /dualog-audit src/
@@ -69,11 +71,40 @@ Existing sessions under `~/.claude/dialogs` stay readable.
 
 Add `partner:<agent-id>` to any of them to choose who reviews.
 
+## Two kinds of review
+
+`start_code_review` runs **one** reviewer over the whole change in a single pass,
+then discusses it with you. It is the fast general read.
+
+`start_pr_review` runs a **panel**: the pr-review-toolkit flow, ported so any
+connected agent can perform it. The same change is reviewed once per aspect —
+general code quality, test coverage, error handling, comment accuracy, type
+design, and optionally simplification — each in its own partner turn carrying
+only that specialist's rubric, and a final pass consolidates them into one
+prioritized report. Aspects are selected from the diff unless you name them, and
+the ones that were *not* run are reported as explicitly as the ones that were.
+
+Splitting the lenses is the point. A single prompt holding all six rubrics
+produces a generalist doing six things adequately, which is what the panel exists
+to avoid. It costs one partner turn per aspect plus one to consolidate, so it is
+slower and more expensive than a single-pass review — reach for it on a real PR,
+not on every save.
+
+The panel is sequential, not parallel: every turn in a session writes the same
+`current_terminal.json`, so two concurrent passes would leave that record
+describing whichever finished last, and session teardown would terminate the
+wrong pane.
+
+Use `get_pr_review_report` rather than `get_review_summary` for a panel session.
+It is the only view that distinguishes an aspect that found nothing from one that
+never ran.
+
 ## Tools
 
-`start_dialog`, `start_code_review`, `send_message`, `check_messages`,
-`wait_for_partner_response`, `get_full_history`, `get_review_summary`,
-`check_partner_alive`, `send_key`, `end_dialog`, `list_sessions`, and:
+`start_dialog`, `start_code_review`, `start_pr_review`, `send_message`,
+`check_messages`, `wait_for_partner_response`, `get_full_history`,
+`get_review_summary`, `get_pr_review_report`, `check_partner_alive`, `send_key`,
+`end_dialog`, `list_sessions`, and:
 
 - **`list_adapters`** — every agent this server can drive, its capabilities, and
   whether its binary is actually installed
@@ -148,6 +179,13 @@ transitively, so it also covers partner-spawns-partner.
 
 `start_dialog` and `start_code_review` accept `partner_agent`, `partner_command`,
 `model`, `reasoning_effort`, `max_rounds`, `tool_profile`, `subject_path`.
+
+`start_pr_review` takes the same partner options, plus `pr`, `aspects`, and
+`follow_up_rounds`. It uses `follow_up_rounds` rather than `max_rounds` because
+the two count different things: the panel passes are the review itself, not
+rounds of conversation about it. They are still folded into the session's
+`max_rounds`, since the budget is computed from partner messages and every pass
+produces one.
 
 Model strings are forwarded verbatim; unknown values pass through with a warning
 rather than being rejected, because vendors ship new ids continuously. Reasoning

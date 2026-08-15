@@ -25,6 +25,7 @@ const SERVER_PATH = path.join(REPO_ROOT, "src", "dialog-server.mjs");
 
 const CLAUDE_COMMANDS = [
   "dualog-review-code",
+  "dualog-review-pr",
   "dualog-review-plan",
   "dualog-review-spec",
   "dualog-audit",
@@ -51,6 +52,7 @@ const HOOK_FILES = [
 
 const CODEX_SKILLS = [
   "dualog-review-code",
+  "dualog-review-pr",
   "dualog-review-plan",
   "dualog-review-spec",
   "dualog-audit",
@@ -518,11 +520,11 @@ function printSummary(mode, cliStatus) {
   console.log("");
   console.log(` MCP server: ${SERVER_PATH}`);
   if (mode.installClaude) {
-    console.log(` Claude:     ${path.join(CLAUDE_COMMANDS_DIR, "dualog-{review-code,review-plan,review-spec,audit}.md")}`);
+    console.log(` Claude:     ${path.join(CLAUDE_COMMANDS_DIR, "dualog-{review-code,review-pr,review-plan,review-spec,audit}.md")}`);
     console.log(` Hooks:      ${CLAUDE_HOOKS_DIR}`);
   }
   if (mode.installCodex) {
-    console.log(` Codex:      ${path.join(CODEX_SKILLS_DIR, "dualog-{review-code,review-plan,review-spec,audit,ui-implementer}")}`);
+    console.log(` Codex:      ${path.join(CODEX_SKILLS_DIR, "dualog-{review-code,review-pr,review-plan,review-spec,audit,ui-implementer}")}`);
   }
   console.log("");
   if (mode.installClaude) console.log(" Restart Claude Code to pick up updated MCP configuration and commands.");
@@ -545,6 +547,7 @@ function printSummary(mode, cliStatus) {
   console.log(" Usage:");
   // Both hosts get the same partner-agnostic command set, so list it once.
   console.log("   /dualog-review-code         Review uncommitted code changes");
+  console.log("   /dualog-review-pr           Multi-specialist PR review panel");
   console.log("   /dualog-review-plan         Review an implementation plan");
   console.log("   /dualog-review-spec         Review a product/feature spec");
   console.log("   /dualog-audit src/          Audit files");

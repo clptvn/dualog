@@ -21,6 +21,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -386,5 +387,140 @@ test("a rejected model/effort pair never creates a session", async (t) => {
     const sessionsRoot = path.join(home, ".dualog", "sessions");
     const leftovers = fs.existsSync(sessionsRoot) ? fs.readdirSync(sessionsRoot) : [];
     assert.deepEqual(leftovers, [], "a refused start must not leave a session behind");
+  });
+});
+
+// ── PR review panel ─────────────────────────────────────────────────────────
+//
+// The panel start has a contract the single-reviewer start does not: it decides
+// which specialists to run, and that decision is invisible to the caller unless
+// the response states it. A panel that quietly declined to review error
+// handling reads exactly like a panel that reviewed it and found nothing, so
+// the selected AND skipped lists are part of the response contract, not
+// diagnostics.
+
+const callText = async (client, name, args) => {
+  const res = await client.callTool({ name, arguments: args });
+  return res.content[0].text;
+};
+
+// A committed sha is the only review target that does not depend on the working
+// tree: this repo is usually clean, so an "uncommitted" probe would assert
+// against an empty diff and pass vacuously.
+const HEAD_SHA = execFileSync("git", ["rev-parse", "HEAD"], { cwd: REPO_ROOT })
+  .toString()
+  .trim();
+
+test("a PR review panel reports the aspects it will run and the ones it will not", async (t) => {
+  await withServer(t, async (client) => {
+    const started = await callJson(client, "start_pr_review", {
+      project_path: REPO_ROOT,
+      diff_target: `commit:${HEAD_SHA}`,
+      aspects: ["code", "tests"],
+      partner_agent: "codex",
+      partner_command: "true",
+      follow_up_rounds: 3,
+    });
+
+    assert.deepEqual(started.aspects, ["code", "tests"], "the requested panel is echoed untouched");
+    assert.equal(started.panel_passes, 2);
+    assert.equal(started.total_passes, 3, "two specialists plus one consolidation pass");
+
+    const skipped = started.skipped_aspects.map((s) => s.aspect);
+    assert.ok(skipped.includes("errors"), "an unselected aspect must be reported as skipped");
+    for (const entry of started.skipped_aspects) {
+      assert.ok(entry.reason, `${entry.aspect} was skipped with no stated reason`);
+    }
+
+    // The budget must account for the panel, because computeBudget can only
+    // count partner messages and every pass produces one. Reporting the
+    // follow-up budget as if it were the whole budget would tell the caller the
+    // review had exhausted its rounds before the conversation began.
+    assert.equal(started.follow_up_rounds, 3);
+    assert.equal(started.max_rounds, 2 + 1 + 3);
+    assert.equal(started.hard_cap, started.max_rounds + 5);
+
+    assert.match(
+      started.message,
+      /do not read the first one as the finished review/,
+      "the caller must be told that several partner messages are coming"
+    );
+  });
+});
+
+test("a PR review session is typed pr_review even though its id says review", async (t) => {
+  await withServer(t, async (client, home) => {
+    const started = await callJson(client, "start_pr_review", {
+      project_path: REPO_ROOT,
+      diff_target: `commit:${HEAD_SHA}`,
+      aspects: ["code"],
+      partner_agent: "codex",
+      partner_command: "true",
+    });
+
+    // The `review-` prefix is deliberate: it is what session-scratch's cleanup
+    // allowlist and the path validators match on, so a panel inherits both. The
+    // session's real identity therefore has to travel in status.type, and every
+    // consumer has to read it there.
+    assert.match(started.session_id, /^review-\d+-[0-9a-f]{8}$/);
+    const status = readStatus(path.join(home, ".dualog", "sessions"), started.session_id);
+    assert.equal(status.type, "pr_review");
+    assert.deepEqual(status.aspects, ["code"]);
+
+    const listed = await callJson(client, "list_sessions", {});
+    const entry = listed.find((s) => s.session_id === started.session_id);
+    assert.equal(entry.type, "pr_review", "list_sessions must not report a panel as a plain review");
+  });
+});
+
+test("get_pr_review_report refuses a session that is not a panel", async (t) => {
+  await withServer(t, async (client) => {
+    const started = await callJson(client, "start_dialog", {
+      problem_description: "contract probe: wrong session kind",
+      project_path: REPO_ROOT,
+      partner_agent: "codex",
+      partner_command: "true",
+    });
+
+    const text = await callText(client, "get_pr_review_report", {
+      session_id: started.session_id,
+    });
+    assert.match(text, /not a PR review panel/);
+    assert.match(text, /get_review_summary/, "the error must name the tool that does apply");
+  });
+});
+
+test("an empty aspect list is refused rather than silently meaning 'all'", async (t) => {
+  await withServer(t, async (client, home) => {
+    const text = await callText(client, "start_pr_review", {
+      project_path: REPO_ROOT,
+      diff_target: `commit:${HEAD_SHA}`,
+      aspects: [],
+      partner_agent: "codex",
+      partner_command: "true",
+    });
+    assert.match(text, /provided but empty/);
+
+    const sessionsRoot = path.join(home, ".dualog", "sessions");
+    const leftovers = fs.existsSync(sessionsRoot) ? fs.readdirSync(sessionsRoot) : [];
+    assert.deepEqual(leftovers, [], "a refused start must not leave a session behind");
+  });
+});
+
+test("an empty branch diff explains the default rather than just failing", async (t) => {
+  await withServer(t, async (client) => {
+    // Comparing a branch against itself is guaranteed empty, which is the shape
+    // of the mistake this message exists for: work that is not committed yet,
+    // reviewed with the branch default.
+    const text = await callText(client, "start_pr_review", {
+      project_path: REPO_ROOT,
+      diff_target: "branch",
+      base_branch: "HEAD",
+      branch: "HEAD",
+      partner_agent: "codex",
+      partner_command: "true",
+    });
+    assert.match(text, /No changes found/);
+    assert.match(text, /diff_target: "uncommitted"/, "the recovery must be named");
   });
 });
