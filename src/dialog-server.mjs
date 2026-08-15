@@ -52,7 +52,9 @@ import { isEnumerable, modelIds } from "./adapters/schema.mjs";
 import { resolveDiscovery } from "./adapters/discovery.mjs";
 import { resolveDiscoveryForValidation } from "./adapters/resolve-for-validation.mjs";
 import {
+  ASPECT_HEADER_RE,
   ASPECT_IDS,
+  CONSOLIDATED_HEADER_RE,
   FINDING_CATEGORIES,
   PR_REVIEW_ASPECTS,
   extractAspectResult,
@@ -1482,6 +1484,17 @@ server.tool(
  * another host -- and each of those needs its own instruction to be actionable.
  */
 function resolvePullRequest(ref, projectPath) {
+  // A ref is a positional argument, so nothing shell-interprets it -- but `gh`
+  // still parses a leading dash as one of its own flags, and `--repo=other/repo`
+  // would quietly review a different repository than the one the caller named.
+  // The change would be reviewed correctly and be the wrong change.
+  if (typeof ref !== "string" || ref.startsWith("-")) {
+    throw new Error(
+      `Invalid pull request reference ${JSON.stringify(ref)}: it may not begin with "-", ` +
+        `which gh would read as one of its own flags rather than as a PR.`
+    );
+  }
+
   const execOpts = {
     cwd: projectPath,
     timeout: 60000,
@@ -1616,7 +1629,7 @@ server.tool(
       .max(50)
       .optional()
       .describe(
-        "Soft budget for the CONVERSATION after the panel reports (default: 5). Panel and consolidation passes are the review itself and are not charged against this. Hard cap = follow_up_rounds + 5."
+        "Soft budget for the CONVERSATION after the panel reports (default: 5). Panel and consolidation passes are the review itself and are not charged against this. The follow-up conversation's own hard cap is follow_up_rounds + 5; the session-wide `hard_cap` in the response is larger, because it also covers the panel passes."
       ),
     reasoning_effort: z.enum(ALL_EFFORTS).optional().describe(REASONING_EFFORT_DESCRIPTION),
     model: z.string().optional().describe(MODEL_OVERRIDE_DESCRIPTION),
@@ -2085,13 +2098,12 @@ server.tool(
     let consolidated = null;
     for (const msg of messages) {
       if (msg.from !== partnerAgent) continue;
-      // The character class matches the aspect-id shape, not today's six ids: a
-      // future hyphenated id would otherwise parse as unattributed and its
-      // findings would vanish from the report without any error.
-      const header = msg.content.match(/^## Panel pass \d+ of \d+ — .+ \(aspect: ([a-z][a-z0-9-]*)\)/m);
+      // Pattern and producer are imported from one place, so the header cannot
+      // drift out from under the parser and silently empty the report.
+      const header = msg.content.match(ASPECT_HEADER_RE);
       if (header) {
         aspectReports.push({
-          aspect: header[1],
+          aspect: header[4],
           message_id: msg.id,
           result: extractAspectResult(msg.content),
           findings: extractNormalizedFindings(msg.content),
@@ -2099,7 +2111,7 @@ server.tool(
         });
         continue;
       }
-      if (/^## Consolidated PR Review/m.test(msg.content)) {
+      if (CONSOLIDATED_HEADER_RE.test(msg.content)) {
         consolidated = {
           message_id: msg.id,
           content: msg.content,
@@ -2119,6 +2131,12 @@ server.tool(
     }
 
     const ran = new Set(aspectReports.map((r) => r.aspect));
+    // A failed pass appends a system message, not a headered partner report, so
+    // it never enters `ran`. Without subtracting it here it would sit in
+    // aspects_pending forever -- contradicting aspects_failed in the same
+    // document, and stranding any host that polls for pending to empty.
+    const failed = (panel?.completed ?? []).filter((c) => c.status === "failed");
+    const failedAspects = new Set(failed.map((c) => c.aspect));
     const planned = meta?.aspects ?? status?.aspects ?? [];
     const budget = computeBudget(status, messages);
     const reviewStatus = computeReviewStatus(status, messages, {
@@ -2147,10 +2165,13 @@ server.tool(
               panel_complete: Boolean(consolidated),
               aspects_planned: planned,
               aspects_reported: [...ran],
-              aspects_pending: planned.filter((a) => !ran.has(a)),
-              aspects_failed: (panel?.completed ?? [])
-                .filter((c) => c.status === "failed")
-                .map((c) => ({ aspect: c.aspect, error: c.error })),
+              aspects_pending: planned.filter(
+                (a) => !ran.has(a) && !failedAspects.has(a)
+              ),
+              aspects_failed: failed.map((c) => ({
+                aspect: c.aspect,
+                error: c.error,
+              })),
               // Carried through verbatim from the start call. The report is the
               // place a reader decides what this review actually covered, and a
               // skipped aspect is invisible here unless it is stated.
@@ -2400,9 +2421,16 @@ server.tool(
       partnerAgent
     );
 
-    // Return problem for dialogs, meta for reviews
+    // Return problem for dialogs, meta for reviews.
+    //
+    // The filename is type-dependent: a panel writes pr_review_meta.json, so
+    // reading only review_meta.json here reported `review_meta: null` for every
+    // PR review -- the same oversight that made send_message's refresh miss them.
     const problemPath = path.join(sessionDir, "problem.md");
-    const metaPath = path.join(sessionDir, "review_meta.json");
+    const metaPath = path.join(
+      sessionDir,
+      status?.type === "pr_review" ? "pr_review_meta.json" : "review_meta.json"
+    );
     const problem = fs.existsSync(problemPath)
       ? fs.readFileSync(problemPath, "utf-8")
       : null;

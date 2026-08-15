@@ -24,6 +24,8 @@ import { fileURLToPath } from "node:url";
 
 import { writeFakeCli, writeFakeAdapter } from "./helpers/fake-cli.mjs";
 import {
+  ASPECT_HEADER_RE,
+  CONSOLIDATED_HEADER_RE,
   extractAspectResult,
   extractNormalizedFindings,
 } from "../src/pr-review-aspects.mjs";
@@ -213,9 +215,10 @@ test("the panel runs one pass per aspect, then consolidates exactly once", async
     const messages = await waitForPartnerMessages(sessionDir, aspects.length + 1);
     const partner = messages.filter((m) => m.from === "fake-panel");
 
-    const headers = partner
-      .map((m) => m.content.match(/^## Panel pass (\d+) of (\d+) — (.+) \(aspect: ([a-z][a-z0-9-]*)\)/m))
-      .filter(Boolean);
+    // Matched with the SHARED pattern the server parses with, not a local copy.
+    // A third copy here meant the test checked the runner against itself, so a
+    // change to either real side left every assertion green.
+    const headers = partner.map((m) => m.content.match(ASPECT_HEADER_RE)).filter(Boolean);
 
     assert.equal(headers.length, 2, "each selected aspect must produce exactly one panel pass");
     assert.deepEqual(
@@ -229,10 +232,14 @@ test("the panel runs one pass per aspect, then consolidates exactly once", async
       "passes must be numbered for the reader following along"
     );
 
-    const consolidations = partner.filter((m) => /^## Consolidated PR Review/m.test(m.content));
+    const consolidations = partner.filter((m) => CONSOLIDATED_HEADER_RE.test(m.content));
     assert.equal(consolidations.length, 1, "consolidation must happen once");
+    // Compared against the LAST panel pass, found by header rather than by
+    // position: a positional index silently checks the wrong message as soon as
+    // the panel has more aspects than the index assumed.
+    const lastPass = partner.filter((m) => ASPECT_HEADER_RE.test(m.content)).at(-1);
     assert.ok(
-      consolidations[0].id > partner[1].id,
+      consolidations[0].id > lastPass.id,
       "consolidation must come after every specialist pass, never before"
     );
 
@@ -298,11 +305,11 @@ test("a host message after the panel gets a follow-up turn, not a second panel",
         timestamp: new Date().toISOString(),
       }) + "\n"
     );
-    // The id cache records the log size it describes; leaving a stale one would
-    // make the runner's own append reuse this id.
-    try {
-      fs.unlinkSync(`${convPath}.next-id`);
-    } catch {}
+    // No cache surgery is needed here. appendMessage's id cache records the log
+    // SIZE it describes, so this raw append leaves it describing a shorter file
+    // and the next append simply rebuilds by scanning -- one wasted scan, never
+    // a duplicate id. (An earlier version of this test deleted the cache and
+    // claimed it was preventing id reuse, which had it exactly backwards.)
 
     const messages = await waitForPartnerMessages(sessionDir, 3);
     const partner = messages.filter((m) => m.from === "fake-panel");

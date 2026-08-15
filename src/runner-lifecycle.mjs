@@ -7,6 +7,29 @@ import { isProcessAlive } from "./shared.mjs";
 const RUNNER_TOKEN_PREFIX = "--runner-token=";
 const SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
+/**
+ * Which script owns a session type's runner process.
+ *
+ * A table rather than a ternary chain, because the failure mode of getting this
+ * wrong is silent and total. isSessionRunnerAlive() proves identity by matching
+ * this path against the live process's command line, so an unmapped type falls
+ * to the default, never matches, and reports a perfectly healthy runner as dead
+ * forever -- which makes send_message refuse to write, wait_for_partner_response
+ * return `runner_exited` before the first turn finishes, and end_dialog skip the
+ * SIGTERM it exists to send.
+ *
+ * That is exactly what happened when `pr_review` was added as the third type: it
+ * inherited the dialog default and every panel session was born unreachable. A
+ * type absent from this table is a bug, not a fallback, so add the entry when
+ * adding a runner.
+ */
+export const RUNNER_SCRIPT_BY_SESSION_TYPE = {
+  dialog: "dialog-runner.mjs",
+  review: "review-runner.mjs",
+  pr_review: "pr-review-runner.mjs",
+};
+const DEFAULT_RUNNER_SCRIPT = "dialog-runner.mjs";
+
 export function buildRunnerTokenArg(token) {
   return `${RUNNER_TOKEN_PREFIX}${token}`;
 }
@@ -25,8 +48,10 @@ export function isSessionRunnerAlive(status, sessionDir) {
   const commandLine = readProcessCommandLine(pid);
   if (!commandLine) return false;
 
+  // A session written before `type` was recorded has none; those are all
+  // dialogs, which is what the default covers.
   const runnerName =
-    status?.type === "review" ? "review-runner.mjs" : "dialog-runner.mjs";
+    RUNNER_SCRIPT_BY_SESSION_TYPE[status?.type] ?? DEFAULT_RUNNER_SCRIPT;
   const expectedRunnerPath = path.join(SOURCE_DIR, runnerName);
   if (
     !commandLine.includes(expectedRunnerPath) ||

@@ -109,10 +109,20 @@ test("summarizeDiff ignores unchanged context lines", () => {
   assert.equal(facts.touchesTypes, false);
 });
 
-test("summarizeDiff does not mistake the +++ file header for an added line", () => {
-  // "+++ b/src/types.ts" begins with "+", and a naive added-line scan reads the
-  // path as content.
+test("summarizeDiff does not mistake a file header for a changed line", () => {
+  // The header skip is load-bearing for `--- a/...`, not for `+++ b/...`:
+  // COMMENT_RE's SQL alternative (`-- `) matches the `---` line, so without the
+  // skip touchesComments would go true on EVERY diff and the comment specialist
+  // would be auto-selected always, which is the same as never selecting it
+  // deliberately. TYPE_RE happens not to match `+++ b/src/types.ts`, so a
+  // types-only assertion here passed with or without the skip and guarded
+  // nothing.
   const facts = summarizeDiff(diffFor("src/types.ts", ["const x = 1;"]));
+  assert.equal(
+    facts.touchesComments,
+    false,
+    "the `--- a/...` header was scanned as a changed comment line"
+  );
   assert.equal(facts.touchesTypes, false);
 });
 

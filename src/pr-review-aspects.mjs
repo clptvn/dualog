@@ -28,10 +28,39 @@
  */
 
 /**
- * The normalized finding vocabulary, shared with review-runner.mjs and the
- * approval logic in shared.mjs (BLOCKING_FINDING_RE). An aspect that invents a
- * category outside this list produces a finding no gate will ever see, so the
- * list is stated to every specialist verbatim.
+ * The header the runner stamps on each specialist's report, and the pattern that
+ * reads it back.
+ *
+ * Both live here because they are one contract with two ends: the runner writes
+ * the header, and get_pr_review_report attributes every finding by matching it.
+ * They were separate literals in separate files, which meant tightening the
+ * pattern or changing the dash would have emptied the report of all findings --
+ * silently, with no error and nothing failing, since the tests carried a third
+ * copy and were checking the runner against themselves.
+ */
+export function buildAspectHeader({ aspect, title, passIndex, passTotal }) {
+  return `## Panel pass ${passIndex} of ${passTotal} — ${title} (aspect: ${aspect})`;
+}
+
+/** Capture groups: 1 = pass index, 2 = pass total, 3 = title, 4 = aspect id. */
+export const ASPECT_HEADER_RE =
+  /^## Panel pass (\d+) of (\d+) — (.+) \(aspect: ([a-z][a-z0-9-]*)\)/m;
+
+export const CONSOLIDATED_HEADER = "## Consolidated PR Review";
+export const CONSOLIDATED_HEADER_RE = /^## Consolidated PR Review/m;
+
+/**
+ * The normalized finding vocabulary this module's parser understands.
+ *
+ * Stated verbatim to every specialist so their reports are machine-readable at
+ * all. Note this is NOT the same list as the approval gate's: shared.mjs's
+ * BLOCKING_FINDING_RE matches a SUPERSET, carrying the plan/spec categories
+ * (GAP, AMBIGUITY, SCOPE, FEASIBILITY, UX, TESTABILITY) that this module has no
+ * entry for. So an off-list category fails in the more dangerous direction than
+ * it first appears: `[GAP]` would trip hasBlockingFindings and drive the whole
+ * session to changes_requested, while extractNormalizedFindings drops it and it
+ * never surfaces in get_pr_review_report at all. The gate sees a finding the
+ * report cannot show you.
  */
 export const FINDING_CATEGORIES = [
   "CRITICAL",
@@ -84,8 +113,12 @@ function aspectFooter(aspectId) {
   // shared.mjs scans partner messages for a line beginning VERDICT / STATUS /
   // REVIEW_VERDICT and lets it decide the whole session's state. A single
   // specialist must never be able to do that: the first clean aspect would
-  // approve a review whose remaining five passes had not run yet. Only the
-  // aggregation turn is allowed to emit REVIEW_VERDICT.
+  // approve a review whose remaining five passes had not run yet.
+  //
+  // The invariant is that no SPECIALIST pass may emit a verdict -- not that only
+  // one turn ever does. Consolidation is the FIRST turn permitted to, and every
+  // follow-up turn after it is required to (buildFollowUpPrompt makes the footer
+  // mandatory), which is how an approval is reached at all.
   return `## Machine-Readable Footer (REQUIRED)
 
 End your response with these lines, after the normalized findings:
@@ -556,7 +589,14 @@ export function selectAspects(diff, requested) {
     }
     // An explicit request wins over the heuristic in both directions: it may add
     // an aspect the diff does not suggest, and it may drop one the diff does.
-    const selected = ASPECT_IDS.filter((id) => requested.includes(id));
+    //
+    // The caller's ORDER is preserved, not normalized to ASPECT_IDS order. Order
+    // is behavioral here -- passes run in sequence and each is handed the
+    // findings the earlier ones filed -- so quietly reordering the panel changes
+    // which specialist gets to see what, while the echoed list still looks like
+    // what was asked for. De-duplicated, since a repeated id would otherwise buy
+    // a second full pass.
+    const selected = [...new Set(requested)];
     return {
       facts,
       selected,
@@ -698,8 +738,8 @@ footer. Do not wrap any of it in JSON.`;
 /**
  * The final pass: turn N specialist reports into one actionable review.
  *
- * This is the only pass permitted to emit REVIEW_VERDICT, and the only one that
- * sees every other pass's output.
+ * The first pass permitted to emit REVIEW_VERDICT -- follow-up turns emit one
+ * too -- and the only one that sees every other pass's output.
  */
 export function buildAggregationPrompt({
   meta,

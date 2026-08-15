@@ -13,17 +13,21 @@
  *      carrying only its own lens, and each appends its report as soon as it
  *      lands so the host can read pass 1 while pass 2 is still running.
  *   2. Consolidation — one turn that merges the reports, re-ranks by real
- *      severity, and is the ONLY turn permitted to emit a REVIEW_VERDICT.
+ *      severity, and is the FIRST turn permitted to emit a REVIEW_VERDICT. No
+ *      specialist pass may; follow-up turns are required to.
  *   3. Follow-up — an ordinary review conversation. The panel does not re-run:
  *      spending six specialist turns to confirm one fix would exhaust the round
  *      budget on a line of code.
  *
  * The passes are sequential rather than parallel, which is the one place this
  * departs from the plugin's optional "parallel" mode. It is not a performance
- * oversight: every partner turn in a session writes the same
+ * oversight: every TMUX partner turn in a session writes the same
  * current_terminal.json, and two concurrent turns in one session directory would
  * leave that record describing whichever finished last -- so end_dialog and
  * check_partner_alive would be reasoning about, and terminating, the wrong pane.
+ * A headless partner has no such record, but shares this session's
+ * partner_processing marker and last_error.txt, which carry the same
+ * single-writer assumption.
  */
 
 import fs from "fs";
@@ -52,8 +56,10 @@ import {
   requestedReasoningEffortForAdapter,
 } from "./runtime-defaults.mjs";
 import {
+  CONSOLIDATED_HEADER,
   PR_REVIEW_ASPECTS,
   buildAggregationPrompt,
+  buildAspectHeader,
   buildAspectPrompt,
   buildFollowUpPrompt,
   extractNormalizedFindings,
@@ -253,8 +259,13 @@ async function main() {
     try {
       const response = await runTurn(prompt, `${PARTNER_AGENT}-pr-${aspectId}`);
       const header =
-        `## Panel pass ${passIndex} of ${selected.length} — ${spec.title} (aspect: ${aspectId})\n` +
-        `_${passIndex < selected.length ? `${selected.length - passIndex} more specialist pass(es) and then consolidation still to come.` : "Consolidation pass still to come."}_\n\n`;
+        buildAspectHeader({
+          aspect: aspectId,
+          title: spec.title,
+          passIndex,
+          passTotal: selected.length,
+        }) +
+        `\n_${passIndex < selected.length ? `${selected.length - passIndex} more specialist pass(es) and then consolidation still to come.` : "Consolidation pass still to come."}_\n\n`;
       appendMessage(sessionDir, PARTNER_AGENT, header + response);
       reports.push({ aspect: aspectId, content: response, failed: false });
       for (const finding of extractNormalizedFindings(response)) {
@@ -320,7 +331,7 @@ async function main() {
       appendMessage(
         sessionDir,
         PARTNER_AGENT,
-        `## Consolidated PR Review\n_Panel complete: ${reports.filter((r) => !r.failed).length} of ${selected.length} specialist pass(es) reported._\n\n${response}`
+        `${CONSOLIDATED_HEADER}\n_Panel complete: ${reports.filter((r) => !r.failed).length} of ${selected.length} specialist pass(es) reported._\n\n${response}`
       );
       panelState.completed.push({ aspect: "__aggregate__", status: "complete" });
       log(`Consolidation complete (${response.length} chars)`);
@@ -379,10 +390,16 @@ async function main() {
   }
 
   // ── Phase 3: follow-up conversation ───────────────────────────────────────
-  let lastProcessedId = readConversation(sessionDir).reduce(
-    (max, m) => (Number.isSafeInteger(m.id) && m.id > max ? m.id : max),
-    0
-  );
+  // Seeded at 0, deliberately, and NOT at the highest id the panel produced.
+  //
+  // The loop's filter already excludes the panel's own output by author
+  // (`from === HOST_AGENT`), so seeding from the max id buys nothing and costs a
+  // whole host turn: a message sent while the panel was running would be marked
+  // processed before this loop ever looked at it, and send_message would have
+  // told the host it "will be invoked to respond" while nothing ever did. The
+  // window is up to one per-pass timeout times the number of aspects, which is
+  // precisely when an impatient host is most likely to write.
+  let lastProcessedId = 0;
   let followUpTurns = 0;
   let lastActivityTime = Date.now();
   let consecutiveErrors = 0;
