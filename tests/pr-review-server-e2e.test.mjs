@@ -48,6 +48,11 @@ const FAKE_REPLY = [
 const FAKE_BIN = writeFakeCli(BIN_DIR, "fake-e2e.mjs", "sidecar-ok", { reply: FAKE_REPLY });
 writeFakeAdapter(ADAPTER_DIR, "fake-e2e", FAKE_BIN);
 
+// A partner that returns nothing, so every pass fails. Used to reach the one
+// state get_pr_review_report's failed-aspect handling exists for.
+const EMPTY_BIN = writeFakeCli(BIN_DIR, "fake-e2e-empty.mjs", "sidecar-ok", { reply: "" });
+writeFakeAdapter(ADAPTER_DIR, "fake-e2e-empty", EMPTY_BIN);
+
 // A committed sha, so the review target does not depend on the working tree
 // being dirty or clean when the suite runs.
 const HEAD_SHA = execFileSync("git", ["rev-parse", "HEAD"], { cwd: REPO_ROOT })
@@ -275,6 +280,55 @@ test("the panel's findings survive the round trip into get_pr_review_report", as
     for (const entry of report.aspects_skipped) {
       assert.ok(entry.reason, `${entry.aspect} was skipped with no reason recorded`);
     }
+  });
+});
+
+test("a failed aspect is reported as failed and never as pending", async (t) => {
+  // The third safety mechanism, and the last one never executed end to end. The
+  // `!failedAspects.has(a)` subtraction only changes anything when a pass has
+  // failed, and every other assertion about aspects_pending is made in the
+  // all-succeed case, where the term is not load-bearing.
+  //
+  // Its failure mode is a report telling a host to keep waiting on an aspect
+  // that is permanently dead, while aspects_failed in the same document says it
+  // is finished -- the exact self-contradiction this tool exists to prevent.
+  await withServer(t, async (client) => {
+    const started = await callJson(client, "start_pr_review", {
+      project_path: REPO_ROOT,
+      diff_target: `commit:${HEAD_SHA}`,
+      aspects: ["code"],
+      partner_agent: "fake-e2e-empty",
+      follow_up_rounds: 2,
+    });
+
+    let report;
+    const giveUpAt = Date.now() + 120000;
+    for (;;) {
+      report = await callJson(client, "get_pr_review_report", {
+        session_id: started.session_id,
+      });
+      if (report.aspects_failed.length > 0) break;
+      if (Date.now() >= giveUpAt) {
+        assert.fail(
+          `the failed pass never surfaced: reported=${JSON.stringify(report.aspects_reported)} ` +
+            `pending=${JSON.stringify(report.aspects_pending)}`
+        );
+      }
+      await sleep(1000);
+    }
+
+    assert.deepEqual(
+      report.aspects_failed.map((f) => f.aspect),
+      ["code"]
+    );
+    assert.ok(
+      !report.aspects_pending.includes("code"),
+      "a permanently failed aspect was still listed as pending, telling the host to wait on it"
+    );
+    assert.ok(
+      !report.aspects_reported.includes("code"),
+      "a failed pass must not be reported as one that produced a report"
+    );
   });
 });
 

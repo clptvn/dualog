@@ -1163,7 +1163,10 @@ export function suppressVerdictLines(response) {
   // stops the gate reading it is removing the token itself.
   let suppressed = masked.suppressed;
   const text = masked.text
-    .replace(/\b(REVIEW[_\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)\s*:/gi, () => {
+    // Emphasis may sit between the token and its colon -- `*VERDICT*:` is a
+    // shape the gate reads and an earlier version of this fallback did not,
+    // so the last resort fired and still leaked.
+    .replace(/\b(REVIEW[_\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)(?:\*\*|__|\*)?\s*:/gi, () => {
       suppressed++;
       return "ASPECT_NOTE (verdict suppressed — a specialist pass may not resolve the review):";
     })

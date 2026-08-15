@@ -136,37 +136,55 @@ export function gateReadableLineMask(content) {
     offset += line.length + 1;
   }
 
-  const blocked = new Array(lines.length).fill(false);
+  // Patterns are consumed SEQUENTIALLY, each over the previous result, because
+  // that is what stripMarkdownNoise does -- and applying them independently over
+  // the original text is not the same thing when marker types interleave.
+  //
+  // A fuzz over 300,000 generated reports found 519 documents where they differ,
+  // reduced to: a `<!--` on line 0, a verdict on line 1, then two ```js lines
+  // whose pairing consumes the `-->` between them. Sequentially, the fences go
+  // first and eat the comment's terminator, leaving `<!--` unpaired so the gate
+  // reads the verdict. Independently, both a comment span and a fence span
+  // exist, the verdict line is blocked, and the suppressor never looks at it.
+  // That is not exotic: the `comments` specialist's literal job is writing about
+  // comment syntax while also quoting fenced snippets.
+  //
+  // Redaction is length-preserving rather than deleting, so offsets stay valid
+  // AND a consumed span cannot participate in a later pattern's match -- which
+  // is precisely what sequential excision does.
+  // Redacted to spaces rather than to a magic character, which is safe because
+  // the only question asked of the result is "did any NON-SPACE character of
+  // this line survive". A verdict always contains non-space characters, so a
+  // line whose surviving remnant is whitespace cannot carry one, and treating
+  // it as blocked costs nothing.
+  let redacted = text;
   for (const pattern of NOISE_BLOCKS) {
-    for (const match of text.matchAll(pattern)) {
-      const spanStart = match.index;
-      const spanEnd = match.index + match[0].length;
-      for (let i = 0; i < lines.length; i++) {
-        const lineStart = starts[i];
-        const lineEnd = lineStart + lines[i].length;
-        // WHOLLY inside, never merely overlapping.
-        //
-        // Safe by construction for the content of any single ORIGINAL line,
-        // which is the case that matters. (It cannot cover everything: excision
-        // splices the head of an opening line to the tail of a closing one, so
-        // the gate can read a line that never existed in the source and which
-        // this mask has no way to mark. suppressVerdictLines handles that by
-        // checking its postcondition against the gate rather than trusting the
-        // mask alone.) stripMarkdownNoise
-        // excises the SPAN and keeps scanning what remains of the line, so if any
-        // part of a line falls outside every span, the gate may still read that
-        // part -- and a consumer of this mask must therefore examine it.
-        //
-        // An earlier version blocked on partial overlap and broke exactly that
-        // property, in the direction that matters: a finding line containing an
-        // inline ``` pairs with a later fence, so the span covered the line's
-        // tail and the whole line vanished. `[CRITICAL] ... an unclosed ``` ...`
-        // stopped being a blocking finding and the review flipped to approved --
-        // for every session type, not just PR panels.
-        if (spanStart <= lineStart && lineEnd <= spanEnd) blocked[i] = true;
-      }
-    }
+    redacted = redacted.replace(pattern, (match) => " ".repeat(match.length));
   }
+
+  // A line is blocked only when NO character of it survived redaction --
+  // equivalently, wholly inside the consumed regions rather than merely
+  // overlapping them.
+  //
+  // stripMarkdownNoise excises a span and keeps scanning what remains of the
+  // line, so if any character survives the gate may read that part, and a
+  // consumer of this mask must therefore examine the line. An earlier version
+  // blocked on partial overlap and broke exactly that, in the direction that
+  // matters: a finding line containing an inline ``` paired with a later fence,
+  // the span covered the line's tail, and the whole line vanished -- so
+  // `[CRITICAL] ... an unclosed ``` ...` stopped being a blocking finding and
+  // the review flipped to approved, for every session type.
+  //
+  // The guarantee is LINE-granular and cannot be more than that: excision can
+  // splice the head of one line onto the tail of another, and can repair a token
+  // from the inside (`VERDICT<!-- x -->: APPROVE`). suppressVerdictLines covers
+  // both by checking its postcondition against the gate rather than trusting
+  // this mask alone.
+  const blocked = lines.map((line, i) => {
+    if (line.length === 0) return false;
+    const slice = redacted.slice(starts[i], starts[i] + line.length);
+    return !/\S/.test(slice);
+  });
 
   return lines.map((line, i) => !blocked[i] && !isNoiseLine(line));
 }
