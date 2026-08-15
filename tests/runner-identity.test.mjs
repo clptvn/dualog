@@ -125,8 +125,11 @@ test("the probe distinguishes a proven death from an unreadable process", async 
   // express. Folding both into `false` calls a healthy panel dead wherever `ps`
   // is unavailable; folding both into "unknown" erases a proven death -- which
   // is the case the field exists for, since watchRunnerExit only fires inside
-  // the server process that spawned the runner, so a SIGKILL, an OOM kill or a
-  // server restart leaves `runner_state: "running"` behind a corpse.
+  // the server process that spawned the runner: a restart, a reboot, or a runner
+  // inherited from an earlier server leaves `runner_state: "running"` behind a
+  // corpse. (This test reproduces that by spawning its own lookalike with no
+  // server attached, which is why the SIGKILL below leaves a stale record where
+  // the same kill under a live server would not.)
   const sessionDir = makeSession(t, "probe");
   const child = await spawnRunnerLookalike(
     t,

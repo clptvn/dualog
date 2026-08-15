@@ -146,7 +146,13 @@ export function gateReadableLineMask(content) {
         const lineEnd = lineStart + lines[i].length;
         // WHOLLY inside, never merely overlapping.
         //
-        // This is the only test that is safe by construction. stripMarkdownNoise
+        // Safe by construction for the content of any single ORIGINAL line,
+        // which is the case that matters. (It cannot cover everything: excision
+        // splices the head of an opening line to the tail of a closing one, so
+        // the gate can read a line that never existed in the source and which
+        // this mask has no way to mark. suppressVerdictLines handles that by
+        // checking its postcondition against the gate rather than trusting the
+        // mask alone.) stripMarkdownNoise
         // excises the SPAN and keeps scanning what remains of the line, so if any
         // part of a line falls outside every span, the gate may still read that
         // part -- and a consumer of this mask must therefore examine it.
@@ -166,7 +172,9 @@ export function gateReadableLineMask(content) {
 }
 
 /**
- * Left exactly as it was, deliberately.
+ * Behaviour left exactly as it was, deliberately. (The two chained noise filters
+ * are now one call to isNoiseLine, which the mask also uses; `!(A || B)` is the
+ * chained `!A` then `!B`, so the predicate is unchanged.)
  *
  * The suppressor needed to stop modelling markdown noise for itself; the GATE
  * did not need to change, and rewriting it on top of the mask is what produced

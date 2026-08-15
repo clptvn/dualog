@@ -28,6 +28,7 @@
  */
 
 import {
+  extractReviewVerdict,
   gateReadableLineMask,
   matchLegacyApprovalLine,
   matchVerdictLine,
@@ -1009,19 +1010,28 @@ export function extractNormalizedFindings(content) {
     `^\\s*(?:[-*+]\\s+|\\d+[.)]\\s+)?\\**\\[(${FINDING_CATEGORIES.join("|")})\\]\\**\\s*(.+)$`,
     "i"
   );
-  // Skips the same fenced, quoted and indented regions the approval gate skips.
+  // Noise-masked ONLY above the findings heading; everything below it is parsed
+  // as written.
   //
-  // Without this, a specialist QUOTING the taxonomy as an example -- which the
-  // prompt itself invites, since it lists every category -- had those examples
-  // indexed as real findings. That over-reports, which is the safe direction for
-  // the gate. But these lines also feed `priorFindings`, handed to later passes
-  // under "Do not re-file these", so a quoted example could tell pass 4 that a
-  // real defect had already been filed when nobody filed it. That is an
-  // UNDER-reporting path one step removed.
+  // Masking the whole document fixed one problem and created a worse one. It
+  // stopped a specialist's QUOTED taxonomy examples -- which the prompt invites,
+  // since it lists every category -- from being indexed as real findings and
+  // fed into priorFindings, where they would tell a later pass a defect had
+  // already been filed when nobody filed it. But a specialist that wrapped its
+  // own "### Normalized Findings" block in a code fence then reported ZERO
+  // findings while its own ASPECT_RESULT said FINDINGS: a pass that found a
+  // CRITICAL rendering as one that found nothing, which is the same destination
+  // by a different door. Fencing a machine-readable block is a natural thing for
+  // a model to do, and nothing in the prompt tells it not to.
+  //
+  // The split resolves both: illustrative examples live in prose above the
+  // heading, real findings live under it.
   const lines = String(content || "").split("\n");
+  const headingAt = lines.findIndex((line) => /^\s*#*\s*Normalized Findings\b/i.test(line));
   const readable = gateReadableLineMask(content || "");
   for (const [i, line] of lines.entries()) {
-    if (!readable[i]) continue;
+    const belowHeading = headingAt >= 0 && i > headingAt;
+    if (!belowHeading && !readable[i]) continue;
     const match = line.match(categoryRe);
     if (!match) continue;
     findings.push({
@@ -1054,7 +1064,7 @@ export function extractNormalizedFindings(content) {
  * Returns { text, suppressed } — the count is the caller's cue to log it, since
  * a specialist ignoring an explicit instruction is worth noticing.
  */
-export function suppressVerdictLines(response) {
+function neutralizeVerdicts(source, readable) {
   // Acts on EXACTLY the lines shared.mjs would read as a verdict -- no fewer, no
   // more. Both directions had already gone wrong with a hand-written pattern:
   //
@@ -1069,16 +1079,11 @@ export function suppressVerdictLines(response) {
   //   protects nothing and corrupts the report a human reads and the
   //   consolidator is handed.
   let suppressed = 0;
-  // The gate's OWN answer to "which lines do you read", not a second model of
-  // it. Tracking fences here with a local boolean diverged on unclosed fences:
-  // the boolean latched and skipped the rest of the document while the gate,
-  // which pairs its fences, read straight past the unmatched one.
-  const readable = gateReadableLineMask(response ?? "");
 
-  const text = String(response ?? "")
+  const text = String(source ?? "")
     .split("\n")
     .map((line, i) => {
-      if (!readable[i]) return line;
+      if (readable && !readable[i]) return line;
 
       const hit = matchVerdictLine(line);
       if (hit) {
@@ -1108,6 +1113,66 @@ export function suppressVerdictLines(response) {
     .join("\n");
 
   return { text, suppressed };
+}
+
+/**
+ * Neutralize any session-level verdict a SPECIALIST pass tried to emit.
+ *
+ * Checks its own postcondition against the gate rather than trying to predict
+ * it, which is the third design this function has had and the first that does
+ * not depend on two text models agreeing.
+ *
+ * The first two both failed the same way. Sharing the gate's line PATTERN fixed
+ * which strings count as a verdict; sharing its readable-line MASK fixed which
+ * lines each half looks at. Neither was sufficient, because stripMarkdownNoise
+ * EXCISES its noise spans -- swallowing the newlines inside them -- so the gate
+ * matches against a remnant that can differ from any original line, and can even
+ * be spliced from two of them. `<!-- note -->VERDICT: APPROVE` is not a verdict
+ * line to a per-line matcher and is one to the gate, which sees
+ * `VERDICT: APPROVE` after excision. That class is unbounded; every widening of
+ * a pattern was another guess at it.
+ *
+ * So: do the precise, mask-guided pass, then ASK THE GATE whether a verdict
+ * survived. If one did, fall back to neutralizing on the raw text with no mask
+ * at all. The fallback over-suppresses -- it can rewrite a line inside a code
+ * fence, which is the cosmetic damage the mask exists to avoid -- but it fires
+ * only when the alternative is a specialist silently resolving the review, and
+ * it reports itself so the trade is visible rather than assumed.
+ *
+ * Returns { text, suppressed, fellBack }.
+ */
+export function suppressVerdictLines(response) {
+  const source = String(response ?? "");
+  const masked = neutralizeVerdicts(source, gateReadableLineMask(source));
+
+  // The stricter reading deliberately: allowsApproveVerdict widens what counts
+  // as an approval, and a specialist must not be able to resolve the review
+  // under ANY setting a session might be evaluated with.
+  if (!extractReviewVerdict(masked.text, { allowsApproveVerdict: true })) {
+    return { ...masked, fellBack: false };
+  }
+
+  // Last resort: neutralize the verdict TOKENS wherever they appear, not just
+  // where a line starts with one.
+  //
+  // A per-line pass cannot help here by construction. In every surviving case
+  // the verdict is not at the start of any original line -- it becomes one only
+  // after the gate excises a preceding noise span, as in
+  // `<!-- note -->VERDICT: APPROVE`, or is spliced together from two different
+  // lines. There is no single line to rewrite, so the only thing that reliably
+  // stops the gate reading it is removing the token itself.
+  let suppressed = masked.suppressed;
+  const text = masked.text
+    .replace(/\b(REVIEW[_\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)\s*:/gi, () => {
+      suppressed++;
+      return "ASPECT_NOTE (verdict suppressed — a specialist pass may not resolve the review):";
+    })
+    .replace(/\bLGTM\b/gi, () => {
+      suppressed++;
+      return "ASPECT_NOTE (approval suppressed)";
+    });
+
+  return { text, suppressed, fellBack: true };
 }
 
 /** Read the ASPECT_RESULT line a specialist pass is required to emit. */

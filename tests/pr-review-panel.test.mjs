@@ -516,6 +516,12 @@ test("a panel with survivors consolidates, and carries the hole into every verdi
   // APPROVE ban at consolidation, the same ban threaded into the follow-up
   // prompt, and the aspects_pending subtraction -- and none of the three had
   // ever executed end to end, in any test, at any point in this branch.
+  //
+  // This case covers the first two. The aspects_pending subtraction is still
+  // unexercised: reading it means calling get_pr_review_report, and this file
+  // drives the runner directly with no server. Its failure mode is a report
+  // telling a host to keep waiting on a dead aspect, not a wrong verdict, so it
+  // is filed rather than fixed here.
   const aspects = ["code", "types"];
   const { sessionDir } = setupSession("aaaaaaa6", aspects);
   const child = startRunner(sessionDir, 2, SELECTIVE_FAIL_BIN);

@@ -206,10 +206,11 @@ function appendBoundedPartnerMessage(content) {
   // A cut inside a multi-byte sequence decodes to U+FFFD, which re-encodes to 3
   // bytes -- so a naive `subarray(0, budget).toString()` can exceed
   // MAX_MESSAGE_BYTES by up to 2, and shared.mjs throws on strictly greater.
-  // Two bytes is enough, and these reports are unusually dense in multi-byte
-  // characters: the prompt asks for `path:LINE — one-sentence statement`, so
-  // there is an em dash per finding. The throw would land in the per-pass catch
-  // and file a complete, successful report as UNREVIEWED.
+  // Two bytes is enough, and these reports do carry multi-byte characters: the
+  // prompt asks for `path:LINE — one-sentence statement`, so there is an em dash
+  // per finding. Sparse, not dense -- landing a cut inside one is unlikely. But
+  // rare is not never, and the cost of being wrong is a throw in the per-pass
+  // catch that files a complete, successful report as UNREVIEWED.
   const isContinuation = (byte) => (byte & 0xc0) === 0x80;
   let headEnd = Math.min(budget - TAIL_BYTES, buf.length);
   while (headEnd > 0 && isContinuation(buf[headEnd])) headEnd--;
@@ -424,10 +425,18 @@ async function main() {
           specialistCount: selected.length,
         }) +
         `\n_${passIndex < selected.length ? `${selected.length - passIndex} more specialist pass(es) and then consolidation still to come.` : "Consolidation pass still to come."}_\n\n`;
-      const { text: safeResponse, suppressed } = suppressVerdictLines(response);
+      const { text: safeResponse, suppressed, fellBack } = suppressVerdictLines(response);
       if (suppressed > 0) {
         log(
           `Suppressed ${suppressed} verdict line(s) in the "${aspectId}" pass; only consolidation and follow-up turns may set a session verdict`
+        );
+      }
+      if (fellBack) {
+        // The precise pass could not see what the gate can, so the blunt one
+        // ran. Worth saying out loud: it can rewrite text inside a code fence,
+        // and the alternative was a specialist resolving the review by itself.
+        log(
+          `A verdict survived the masked suppression pass in "${aspectId}"; fell back to neutralizing verdict tokens anywhere in the text`
         );
       }
       appendBoundedPartnerMessage(header + safeResponse);
@@ -718,25 +727,39 @@ async function main() {
 
         consecutiveErrors++;
         log(`Error on follow-up turn: ${err.message} (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS})`);
-        fs.writeFileSync(
-          ERROR_PATH,
-          `${err.message}\n\nConsecutive errors: ${consecutiveErrors}`
+        // Routed through tryRecovery like the panel and consolidation catches.
+        // The blast radius here is smaller -- the panel and consolidation are
+        // already durable in conversation.jsonl by this point, so a throw costs
+        // only the follow-up conversation -- but this was the lone exception to
+        // a pattern applied everywhere else, which is how a reader stops
+        // noticing. It also fixes one real loss: an append that threw in the
+        // terminal-failure branch exited as `fatal_error` and the host lost the
+        // accurate reason for a failure diagnosed correctly a line earlier.
+        tryRecovery("write last_error.txt", () =>
+          fs.writeFileSync(
+            ERROR_PATH,
+            `${err.message}\n\nConsecutive errors: ${consecutiveErrors}`
+          )
         );
 
         if (isPartnerTerminalFailureError(err)) {
-          appendMessage(
-            sessionDir,
-            "system",
-            `PR review runner stopped after a definitive partner terminal failure: ${err.message}.`
+          tryRecovery("append the terminal-failure notice", () =>
+            appendMessage(
+              sessionDir,
+              "system",
+              `PR review runner stopped after a definitive partner terminal failure: ${err.message}.`
+            )
           );
           exitReason = "partner_terminal_failure";
           break;
         }
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-          appendMessage(
-            sessionDir,
-            "system",
-            `PR review runner hit ${MAX_CONSECUTIVE_ERRORS} consecutive errors and is shutting down. Last error: ${err.message}`
+          tryRecovery("append the consecutive-errors notice", () =>
+            appendMessage(
+              sessionDir,
+              "system",
+              `PR review runner hit ${MAX_CONSECUTIVE_ERRORS} consecutive errors and is shutting down. Last error: ${err.message}`
+            )
           );
           exitReason = "consecutive_errors";
           break;

@@ -48,8 +48,10 @@ export function readRunnerToken(argv = process.argv) {
  * caller that maps `false` to "could not determine" throws away a proven death,
  * and a proven death behind a stale `runner_state: "running"` is exactly the
  * case a host most needs told. watchRunnerExit only fires inside the server
- * process that spawned the runner, so a SIGKILL, an OOM kill, a reboot, or a
- * server restart all leave that stale record behind a corpse.
+ * process that spawned the runner, so anything OUTLIVING that process leaves the
+ * stale record behind a corpse: a server restart, a reboot, or a runner
+ * inherited from an earlier server. (A SIGKILL or OOM kill while that server is
+ * still up does fire the watcher, which records the exit correctly.)
  */
 export function probeSessionRunner(status, sessionDir) {
   const pid = status?.runner_pid;
@@ -82,32 +84,21 @@ export function probeSessionRunner(status, sessionDir) {
   return "alive";
 }
 
+/**
+ * Defined in terms of the probe, never as a second copy of it.
+ *
+ * Its callers gate an action, so collapsing "dead" and "unknown" into false is
+ * right for them -- refusing to act on a runner we cannot prove is exactly the
+ * safe default. But that collapse is the ONLY difference, and keeping a parallel
+ * copy of the identity chain to express it would make this the fourth instance
+ * of one question with two implementations in this file's history. The first
+ * three all became defects: the header versus its parser, the suppressor versus
+ * the gate's line pattern, the suppressor versus its fence model. Adding a
+ * session type or changing how the token is matched must not be a change anyone
+ * can make in one place and forget in the other.
+ */
 export function isSessionRunnerAlive(status, sessionDir) {
-  const pid = status?.runner_pid;
-  if (!Number.isSafeInteger(pid) || pid <= 0 || !isProcessAlive(pid)) {
-    return false;
-  }
-
-  const commandLine = readProcessCommandLine(pid);
-  if (!commandLine) return false;
-
-  // A session written before `type` was recorded has none; those are all
-  // dialogs, which is what the default covers.
-  const runnerName =
-    RUNNER_SCRIPT_BY_SESSION_TYPE[status?.type] ?? DEFAULT_RUNNER_SCRIPT;
-  const expectedRunnerPath = path.join(SOURCE_DIR, runnerName);
-  if (
-    !commandLine.includes(expectedRunnerPath) ||
-    !commandLine.includes(sessionDir)
-  ) {
-    return false;
-  }
-
-  if (typeof status.runner_token === "string" && status.runner_token) {
-    return commandLine.includes(buildRunnerTokenArg(status.runner_token));
-  }
-
-  return true;
+  return probeSessionRunner(status, sessionDir) === "alive";
 }
 
 /**
