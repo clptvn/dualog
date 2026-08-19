@@ -1163,10 +1163,16 @@ export function suppressVerdictLines(response) {
   // stops the gate reading it is removing the token itself.
   let suppressed = masked.suppressed;
   const text = masked.text
-    // Emphasis may sit between the token and its colon -- `*VERDICT*:` is a
-    // shape the gate reads and an earlier version of this fallback did not,
-    // so the last resort fired and still leaked.
-    .replace(/\b(REVIEW[_\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)(?:\*\*|__|\*)?\s*:/gi, () => {
+    // The bare TOKEN, with no colon required.
+    //
+    // Requiring a colon left a hole the two earlier passes also miss: a noise
+    // span sitting INSIDE the token run, which excision repairs for the gate.
+    // `VERDICT<!-- draft -->: APPROVE` has no colon after VERDICT in the source
+    // and does have one in what the gate reads. Since this is the last resort --
+    // it only runs when a verdict has already survived two more careful passes
+    // -- it neutralizes the token itself and accepts rewriting the bare word
+    // "status" in prose as the price.
+    .replace(/\b(REVIEW[_\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)\b/gi, () => {
       suppressed++;
       return "ASPECT_NOTE (verdict suppressed — a specialist pass may not resolve the review):";
     })
