@@ -169,6 +169,7 @@ export function detectStartupPrompt(tui, snapshot, { readyWins = false } = {}) {
       return {
         kind: prompt.kind,
         input: prompt.input,
+        keys: prompt.keys ? [...prompt.keys] : undefined,
         description: prompt.description,
       };
     }

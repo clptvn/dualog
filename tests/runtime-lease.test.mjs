@@ -28,6 +28,7 @@ const {
   bootIdentity,
   isSameBoot,
   leasePath,
+  probeLeaseConsumer,
   proveLeaseReleasable,
   readTurnLease,
   releaseLease,
@@ -57,6 +58,22 @@ function newLease(overrides = {}) {
 
 function meta(lease) {
   return JSON.parse(fs.readFileSync(lease.metaPath, "utf-8"));
+}
+
+function localTmuxIdentity() {
+  const launcher = process.env.DUALOG_TMUX_BINARY?.trim() || "tmux";
+  const socket =
+    process.env.DUALOG_TMUX_SOCKET?.trim() ||
+    process.env.CODEX_DIALOG_TMUX_SOCKET?.trim() ||
+    process.env.CONDUCTOR_TMUX_SOCKET?.trim() ||
+    "dualog";
+  return {
+    tmux_transport: "local",
+    tmux_distro: null,
+    tmux_launcher: launcher,
+    tmux_control_binary: launcher,
+    tmux_socket_name: socket,
+  };
 }
 
 /**
@@ -227,7 +244,11 @@ test("a lease mid-spawn is not mistaken for one whose consumer exited", (t) => {
     state: "spawning",
     runner_pid: liveProcess(t),
     boot: bootIdentity(),
-    consumer: { kind: "tmux", session_name: "dualog-lease-test-not-created-yet" },
+    consumer: {
+      kind: "tmux",
+      ...localTmuxIdentity(),
+      session_name: "dualog-lease-test-not-created-yet",
+    },
   };
   const midSpawn = proveLeaseReleasable(spawning);
   assert.equal(midSpawn.removable, false, "a live runner mid-spawn must keep its lease");
@@ -260,7 +281,11 @@ test("a lease mid-spawn is not mistaken for one whose consumer exited", (t) => {
     proveLeaseReleasable({
       state: "active",
       runner_pid: liveProcess(t),
-      consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+      consumer: {
+        kind: "tmux",
+        ...localTmuxIdentity(),
+        session_name: "dualog-lease-test-no-such-session",
+      },
     }).removable,
     true,
     "an active lease whose pane is gone is still removable while its runner lives"
@@ -315,6 +340,7 @@ test("a closed pane does not prove the partner process exited", (t) => {
     state: "active",
     consumer: {
       kind: "tmux",
+      ...localTmuxIdentity(),
       session_name: "dualog-lease-test-no-such-session",
       pane_pid: liveProcess(t),
     },
@@ -337,7 +363,11 @@ test("a closed pane does not prove the partner process exited", (t) => {
   assert.equal(
     proveLeaseReleasable({
       state: "active",
-      consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+      consumer: {
+        kind: "tmux",
+        ...localTmuxIdentity(),
+        session_name: "dualog-lease-test-no-such-session",
+      },
     }).removable,
     true,
     "a legacy record without pane_pid keeps working"
@@ -353,6 +383,95 @@ test("a closed pane does not prove the partner process exited", (t) => {
   );
 });
 
+test("a WSL tmux consumer is probed only in its recorded distribution", () => {
+  let nativePaneCalls = 0;
+  let wslPaneCalls = 0;
+  const consumer = {
+    kind: "tmux",
+    session_name: "dlg-wsl-consumer",
+    tmux_transport: "wsl",
+    tmux_distro: "Ubuntu",
+    tmux_launcher: "wsl.exe",
+    tmux_control_binary: "tmux",
+    tmux_socket_name: "dualog",
+    pane_pid: 42,
+    pane_started_at: "started",
+  };
+  const verdict = probeLeaseConsumer(consumer, {
+    probeTmuxSessionFn: (sessionName, options) => {
+      assert.equal(sessionName, "dlg-wsl-consumer");
+      assert.deepEqual(options, {
+        transport: "wsl",
+        distro: "Ubuntu",
+        tmuxLauncher: "wsl.exe",
+        tmuxControlBinary: "tmux",
+        tmuxSocketName: "dualog",
+        requireExactIdentity: true,
+        platform: process.platform,
+      });
+      return "absent";
+    },
+    probeWslPaneProcessFn: (pid, startedAt, options) => {
+      wslPaneCalls += 1;
+      assert.equal(pid, 42);
+      assert.equal(startedAt, "started");
+      assert.deepEqual(options, {
+        transport: "wsl",
+        distro: "Ubuntu",
+        tmuxLauncher: "wsl.exe",
+        tmuxControlBinary: "tmux",
+        tmuxSocketName: "dualog",
+        requireExactIdentity: true,
+        platform: process.platform,
+      });
+      return "alive";
+    },
+    probeRecordedProcessFn: () => {
+      nativePaneCalls += 1;
+      return "absent";
+    },
+  });
+  assert.equal(verdict, "alive");
+  assert.equal(wslPaneCalls, 1);
+  assert.equal(nativePaneCalls, 0);
+});
+
+test("a different host or legacy missing route identity can never release a tmux lease", () => {
+  const previousSocket = process.env.DUALOG_TMUX_SOCKET;
+  process.env.DUALOG_TMUX_SOCKET = "dualog-host-b";
+  try {
+    const hostA = proveLeaseReleasable({
+      state: "active",
+      consumer: {
+        kind: "tmux",
+        session_name: "dualog-lease-test-no-such-session",
+        tmux_transport: "local",
+        tmux_distro: null,
+        tmux_launcher: "tmux",
+        tmux_control_binary: "tmux",
+        tmux_socket_name: "dualog-host-a",
+      },
+    });
+    assert.equal(hostA.removable, false);
+    assert.match(hostA.reason, /could not be probed \(unknown\)/u);
+
+    const legacy = proveLeaseReleasable({
+      state: "active",
+      consumer: {
+        kind: "tmux",
+        session_name: "dualog-lease-test-no-such-session",
+        tmux_transport: "local",
+        tmux_distro: null,
+      },
+    });
+    assert.equal(legacy.removable, false);
+    assert.match(legacy.reason, /could not be probed \(unknown\)/u);
+  } finally {
+    if (previousSocket === undefined) delete process.env.DUALOG_TMUX_SOCKET;
+    else process.env.DUALOG_TMUX_SOCKET = previousSocket;
+  }
+});
+
 test("a reused pid does not keep a lease alive forever", async () => {
   // `kill(pid, 0)` answers "something has this pid", not "the thing I recorded
   // still has it". After a crash and pid reuse, an unrelated long-lived process
@@ -364,7 +483,12 @@ test("a reused pid does not keep a lease alive forever", async () => {
   assert.ok(mine, "this platform must be able to report a process start time");
 
   for (const consumer of [
-    { kind: "tmux", session_name: "dualog-lease-test-no-such-session", pane_pid: process.pid },
+    {
+      kind: "tmux",
+      ...localTmuxIdentity(),
+      session_name: "dualog-lease-test-no-such-session",
+      pane_pid: process.pid,
+    },
     { kind: "headless", pid: process.pid, pgid: process.pid },
   ]) {
     // Same pid, the generation we recorded: alive, so the lease is kept.
@@ -428,6 +552,7 @@ test("a pane we could not identify is not the same as one that never had an iden
     state: "active",
     consumer: {
       kind: "tmux",
+      ...localTmuxIdentity(),
       session_name: "dualog-lease-test-no-such-session",
       pane_pid: null,
       pane_pid_unavailable: true,
@@ -438,7 +563,12 @@ test("a pane we could not identify is not the same as one that never had an iden
 
   const legacy = proveLeaseReleasable({
     state: "active",
-    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session", pane_pid: null },
+    consumer: {
+      kind: "tmux",
+      ...localTmuxIdentity(),
+      session_name: "dualog-lease-test-no-such-session",
+      pane_pid: null,
+    },
   });
   assert.equal(legacy.removable, true, "a pre-pane_pid record still resolves on the session");
 });
@@ -454,7 +584,11 @@ test("a lease whose consumer is proven absent is removable", () => {
   assert.equal(
     proveLeaseReleasable({
       state: "active",
-      consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+      consumer: {
+        kind: "tmux",
+        ...localTmuxIdentity(),
+        session_name: "dualog-lease-test-no-such-session",
+      },
     }).removable,
     true
   );
@@ -597,7 +731,13 @@ test("a symlinked managed ROOT is refused, not just a symlinked leaf", () => {
         const root = path.join(home, rootRel);
         const link = path.join(home, linkAt);
         fs.mkdirSync(path.dirname(link), { recursive: true });
-        fs.symlinkSync(victim, link);
+        // A junction is still reported as a symbolic link by lstat, but unlike
+        // a Windows directory symlink it does not require Developer Mode.
+        fs.symlinkSync(
+          victim,
+          link,
+          process.platform === "win32" ? "junction" : "dir"
+        );
         fs.mkdirSync(root, { recursive: true });
         const container = path.join(root, leafName);
         fs.mkdirSync(container, { recursive: true });
@@ -650,7 +790,11 @@ test("allocation refuses a symlinked runtime root, before and after its mkdir", 
     // \`recursive: true\` mkdir would actually CREATE runtime/ inside the target.
     // Linking the leaf directly makes the mkdir a no-op and the test then passes
     // whether or not the pre-check exists.
-    fs.symlinkSync(victim, path.join(home, ".dualog"));
+    fs.symlinkSync(
+      victim,
+      path.join(home, ".dualog"),
+      process.platform === "win32" ? "junction" : "dir"
+    );
     const turnDir = path.join(os.tmpdir(), "dualog-alloc-turn-" + process.pid);
     fs.mkdirSync(turnDir, { recursive: true });
     import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
@@ -689,7 +833,11 @@ test("the sweep refuses to enumerate a symlinked runtime root", () => {
       schema_version: 1, state: "active", consumer: { kind: "headless", pid: 999999, pgid: 999999 },
     }));
     fs.mkdirSync(path.join(home, ".dualog"), { recursive: true });
-    fs.symlinkSync(victim, path.join(home, ".dualog", "runtime"));
+    fs.symlinkSync(
+      victim,
+      path.join(home, ".dualog", "runtime"),
+      process.platform === "win32" ? "junction" : "dir"
+    );
     import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
       const receipt = m.sweepLeases({ apply: true });
       console.log(JSON.stringify({
@@ -825,7 +973,11 @@ test("deletion revalidates the root itself, not just what its caller checked", (
     // A directory in the victim with a perfectly valid lease name.
     fs.mkdirSync(path.join(victim, id), { recursive: true });
     fs.mkdirSync(path.join(home, ".dualog"), { recursive: true });
-    fs.symlinkSync(victim, path.join(home, ".dualog", "runtime"));
+    fs.symlinkSync(
+      victim,
+      path.join(home, ".dualog", "runtime"),
+      process.platform === "win32" ? "junction" : "dir"
+    );
     import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
       let refused = false, message = null;
       try {
@@ -851,7 +1003,11 @@ test("releasing takes the credentials with it", () => {
   fs.mkdirSync(home, { recursive: true });
   fs.writeFileSync(path.join(home, "auth.json"), '{"token":"secret"}');
   transitionLease(lease, "active", {
-    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+    consumer: {
+      kind: "tmux",
+      ...localTmuxIdentity(),
+      session_name: "dualog-lease-test-no-such-session",
+    },
   });
 
   const { released } = releaseLease(lease);
@@ -887,6 +1043,7 @@ test("a runner can clean up after its own failed pre-spawn turn", () => {
     // proof rather than a guess.
     consumer: {
       kind: "tmux",
+      ...localTmuxIdentity(),
       session_name: "dualog-lease-test-no-such-session",
       pane_pid: 999999,
     },
@@ -894,13 +1051,37 @@ test("a runner can clean up after its own failed pre-spawn turn", () => {
   assert.equal(releaseLease(failed).released, true, "the owner may reclaim its own failed spawn");
   assert.equal(fs.existsSync(failed.dir), false);
 
+  const unidentifiedPane = newLease();
+  transitionLease(unidentifiedPane, "spawning", {
+    consumer: {
+      kind: "tmux",
+      ...localTmuxIdentity(),
+      session_name: "dualog-lease-test-no-such-session",
+      pane_pid: null,
+      pane_pid_unavailable: true,
+    },
+  });
+  const unidentifiedRelease = releaseLease(unidentifiedPane);
+  assert.equal(
+    unidentifiedRelease.released,
+    false,
+    "a failed setup after pane creation retains when the pane pid was unreadable"
+  );
+  assert.match(unidentifiedRelease.reason, /could not be probed \(unknown\)/u);
+  fs.rmSync(unidentifiedPane.dir, { recursive: true, force: true });
+  fs.rmSync(unidentifiedPane.metaPath, { force: true });
+
   // But NOT on a session name alone. In `spawning` the name may have been
   // recorded before new-session ran, and the tmux server is a separate process
   // from the client we drove -- so a client that timed out can still have handed
   // the command over and the pane can appear after any number of probes.
   const nameless = newLease();
   transitionLease(nameless, "spawning", {
-    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+    consumer: {
+      kind: "tmux",
+      ...localTmuxIdentity(),
+      session_name: "dualog-lease-test-no-such-session",
+    },
   });
   const refusedNameless = releaseLease(nameless);
   assert.equal(
@@ -953,7 +1134,11 @@ test("a lease record survives the partner recreating its home", () => {
   // The record lives BESIDE the directory now, so the partner cannot reach it.
   const lease = newLease();
   transitionLease(lease, "active", {
-    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+    consumer: {
+      kind: "tmux",
+      ...localTmuxIdentity(),
+      session_name: "dualog-lease-test-no-such-session",
+    },
   });
   assert.equal(path.dirname(lease.metaPath), path.resolve(runtimeDir()));
   assert.equal(fs.existsSync(path.join(lease.dir, "lease.json")), false, "nothing inside the lease");
@@ -1151,7 +1336,12 @@ test("an incomplete usage scan is not a free one", (t) => {
   fs.chmodSync(deep, 0o000);
 
   transitionLease(lease, "active", {
-    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session", pane_pid: 999999 },
+    consumer: {
+      kind: "tmux",
+      ...localTmuxIdentity(),
+      session_name: "dualog-lease-test-no-such-session",
+      pane_pid: 999999,
+    },
   });
   const verdict = releaseLease(lease);
   assert.equal(verdict.released, false, "a scan that could not look everywhere must retain");
@@ -1271,13 +1461,22 @@ test("a tombstone is not aged out until its consumer is proven gone", () => {
   assert.equal(fs.existsSync(lease.metaPath), false);
 });
 
-test("a release that cannot persist its tombstone keeps the directory", () => {
+test("a release that cannot persist its tombstone keeps the directory", (t) => {
   // Removing anyway left the credential directory gone AND no record, so a late
   // recreation could never be attributed -- destroying exactly the evidence the
   // sibling-record design exists to preserve, and reporting success while doing it.
+  if (process.platform === "win32") {
+    t.skip("Windows chmod does not provide a deterministic unwritable-directory fixture");
+    return;
+  }
   const lease = newLease();
   transitionLease(lease, "active", {
-    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session", pane_pid: 999999 },
+    consumer: {
+      kind: "tmux",
+      ...localTmuxIdentity(),
+      session_name: "dualog-lease-test-no-such-session",
+      pane_pid: 999999,
+    },
   });
   // Readable but NOT writable: the record is where it belongs, and the runtime
   // root denies the atomic write. That is the case being tested -- an unreadable
@@ -1335,7 +1534,11 @@ test("a spent lease record is eventually reaped, once its directory is gone", ()
   // them -- otherwise the runtime root fills with records of turns long past.
   const lease = newLease();
   transitionLease(lease, "active", {
-    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+    consumer: {
+      kind: "tmux",
+      ...localTmuxIdentity(),
+      session_name: "dualog-lease-test-no-such-session",
+    },
   });
   assert.equal(releaseLease(lease).released, true);
   assert.equal(fs.existsSync(lease.metaPath), true, "the tombstone outlives the directory");
@@ -1446,7 +1649,7 @@ test("every exit from a partner turn releases its lease, and only on proof", () 
   // And the completed path waits for the pane's PROCESS before reclaiming...
   assert.match(
     src,
-    /partnerExited = await waitForProcessExit\(handle\.panePid, PARTNER_EXIT_GRACE_MS\)/,
+    /partnerExited = await waitForPartnerPaneExit\(handle, PARTNER_EXIT_GRACE_MS\)/,
     "the completed turn must give the partner a chance to exit before cleanup"
   );
   // ...and only releases if that actually established absence. `owned` proves
@@ -1464,7 +1667,7 @@ test("every exit from a partner turn releases its lease, and only on proof", () 
   // teardown does not prove the process it ran has exited.
   assert.match(
     src,
-    /if \(lease && !handle && err\?\.panePid\) \{[\s\S]{0,400}pane_pid: err\.panePid/,
+    /if \([\s\S]{0,160}err\?\.panePidUnavailable === true[\s\S]{0,1800}tmux_transport: tmuxTransport,[\s\S]{0,300}tmux_distro: tmuxDistro,[\s\S]{0,300}tmux_launcher: tmuxLauncher,[\s\S]{0,300}tmux_control_binary: tmuxControlBinary,[\s\S]{0,300}tmux_socket_name: tmuxSocketName,[\s\S]{0,300}pane_pid: err\.panePid,[\s\S]{0,200}pane_pid_unavailable: err\.panePidUnavailable === true/,
     "a failed spawn must record the carried pane process before releasing"
   );
 
@@ -1502,6 +1705,10 @@ test("a partner that outlives its pane keeps its lease until it really exits", a
   // partner then recreated it -- leaving a directory with a valid lease name and
   // no metadata that nothing could reclaim. This drives the same shape: a
   // process that survives its pane by a beat and writes into its home.
+  if (process.platform === "win32") {
+    t.skip("native POSIX tmux/process fixture; Windows tree lifecycle has dedicated coverage");
+    return;
+  }
   if (spawnSync("tmux", ["-V"], { stdio: "ignore" }).status !== 0) {
     t.skip("tmux is not installed");
     return;
@@ -1540,7 +1747,16 @@ test("a partner that outlives its pane keeps its lease until it really exits", a
   });
   assert.ok(handle.panePid, "the pane's process must be identified");
   transitionLease(lease, "active", {
-    consumer: { kind: "tmux", session_name: handle.sessionName, pane_pid: handle.panePid },
+    consumer: {
+      kind: "tmux",
+      session_name: handle.sessionName,
+      pane_pid: handle.panePid,
+      tmux_transport: handle.tmuxTransport,
+      tmux_distro: handle.tmuxDistro,
+      tmux_launcher: handle.tmuxLauncher,
+      tmux_control_binary: handle.tmuxControlBinary,
+      tmux_socket_name: handle.tmuxSocketName,
+    },
   });
 
   // Take the pane down. The tmux SESSION goes; the process does not.
@@ -1600,7 +1816,12 @@ test("a setsid descendant keeps the lease, though no identity check can see it",
 
   // The consumer we RECORDED is gone -- every identity check says "release".
   transitionLease(lease, "active", {
-    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session", pane_pid: 999999 },
+    consumer: {
+      kind: "tmux",
+      ...localTmuxIdentity(),
+      session_name: "dualog-lease-test-no-such-session",
+      pane_pid: 999999,
+    },
   });
 
   const verdict = releaseLease(lease);
@@ -1798,7 +2019,11 @@ test("a partner's credentials land in the lease and never in the session archive
 
   // Then the turn ends, and the copy ceases to exist.
   transitionLease(lease, "active", {
-    consumer: { kind: "tmux", session_name: "dualog-lease-test-no-such-session" },
+    consumer: {
+      kind: "tmux",
+      ...localTmuxIdentity(),
+      session_name: "dualog-lease-test-no-such-session",
+    },
   });
   assert.equal(releaseLease(lease).released, true);
   assert.equal(fs.existsSync(path.join(lease.dir, "codex-home", "auth.json")), false);

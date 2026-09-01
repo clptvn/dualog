@@ -252,7 +252,14 @@ export function proveSessionInactive(sessionDir) {
     // reboot, say -- every session carrying a current_terminal.json probed
     // `unknown` and was retained forever. Credentials that this module exists
     // to reclaim were never reclaimed.
-    const probe = probeTmuxSessionSync(sessionName);
+    const probe = probeTmuxSessionSync(sessionName, {
+      transport: terminal.value.tmux_transport ?? null,
+      distro: terminal.value.tmux_distro ?? null,
+      tmuxLauncher: terminal.value.tmux_launcher ?? null,
+      tmuxControlBinary: terminal.value.tmux_control_binary ?? null,
+      tmuxSocketName: terminal.value.tmux_socket_name ?? null,
+      requireExactIdentity: true,
+    });
     if (probe === "alive") return block(`tmux session ${sessionName} is still running`);
     if (probe !== "absent") {
       // Includes tmux being unavailable, which is NOT evidence the pane is gone.

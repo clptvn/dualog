@@ -8,6 +8,7 @@
 
 import fs from "fs";
 import path from "path";
+import { writeNodeCommand } from "./node-command.mjs";
 
 /**
  * Behaviors a fake can be scripted with:
@@ -20,10 +21,9 @@ import path from "path";
  *   hang          never exit                                    (hung)
  */
 export function writeFakeCli(dir, name, behavior, options = {}) {
-  const target = path.join(dir, name);
   const reply = options.reply ?? "FAKE PARTNER REPLY";
 
-  const script = `#!/usr/bin/env node
+  const script = `
 import fs from "fs";
 
 const behavior = ${JSON.stringify(behavior)};
@@ -71,18 +71,26 @@ else {
 }
 `;
 
-  fs.writeFileSync(target, script);
-  fs.chmodSync(target, 0o755);
-  return target;
+  return writeNodeCommand(dir, name, script);
 }
 
 /** A minimal headless-capable manifest pointed at a fake binary. */
 export function writeFakeAdapter(adapterDir, id, binaryPath, overrides = {}) {
   fs.mkdirSync(adapterDir, { recursive: true });
+  const invokeViaNode = process.platform === "win32" && binaryPath.endsWith(".mjs");
+  const binary = invokeViaNode ? process.execPath : binaryPath;
+  const binaryArgs = invokeViaNode ? [binaryPath] : [];
+  const declaredArgs = overrides.argv?.headless ?? [{ args: ["--run", "{{initialPrompt}}"] }];
+  const argv = {
+    ...overrides.argv,
+    headless: declaredArgs.map((entry, index) =>
+      index === 0 ? { ...entry, args: [...binaryArgs, ...(entry.args ?? [])] } : entry
+    ),
+  };
   const manifest = {
     id,
     displayName: id,
-    binary: { default: binaryPath },
+    binary: { default: binary },
     engines: { default: "headless", allowed: ["headless"] },
     capabilities: {
       modelFlag: true,
@@ -94,12 +102,13 @@ export function writeFakeAdapter(adapterDir, id, binaryPath, overrides = {}) {
     },
     mcp: { strategy: "none" },
     promptDelivery: { headless: "argv" },
-    argv: { headless: [{ args: ["--run", "{{initialPrompt}}"] }] },
+    argv,
     completion: {
       sidecar: "always",
       stdoutTrustworthy: false,
     },
     ...overrides,
+    argv,
   };
   const file = path.join(adapterDir, `${id}.json`);
   fs.writeFileSync(file, JSON.stringify(manifest, null, 2));

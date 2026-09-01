@@ -3,7 +3,7 @@ exports[`argv: claude / effort valid for codex but not claude is dropped 1`] = `
   "command": "claude",
   "args": [
     "--permission-mode",
-    "bypassPermissions",
+    "dontAsk",
     "--allowedTools",
     "Read,Grep,Glob,Bash,LSP",
     "--mcp-config",
@@ -16,7 +16,7 @@ exports[`argv: claude / effort valid for codex but not claude is dropped 1`] = `
     "--name",
     "ccd-dialog-1700000000000-abcd1234-turn",
     "--disallowedTools",
-    "Edit,MultiEdit,Write,NotebookEdit"
+    "Edit,Write,NotebookEdit"
   ],
   "env": {
     "DUALOG_ROLE": "partner",
@@ -31,9 +31,9 @@ exports[`argv: claude / implementation profile 1`] = `
   "command": "claude",
   "args": [
     "--permission-mode",
-    "bypassPermissions",
+    "dontAsk",
     "--allowedTools",
-    "Read,Grep,Glob,Bash,LSP,Edit,MultiEdit,Write",
+    "Read,Grep,Glob,Bash,LSP,Edit,Write",
     "--mcp-config",
     "<SCRATCH_DIR>/claude-empty-mcp.json",
     "--strict-mcp-config",
@@ -57,9 +57,9 @@ exports[`argv: claude / model and effort together 1`] = `
   "command": "claude",
   "args": [
     "--permission-mode",
-    "bypassPermissions",
+    "dontAsk",
     "--allowedTools",
-    "Read,Grep,Glob,Bash,LSP,Edit,MultiEdit,Write",
+    "Read,Grep,Glob,Bash,LSP,Edit,Write",
     "--mcp-config",
     "<SCRATCH_DIR>/claude-empty-mcp.json",
     "--strict-mcp-config",
@@ -87,7 +87,7 @@ exports[`argv: claude / model only 1`] = `
   "command": "claude",
   "args": [
     "--permission-mode",
-    "bypassPermissions",
+    "dontAsk",
     "--allowedTools",
     "Read,Grep,Glob,Bash,LSP",
     "--mcp-config",
@@ -100,7 +100,7 @@ exports[`argv: claude / model only 1`] = `
     "--name",
     "ccd-dialog-1700000000000-abcd1234-turn",
     "--disallowedTools",
-    "Edit,MultiEdit,Write,NotebookEdit",
+    "Edit,Write,NotebookEdit",
     "--model",
     "claude-opus-4-8[1m]"
   ],
@@ -117,7 +117,7 @@ exports[`argv: claude / read profile / no model / no effort 1`] = `
   "command": "claude",
   "args": [
     "--permission-mode",
-    "bypassPermissions",
+    "dontAsk",
     "--allowedTools",
     "Read,Grep,Glob,Bash,LSP",
     "--mcp-config",
@@ -130,7 +130,7 @@ exports[`argv: claude / read profile / no model / no effort 1`] = `
     "--name",
     "ccd-dialog-1700000000000-abcd1234-turn",
     "--disallowedTools",
-    "Edit,MultiEdit,Write,NotebookEdit"
+    "Edit,Write,NotebookEdit"
   ],
   "env": {
     "DUALOG_ROLE": "partner",
@@ -145,7 +145,7 @@ exports[`argv: claude / unknown tool profile falls back to read 1`] = `
   "command": "claude",
   "args": [
     "--permission-mode",
-    "bypassPermissions",
+    "dontAsk",
     "--allowedTools",
     "Read,Grep,Glob,Bash,LSP",
     "--mcp-config",
@@ -158,7 +158,7 @@ exports[`argv: claude / unknown tool profile falls back to read 1`] = `
     "--name",
     "ccd-dialog-1700000000000-abcd1234-turn",
     "--disallowedTools",
-    "Edit,MultiEdit,Write,NotebookEdit"
+    "Edit,Write,NotebookEdit"
   ],
   "env": {
     "DUALOG_ROLE": "partner",
@@ -173,7 +173,7 @@ exports[`argv: claude / valid effort 1`] = `
   "command": "claude",
   "args": [
     "--permission-mode",
-    "bypassPermissions",
+    "dontAsk",
     "--allowedTools",
     "Read,Grep,Glob,Bash,LSP",
     "--mcp-config",
@@ -186,7 +186,7 @@ exports[`argv: claude / valid effort 1`] = `
     "--name",
     "ccd-dialog-1700000000000-abcd1234-turn",
     "--disallowedTools",
-    "Edit,MultiEdit,Write,NotebookEdit",
+    "Edit,Write,NotebookEdit",
     "--effort",
     "xhigh"
   ],

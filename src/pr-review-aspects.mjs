@@ -28,10 +28,16 @@
  */
 
 import {
+  PR_REVIEW_FINDING_CATEGORIES,
   extractReviewVerdict,
   gateReadableLineMask,
+  hasBalancedProtocolNoise,
+  isBlockingFindingCategory,
+  isValidFindingId,
   matchLegacyApprovalLine,
   matchVerdictLine,
+  normalizedFindingsLineIndexes,
+  protocolReadableLineMask,
 } from "./shared.mjs";
 
 /**
@@ -55,10 +61,10 @@ export function buildAspectHeader({ aspect, title, passIndex, specialistCount })
 
 /** Capture groups: 1 = pass index, 2 = specialist count, 3 = title, 4 = aspect id. */
 export const ASPECT_HEADER_RE =
-  /^## Panel pass (\d+) of (\d+) — (.+) \(aspect: ([a-z][a-z0-9-]*)\)/m;
+  /^## Panel pass (\d+) of (\d+) — ([^\r\n]+) \(aspect: ([a-z][a-z0-9-]*)\)(?:\r?\n|$)/;
 
 export const CONSOLIDATED_HEADER = "## Consolidated PR Review";
-export const CONSOLIDATED_HEADER_RE = /^## Consolidated PR Review/m;
+export const CONSOLIDATED_HEADER_RE = /^## Consolidated PR Review(?:\r?\n|$)/;
 
 /**
  * The normalized finding vocabulary this module's parser understands.
@@ -78,17 +84,7 @@ export const CONSOLIDATED_HEADER_RE = /^## Consolidated PR Review/m;
  * surfaces in get_pr_review_report at all. The gate sees a finding the report
  * cannot show you.
  */
-export const FINDING_CATEGORIES = [
-  "CRITICAL",
-  "CORRECTNESS",
-  "ARCHITECTURE",
-  "SECURITY",
-  "ROBUSTNESS",
-  "SUGGESTION",
-  "QUESTION",
-  "PRAISE",
-  "NIT",
-];
+export const FINDING_CATEGORIES = [...PR_REVIEW_FINDING_CATEGORIES];
 
 const NORMALIZED_FINDINGS_BLOCK = `## Normalized Findings (REQUIRED)
 
@@ -101,6 +97,14 @@ One finding per line, in this exact shape:
 
 [CATEGORY] path/to/file.ext:LINE — one-sentence statement of the defect
 
+The runner assigns durable IDs after a specialist responds. If an input report
+already contains one, preserve it between the category and path exactly:
+
+[CATEGORY] [FINDING_ID: F-code-1] path/to/file.ext:LINE — one-sentence statement
+
+Do not invent or renumber finding IDs. New findings may omit the ID; the runner
+will assign one before storing the response.
+
 Categories, and what each one means (do not inflate — an inflated category
 spends a reviewer's attention on the wrong thing):
 
@@ -109,9 +113,16 @@ spends a reviewer's attention on the wrong thing):
 - [ARCHITECTURE] — design problem, coupling, broken abstraction.
 - [SECURITY] — input validation, authz, secrets, unsafe pattern.
 - [ROBUSTNESS] — error paths, resource cleanup, partial-failure handling.
+- [GAP] — a required behavior or acceptance criterion is missing.
+- [AMBIGUITY] — the change leaves a material contract unclear.
+- [SCOPE] — implementation materially exceeds or misses the requested scope.
+- [FEASIBILITY] — the proposed behavior cannot work as implemented.
+- [UX] — a user-facing defect that prevents or misleads normal use.
+- [TESTABILITY] — the change cannot be reliably verified or regressed.
 - [SUGGESTION] — concrete improvement with a demonstrable benefit. If you cannot
   say why a senior engineer would adopt it, leave it out.
-- [QUESTION] — you cannot conclude without an answer. Use sparingly.
+- [QUESTION] — optional clarification that does not block a conclusion. If an
+  answer is required to conclude, use [AMBIGUITY] and NEEDS_DISCUSSION instead.
 - [PRAISE] — optional, one line, only when honest.
 - [NIT] — cosmetic. Group at the end or omit entirely.
 
@@ -639,22 +650,45 @@ export function selectAspects(diff, requested) {
   };
 }
 
-function diffSection(diff, maxChars) {
+function diffSection(
+  diff,
+  maxChars,
+  { scope = null, authoritativeDiffPath = null } = {}
+) {
   const truncated = diff.length > maxChars;
   const body = truncated ? diff.slice(0, maxChars) : diff;
+  let truncationNote = "";
+  if (truncated) {
+    if (authoritativeDiffPath) {
+      truncationNote =
+        `\n**Note:** this diff is ${diff.length} chars and only the first ${maxChars} are shown. ` +
+        `Read the complete authoritative diff from ${authoritativeDiffPath}. ` +
+        (scope === "pr"
+          ? "Do NOT substitute the local working tree: it may be on a different branch and is context only. "
+          : "Read changed files in the project directory for surrounding context, but use that diff file for the full change. ") +
+        "Do not draw conclusions about the unshown portion from the shown one.\n";
+    } else if (scope === "pr") {
+      // Production PR prompts always supply the session artifact path. This
+      // fallback still fails safe for direct/library callers: it never tells a
+      // reviewer to inspect a potentially unrelated checkout for bytes omitted
+      // from a remotely fetched PR.
+      truncationNote =
+        `\n**Note:** this diff is ${diff.length} chars and only the first ${maxChars} are shown. ` +
+        "Read the complete diff from this review session's authoritative diff artifact; do NOT substitute the local working tree, which may be on a different branch. " +
+        "Do not draw conclusions about the unshown portion from the shown one.\n";
+    } else {
+      truncationNote =
+        `\n**Note:** this diff is ${diff.length} chars and only the first ${maxChars} are shown. ` +
+        "Read the changed files in the project directory for the rest, and do not draw conclusions about the unshown portion from the shown one.\n";
+    }
+  }
   return {
     truncated,
-    text:
-      "```diff\n" +
-      body +
-      "\n```\n" +
-      (truncated
-        ? `\n**Note:** this diff is ${diff.length} chars and only the first ${maxChars} are shown. Read the changed files in the project directory for the rest, and do not draw conclusions about the unshown portion from the shown one.\n`
-        : ""),
+    text: "```diff\n" + body + "\n```\n" + truncationNote,
   };
 }
 
-function contextBlock(meta, projectPath) {
+function contextBlock(meta, partnerProjectPath) {
   let block = `## What You Are Reviewing
 
 ${meta.scope_label}
@@ -671,7 +705,7 @@ ${meta.pr.body ? `\nPR description:\n\n${meta.pr.body}\n` : ""}`;
 ${meta.diff_stat || "(no stat available)"}
 
 ## Project Directory
-${projectPath}
+${partnerProjectPath}
 
 Read any file here for context beyond the diff. You are expected to — the diff
 alone rarely contains enough to judge a change fairly.
@@ -707,8 +741,9 @@ export function buildAspectPrompt({
   aspect,
   meta,
   diff,
-  projectPath,
+  projectPath: partnerProjectPath,
   maxDiffChars,
+  authoritativeDiffPath = null,
   passIndex,
   passTotal,
   reviewFocus,
@@ -716,7 +751,10 @@ export function buildAspectPrompt({
 }) {
   const spec = PR_REVIEW_ASPECTS[aspect];
   if (!spec) throw new Error(`Unknown review aspect: ${aspect}`);
-  const { text: diffText } = diffSection(diff, maxDiffChars);
+  const { text: diffText } = diffSection(diff, maxDiffChars, {
+    scope: meta.scope,
+    authoritativeDiffPath,
+  });
 
   let prompt = `${spec.prompt}
 
@@ -728,7 +766,7 @@ aspects — stay in your lane and review deeply rather than broadly. A finding
 outside your lens is someone else's pass; a finding inside it that you skipped
 is nobody's.
 
-${contextBlock(meta, projectPath)}`;
+${contextBlock(meta, partnerProjectPath)}`;
 
   if (reviewFocus) {
     prompt += `
@@ -767,6 +805,54 @@ footer. Do not wrap any of it in JSON.`;
   return prompt;
 }
 
+function findingLedgerContract(findingLedger) {
+  const ledger = Array.isArray(findingLedger)
+    ? findingLedger.filter(
+        (finding) =>
+          isValidFindingId(finding?.id) &&
+          isBlockingFindingCategory(finding?.category) &&
+          typeof finding?.text === "string"
+      )
+    : [];
+  const entries = ledger.length
+    ? ledger
+        .map(
+          (finding) =>
+            `- ${finding.id} [${String(finding.category).toUpperCase()}] ${finding.text}`
+        )
+        .join("\n")
+    : "(empty — no prior blocking findings require disposition)";
+
+  return `## Durable Finding Ledger (MACHINE CONTRACT)
+
+The runner, not prose similarity, owns this append-only ledger. A finding may
+not disappear just because you omit or reword it:
+
+${entries}
+
+For every ledger ID, do exactly one of these:
+
+- If it remains unresolved, carry the exact ID in its normalized finding line
+  and use CHANGES_REQUESTED or NEEDS_DISCUSSION. Do not emit a disposition.
+- If it no longer blocks, emit exactly one plain line in this shape immediately
+  before the machine-readable footer:
+
+FINDING_DISPOSITION: F-code-1 | resolved | verified in the refreshed diff at src/file.ts:12
+
+Allowed dispositions are \`resolved\`, \`false-positive\`, \`pre-existing\`, and
+\`duplicate\`. Every one requires a concrete non-empty rationale. A duplicate
+must name another ID already present in the ledger, followed by a rationale:
+
+FINDING_DISPOSITION: F-types-2 | duplicate | duplicate-of=F-code-1; same unchecked branch
+
+APPROVE requires exactly one valid disposition line for EVERY ledger ID and no
+unknown IDs. Use ledger IDs only in exact normalized finding lines or exact
+FINDING_DISPOSITION lines; do not mention them in surrounding prose. Do not put
+disposition lines in a quote or code fence. New blocking findings must be
+normalized as usual and prohibit APPROVE; the runner will give them durable IDs
+before storing your response.`;
+}
+
 /**
  * The final pass: turn N specialist reports into one actionable review.
  *
@@ -775,11 +861,12 @@ footer. Do not wrap any of it in JSON.`;
  */
 export function buildAggregationPrompt({
   meta,
-  projectPath,
+  projectPath: partnerProjectPath,
   reports,
   skipped,
   reviewFocus,
   hostDisplay,
+  findingLedger = [],
 }) {
   // A panel with a failed pass has a KNOWN hole, and until this block existed
   // nothing stopped consolidation from emitting APPROVE over it -- which
@@ -803,11 +890,13 @@ export function buildAggregationPrompt({
 reviewer can act on. Several specialists have each reviewed the same change
 through a single narrow lens. Their reports are below.
 
-${contextBlock(meta, projectPath)}
+${contextBlock(meta, partnerProjectPath)}
 ${reviewFocus ? `\n## Reviewer's Stated Focus\n${reviewFocus}\n` : ""}
 ## Specialist Reports
 
 ${sections}
+
+${findingLedgerContract(findingLedger)}
 
 ${
   skipped.length
@@ -886,7 +975,7 @@ Coverage section. Approving here would certify a review that was never performed
     : ""
 }
 
-Paths in REFERENCED_FILES are relative to ${projectPath}, and the line is parsed
+Paths in REFERENCED_FILES are relative to ${partnerProjectPath}, and the line is parsed
 so your partner can verify your claims against the real code.
 
 Respond with ONLY the consolidated report and the footer.`;
@@ -912,9 +1001,10 @@ Respond with ONLY the consolidated report and the footer.`;
  */
 export function buildFollowUpPrompt({
   meta,
-  projectPath,
+  projectPath: partnerProjectPath,
   diff,
   maxDiffChars,
+  authoritativeDiffPath = null,
   messages,
   hostDisplay,
   partnerDisplay,
@@ -924,13 +1014,17 @@ export function buildFollowUpPrompt({
   softCap,
   hardCap,
   failedAspects = [],
+  findingLedger = [],
 }) {
-  const { text: diffText } = diffSection(diff, maxDiffChars);
+  const { text: diffText } = diffSection(diff, maxDiffChars, {
+    scope: meta.scope,
+    authoritativeDiffPath,
+  });
 
   let prompt = `You are continuing a multi-specialist code review you already delivered. The
 panel has reported and been consolidated; ${hostDisplay} is now responding.
 
-${contextBlock(meta, projectPath)}
+${contextBlock(meta, partnerProjectPath)}
 
 ## ${meta.scope === "pr" ? "The Change, As Last Fetched From The Pull Request" : "Current State of the Change"}
 ${diffText}
@@ -949,6 +1043,8 @@ ${diffText}
   }
 
   prompt += `
+${findingLedgerContract(findingLedger)}
+
 ## Round Budget
 
 Follow-up round ${roundsUsed + 1}. Soft cap ${softCap}, hard cap ${hardCap}.
@@ -977,6 +1073,14 @@ ${
   was reviewed and resolved.`
   }
 
+## Normalized Findings (REQUIRED)
+
+End the human-facing response with a section titled exactly
+"### Normalized Findings". Carry every unresolved ledger finding using its exact
+\`[FINDING_ID: ...]\` tag, add any genuinely new finding in the normal
+\`[CATEGORY] path:LINE — defect\` shape, or write \`(none)\` when none remain.
+Then emit any required FINDING_DISPOSITION lines and the footer below.
+
 ## Machine-Readable Footer (REQUIRED)
 
 REVIEW_VERDICT: <APPROVE|CHANGES_REQUESTED|NEEDS_DISCUSSION>
@@ -993,7 +1097,13 @@ Respond with ONLY your message and the footer.`;
  * Used to tell later passes what has already been filed, and to build the
  * report tool's aspect-keyed index.
  */
-export function extractNormalizedFindings(content) {
+const NORMALIZED_FINDING_LINE_RE = new RegExp(
+  `^(\\s*(?:[-*+]\\s+|\\d+[.)]\\s+)?\\**\\[)(${FINDING_CATEGORIES.join("|")})(\\]\\**\\s*)(.+)$`,
+  "i"
+);
+const FINDING_ID_TAG_RE = /^\[FINDING_ID:\s*(F-[a-z0-9][a-z0-9-]{0,79})\]\s*(.*)$/i;
+
+function normalizedFindingEntries(content, { allProtocolBlocks = false } = {}) {
   const findings = [];
   // Bullets, numbering, and bold wrapping are all accepted around the category.
   //
@@ -1006,10 +1116,6 @@ export function extractNormalizedFindings(content) {
   // findings index for a panel that had raised a critical finding, plus an empty
   // priorFindings list, so later passes were told nothing had been filed and
   // duplicated each other.
-  const categoryRe = new RegExp(
-    `^\\s*(?:[-*+]\\s+|\\d+[.)]\\s+)?\\**\\[(${FINDING_CATEGORIES.join("|")})\\]\\**\\s*(.+)$`,
-    "i"
-  );
   // Noise-masked ONLY above the findings heading; everything below it is parsed
   // as written.
   //
@@ -1027,20 +1133,116 @@ export function extractNormalizedFindings(content) {
   // The split resolves both: illustrative examples live in prose above the
   // heading, real findings live under it.
   const lines = String(content || "").split("\n");
-  const headingAt = lines.findIndex((line) => /^\s*#*\s*Normalized Findings\b/i.test(line));
-  const readable = gateReadableLineMask(content || "");
-  for (const [i, line] of lines.entries()) {
-    const belowHeading = headingAt >= 0 && i > headingAt;
-    if (!belowHeading && !readable[i]) continue;
-    const match = line.match(categoryRe);
+  const protocolLineIndexes = normalizedFindingsLineIndexes(content, {
+    allProtocolBlocks,
+  });
+  // Historical reports without the required heading remain readable. New
+  // runner output always has the heading, and approval-time validation treats
+  // malformed protocol blocks separately.
+  const candidateLineIndexes = protocolLineIndexes.length
+    ? protocolLineIndexes
+    : gateReadableLineMask(content || "")
+        .map((isReadable, index) => (isReadable ? index : null))
+        .filter((index) => index != null);
+
+  for (const i of [...new Set(candidateLineIndexes)]) {
+    const line = lines[i];
+    const match = line.match(NORMALIZED_FINDING_LINE_RE);
     if (!match) continue;
+    const tagged = match[4].trim().match(FINDING_ID_TAG_RE);
+    const id = tagged?.[1] && isValidFindingId(tagged[1]) ? tagged[1] : null;
+    const text = tagged ? tagged[2].trim() : match[4].trim();
+    if (!text) continue;
     findings.push({
-      category: match[1].toUpperCase(),
-      text: match[2].trim(),
+      ...(id ? { id } : {}),
+      category: match[2].toUpperCase(),
+      text,
       line: line.trim(),
+      lineIndex: i,
+      prefix: match[1],
+      categorySuffix: match[3],
     });
   }
   return findings;
+}
+
+export function extractNormalizedFindings(content) {
+  return normalizedFindingEntries(content).map(
+    ({ lineIndex: _lineIndex, prefix: _prefix, categorySuffix: _categorySuffix, ...finding }) =>
+      finding
+  );
+}
+
+/**
+ * Stamp normalized findings with stable runner-owned IDs before persistence.
+ *
+ * Specialists never get to choose their own identity. Consolidation and
+ * follow-up may carry an ID only when it already exists in the durable ledger;
+ * everything else receives a deterministic phase-local ID.
+ */
+export function ensureFindingIds(
+  content,
+  { prefix = "finding", allowedExistingIds = [], preserveExisting = true } = {}
+) {
+  const text = String(content || "");
+  const lines = text.split("\n");
+  const entries = normalizedFindingEntries(text);
+  const selectedLineIndexes = new Set(entries.map((entry) => entry.lineIndex));
+  const protocolAmbiguities = normalizedFindingEntries(text, {
+    allProtocolBlocks: true,
+  })
+    .filter(
+      (entry) =>
+        !selectedLineIndexes.has(entry.lineIndex) &&
+        isBlockingFindingCategory(entry.category)
+    )
+    .map(({ category, text: findingText, line }) => ({
+      category,
+      text: findingText,
+      line,
+      reason: "blocking_finding_in_non_authoritative_normalized_block",
+    }));
+  const allowed = new Set(
+    Array.from(allowedExistingIds || []).filter((id) => isValidFindingId(id))
+  );
+  const used = new Set();
+  const reserved = new Set(allowed);
+  const safePrefix = String(prefix || "finding")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "finding";
+  let ordinal = 0;
+
+  for (const entry of entries) {
+    let id =
+      preserveExisting &&
+      entry.id &&
+      allowed.has(entry.id) &&
+      !used.has(entry.id)
+        ? entry.id
+        : null;
+    while (!id) {
+      ordinal++;
+      const candidate = `F-${safePrefix}-${ordinal}`;
+      if (isValidFindingId(candidate) && !reserved.has(candidate) && !used.has(candidate)) {
+        id = candidate;
+      }
+    }
+    used.add(id);
+    lines[entry.lineIndex] =
+      `${entry.prefix}${entry.category}${entry.categorySuffix}` +
+      `[FINDING_ID: ${id}] ${entry.text}`;
+  }
+
+  const annotated = lines.join("\n");
+  return {
+    text: annotated,
+    findings: normalizedFindingEntries(annotated).map(
+      ({ lineIndex: _lineIndex, prefix: _prefix, categorySuffix: _suffix, ...finding }) =>
+        finding
+    ),
+    protocol_ambiguities: protocolAmbiguities,
+  };
 }
 
 /**
@@ -1095,12 +1297,14 @@ function neutralizeVerdicts(source, readable) {
         );
       }
 
-      // A bare `LGTM` approves a session on its own, with no footer anywhere, so
-      // it has to go too. `APPROVE` is deliberately left alone: it only counts
-      // for plan/spec review dialogs, never for a PR panel, and suppressing it
-      // would rewrite ordinary prose like "Approve this once the test lands".
-      const legacy = matchLegacyApprovalLine(line, "LGTM");
-      if (legacy) {
+      // Bare legacy approval signals count too. The postcondition below asks the
+      // gate in its strict mode (`allowsApproveVerdict: true`), so APPROVE must be
+      // handled here as well as LGTM. Doing it in this precise pass preserves the
+      // rest of a benign sentence such as "Approve after fixing status"; the old
+      // blunt fallback missed APPROVE itself and rewrote the later word `status`.
+      for (const token of ["LGTM", "APPROVE"]) {
+        const legacy = matchLegacyApprovalLine(line, token);
+        if (!legacy) continue;
         suppressed++;
         return (
           `${line.slice(0, legacy.index)}ASPECT_NOTE (approval suppressed — a specialist pass may not resolve the review)` +
@@ -1113,6 +1317,93 @@ function neutralizeVerdicts(source, readable) {
     .join("\n");
 
   return { text, suppressed };
+}
+
+/** The gate's sequential markdown excision, with each surviving code unit mapped back. */
+function stripGateNoiseWithSourceMap(source) {
+  let chars = String(source ?? "").split("");
+  let sourceOffsets = chars.map((_, index) => index);
+
+  // Keep this order identical to shared.mjs's stripMarkdownNoise(). The source
+  // map is why this cannot use gateReadableLineMask: a noise block can split a
+  // token (`VERD<!--x-->ICT`) or splice two lines, and a boolean per original
+  // line cannot identify which original byte must be neutralized.
+  for (const pattern of [/```[\s\S]*?```/g, /~~~[\s\S]*?~~~/g, /<!--[\s\S]*?-->/g]) {
+    const text = chars.join("");
+    const nextChars = [];
+    const nextOffsets = [];
+    let cursor = 0;
+    pattern.lastIndex = 0;
+    for (const match of text.matchAll(pattern)) {
+      const start = match.index;
+      const end = start + match[0].length;
+      // Do not spread a report-sized slice into push(): partner reports may be
+      // close to the 2 MiB message limit, which exceeds V8's argument-count
+      // limit and would make the sanitizer itself throw on a valid report.
+      for (let i = cursor; i < start; i++) {
+        nextChars.push(chars[i]);
+        nextOffsets.push(sourceOffsets[i]);
+      }
+      cursor = end;
+    }
+    for (let i = cursor; i < chars.length; i++) {
+      nextChars.push(chars[i]);
+      nextOffsets.push(sourceOffsets[i]);
+    }
+    chars = nextChars;
+    sourceOffsets = nextOffsets;
+  }
+
+  return { text: chars.join(""), sourceOffsets };
+}
+
+/**
+ * Neutralize verdicts that become visible only AFTER the gate removes noise.
+ *
+ * This is deliberately a mapping operation instead of another widening regex.
+ * `VERD<!--x-->ICT`, `VERD```x```ICT`, and `LG<!--x-->TM` contain no raw verdict
+ * token for a regex to replace, yet the gate reconstructs one by excision. The
+ * map lets us insert a visible prefix before the first source letter of exactly
+ * the reconstructed signal, without rewriting unrelated words elsewhere.
+ */
+function neutralizeNoiseSplicedVerdicts(source) {
+  const original = String(source ?? "");
+  const { text: searchable, sourceOffsets } = stripGateNoiseWithSourceMap(original);
+  const insertions = new Set();
+  let lineStart = 0;
+
+  for (const line of searchable.split("\n")) {
+    const ignored = line.trimStart().startsWith(">") || /^(?: {4,}|\t)/.test(line);
+    if (!ignored) {
+      const signals = [
+        matchVerdictLine(line)?.match ?? null,
+        matchLegacyApprovalLine(line, "LGTM"),
+        matchLegacyApprovalLine(line, "APPROVE"),
+      ].filter(Boolean);
+
+      for (const signal of signals) {
+        const start = lineStart + signal.index;
+        const end = start + signal[0].length;
+        for (let i = start; i < end; i++) {
+          const sourceIndex = sourceOffsets[i];
+          if (Number.isSafeInteger(sourceIndex) && /[A-Za-z]/.test(original[sourceIndex])) {
+            insertions.add(sourceIndex);
+            break;
+          }
+        }
+      }
+    }
+    lineStart += line.length + 1;
+  }
+
+  if (insertions.size === 0) return { text: original, suppressed: 0 };
+
+  let text = original;
+  const marker = "ASPECT_NOTE (approval suppressed — a specialist pass may not resolve the review) ";
+  for (const offset of [...insertions].sort((a, b) => b - a)) {
+    text = text.slice(0, offset) + marker + text.slice(offset);
+  }
+  return { text, suppressed: insertions.size };
 }
 
 /**
@@ -1133,11 +1424,11 @@ function neutralizeVerdicts(source, readable) {
  * a pattern was another guess at it.
  *
  * So: do the precise, mask-guided pass, then ASK THE GATE whether a verdict
- * survived. If one did, fall back to neutralizing on the raw text with no mask
- * at all. The fallback over-suppresses -- it can rewrite a line inside a code
- * fence, which is the cosmetic damage the mask exists to avoid -- but it fires
- * only when the alternative is a specialist silently resolving the review, and
- * it reports itself so the trade is visible rather than assumed.
+ * survived. If one did, reproduce the gate's sequential excision with a source
+ * map and insert a marker immediately before the reconstructed signal. That
+ * changes only the text the gate actually acts on. A final indentation fallback
+ * exists for future signal shapes and fires only when the alternative is a
+ * specialist silently resolving the review.
  *
  * Returns { text, suppressed, fellBack }.
  */
@@ -1152,42 +1443,35 @@ export function suppressVerdictLines(response) {
     return { ...masked, fellBack: false };
   }
 
-  // Last resort: neutralize the verdict TOKENS wherever they appear, not just
-  // where a line starts with one.
-  //
-  // A per-line pass cannot help here by construction. In every surviving case
-  // the verdict is not at the start of any original line -- it becomes one only
-  // after the gate excises a preceding noise span, as in
-  // `<!-- note -->VERDICT: APPROVE`, or is spliced together from two different
-  // lines. There is no single line to rewrite, so the only thing that reliably
-  // stops the gate reading it is removing the token itself.
-  let suppressed = masked.suppressed;
-  const text = masked.text
-    // The bare TOKEN, with no colon required.
-    //
-    // Requiring a colon left a hole the two earlier passes also miss: a noise
-    // span sitting INSIDE the token run, which excision repairs for the gate.
-    // `VERDICT<!-- draft -->: APPROVE` has no colon after VERDICT in the source
-    // and does have one in what the gate reads. Since this is the last resort --
-    // it only runs when a verdict has already survived two more careful passes
-    // -- it neutralizes the token itself and accepts rewriting the bare word
-    // "status" in prose as the price.
-    .replace(/\b(REVIEW[_\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)\b/gi, () => {
-      suppressed++;
-      return "ASPECT_NOTE (verdict suppressed — a specialist pass may not resolve the review):";
-    })
-    .replace(/\bLGTM\b/gi, () => {
-      suppressed++;
-      return "ASPECT_NOTE (approval suppressed)";
-    });
+  const mapped = neutralizeNoiseSplicedVerdicts(masked.text);
+  const suppressed = masked.suppressed + mapped.suppressed;
+  if (!extractReviewVerdict(mapped.text, { allowsApproveVerdict: true })) {
+    return { text: mapped.text, suppressed, fellBack: true };
+  }
 
-  return { text, suppressed, fellBack: true };
+  // Fail closed if shared.mjs ever learns a new signal shape this mapping does
+  // not yet expose. Indentation is the gate's own documented noise convention,
+  // so this guarantees a specialist cannot resolve the panel. It preserves the
+  // bytes for the human/consolidator and extractNormalizedFindings intentionally
+  // still reads the exact final findings section even when a model fenced or
+  // indented it. This branch should be exceptional and is surfaced by fellBack.
+  const text = mapped.text
+    .split("\n")
+    .map((line) => `    ${line}`)
+    .join("\n");
+  return { text, suppressed: suppressed + 1, fellBack: true };
 }
 
 /** Read the ASPECT_RESULT line a specialist pass is required to emit. */
 export function extractAspectResult(content) {
-  const match = String(content || "").match(
-    /^\s*ASPECT_RESULT:\s*(CLEAN|FINDINGS)\b/im
-  );
-  return match ? match[1].toUpperCase() : null;
+  if (!hasBalancedProtocolNoise(content)) return null;
+  const lines = String(content || "").split("\n");
+  const readable = protocolReadableLineMask(content || "");
+  const matches = [];
+  for (const [index, line] of lines.entries()) {
+    if (!readable[index]) continue;
+    const match = line.match(/^\s*ASPECT_RESULT:\s*(CLEAN|FINDINGS)\s*$/i);
+    if (match) matches.push(match[1].toUpperCase());
+  }
+  return matches.length === 1 ? matches[0] : null;
 }

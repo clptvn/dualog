@@ -20,10 +20,12 @@ import {
 import {
   isPartnerTurnCancelledError,
   isPartnerTerminalFailureError,
+  resolvePartnerRuntimeContext,
   runPartnerCommand,
 } from "./partner-invocation.mjs";
 import {
   markSessionRunnerExited,
+  readRunnerRuntimeDecision,
   readRunnerToken,
 } from "./runner-lifecycle.mjs";
 import { tryGetAdapter } from "./adapters/registry.mjs";
@@ -48,6 +50,8 @@ const DEFAULT_PARTNER_TIMEOUT_MS = 15 * 60 * 1000;
 const PARTNER_TIMEOUT_MS =
   Math.max(1000, parseInt(process.argv[11], 10)) || DEFAULT_PARTNER_TIMEOUT_MS;
 const RUNNER_TOKEN = readRunnerToken();
+const PREFLIGHT_RUNTIME = readRunnerRuntimeDecision();
+const PREFLIGHT_ENGINE = PREFLIGHT_RUNTIME?.engine ?? null;
 // Read as a flag, not by index: the preflight already decided this, and the
 // turn must validate the model on the same terms or it will reject an id the
 // start call deliberately allowed.
@@ -209,7 +213,13 @@ How to use the budget well:
   return block;
 }
 
-function buildPartnerPrompt(problem, messages, partnerTurns, status) {
+function buildPartnerPrompt(
+  problem,
+  messages,
+  partnerTurns,
+  status,
+  partnerProjectPath = projectPath
+) {
   let conversationMessages = messages;
   if (messages.length > MAX_CONVERSATION_MESSAGES) {
     const first = messages.slice(0, 2);
@@ -237,7 +247,7 @@ ${problem}
 
 ${buildCurrentSubjectBlock(status)}
 ## Project Directory
-${projectPath}
+${partnerProjectPath}
 
 You can read any files in this directory to understand the code.
 
@@ -281,7 +291,7 @@ Keep changes scoped to your assigned frontend/UI work. Do not rewrite backend, d
 ## File References (IMPORTANT)
 At the very end of your response, on its own line, list every source file you referenced or made claims about using exactly this format:
 REFERENCED_FILES: path/to/file1.ext, path/to/file2.ext
-Use paths relative to the project root (${projectPath}). This line is machine-parsed to ensure your discussion partner verifies your claims by reading the actual code. If you made no file-specific claims, omit this line entirely.
+Use paths relative to the project root (${partnerProjectPath}). This line is machine-parsed to ensure your discussion partner verifies your claims by reading the actual code. If you made no file-specific claims, omit this line entirely.
 
 Respond with ONLY your message (plus the REFERENCED_FILES line). Do NOT wrap it in any JSON or metadata.`;
 
@@ -291,6 +301,24 @@ Respond with ONLY your message (plus the REFERENCED_FILES line). Do NOT wrap it 
 async function main() {
   const problem = fs.readFileSync(PROBLEM_PATH, "utf-8");
   const status = readSessionStatus();
+  // Resolve the engine and its view of the project once, then reuse that exact
+  // context for every turn. On macOS/Linux (and native Windows headless) this
+  // is the original path. A WSL tmux partner receives the Linux path instead,
+  // without rewriting paths that may legitimately appear inside the problem or
+  // conversation text.
+  const runtimeContext = await resolvePartnerRuntimeContext({
+    partnerAgent: PARTNER_AGENT,
+    partnerCommand,
+    projectPath,
+    requestedEngine: PREFLIGHT_ENGINE,
+    pinnedTmuxTransport: PREFLIGHT_RUNTIME?.tmuxTransport ?? null,
+    pinnedTmuxDistro: PREFLIGHT_RUNTIME?.tmuxDistro ?? null,
+    pinnedTmuxLauncher: PREFLIGHT_RUNTIME?.tmuxLauncher ?? null,
+    pinnedTmuxControlBinary: PREFLIGHT_RUNTIME?.tmuxControlBinary ?? null,
+    pinnedTmuxSocketName: PREFLIGHT_RUNTIME?.tmuxSocketName ?? null,
+    log,
+  });
+  const partnerProjectPath = runtimeContext.partnerProjectPath;
 
   let lastProcessedId = 0;
   let partnerTurns = 0;
@@ -301,6 +329,9 @@ async function main() {
 
   log("=== Dialog runner started ===");
   log(`Project: ${projectPath}`);
+  if (partnerProjectPath !== projectPath) {
+    log(`Partner project: ${partnerProjectPath}`);
+  }
   log(`Host agent: ${HOST_DISPLAY}`);
   log(`Partner agent: ${PARTNER_DISPLAY}`);
   log(`Partner command: ${partnerCommand}`);
@@ -345,7 +376,13 @@ async function main() {
       } catch {}
 
       try {
-        const prompt = buildPartnerPrompt(problem, messages, partnerTurns, status);
+        const prompt = buildPartnerPrompt(
+          problem,
+          messages,
+          partnerTurns,
+          status,
+          partnerProjectPath
+        );
         const response = await runPartnerCommand({
           partnerAgent: PARTNER_AGENT,
           partnerCommand,
@@ -360,6 +397,8 @@ async function main() {
           tempPrefix: `${PARTNER_AGENT}-dialog`,
           responseInstruction: "Respond with your analysis.",
           sessionDir,
+          engine: PREFLIGHT_ENGINE,
+          runtimeContext,
         });
 
         appendMessage(sessionDir, PARTNER_AGENT, response);

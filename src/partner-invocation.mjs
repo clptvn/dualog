@@ -8,17 +8,30 @@ import {
   buildTmuxSessionName,
   captureTmuxPane,
   inspectPartnerTerminal,
-  isTmuxAvailable,
+  prepareTmuxInvocation,
+  probeTmuxAvailability,
   probeTmuxSession,
+  probeWslPaneProcess,
+  probeWslPartnerCommand,
   readTerminalState,
+  resolveTmuxProjectContext,
+  resolveTmuxRouteForPaths,
+  resolveWslLoginShell,
+  resolveWslRouteDistro,
+  seedWslCodexAuth,
+  sendKeyToTmux,
   sendTextToTmux,
   startTmuxSession,
   terminateTmuxSession,
+  tmuxPaneProcessStartTime,
+  tmuxRoute,
+  translateTmuxPath,
   writeTerminalState,
 } from "./tmux-runtime.mjs";
 import { buildInvocationFromAdapter } from "./adapters/argv.mjs";
 import {
   allocateLease,
+  leasePath,
   releaseLease,
   transitionLease,
 } from "./runtime-lease.mjs";
@@ -34,7 +47,7 @@ import {
   buildBootstrapPrompt,
   readCompletion,
 } from "./engines/completion.mjs";
-import { resolveEngine } from "./engines/index.mjs";
+import { resolveEngine, resolveRunnableEngine } from "./engines/index.mjs";
 import { runHeadlessTurn } from "./engines/headless.mjs";
 
 const VALID_TOOL_PROFILES = new Set(["read", "implementation"]);
@@ -54,6 +67,7 @@ const TERMINAL_FAILURE_CHECK_INTERVAL_MS = parsePositiveInt(
   envWithAliases(["DUALOG_TERMINAL_FAILURE_CHECK_MS", "CODEX_DIALOG_TERMINAL_FAILURE_CHECK_MS"]),
   5000
 );
+const RESOLVED_RUNTIME_CONTEXTS = new WeakSet();
 
 export class PartnerTurnCancelledError extends Error {
   constructor(message) {
@@ -160,14 +174,313 @@ function needsRuntimeArtifacts(adapter) {
  */
 const PARTNER_EXIT_GRACE_MS = 3000;
 
-/** Poll until a process is gone, or the budget runs out. Never throws. */
-async function waitForProcessExit(pid, budgetMs) {
+function rememberRuntimeContext(value) {
+  const frozen = Object.freeze(value);
+  RESOLVED_RUNTIME_CONTEXTS.add(frozen);
+  return frozen;
+}
+
+/**
+ * Resolve engine and partner-visible project path as one immutable decision.
+ * Prompt owners pass this same object into runPartnerCommand, which prevents a
+ * Windows headless fallback from receiving WSL paths and prevents a WSL turn
+ * from being re-routed to a different distribution after its prompt is built.
+ */
+export async function resolvePartnerRuntimeContext(
+  {
+    partnerAgent,
+    partnerCommand,
+    projectPath,
+    requestedEngine = null,
+    pinnedTmuxTransport = null,
+    pinnedTmuxDistro = null,
+    pinnedTmuxLauncher = null,
+    pinnedTmuxControlBinary = null,
+    pinnedTmuxSocketName = null,
+    log,
+  },
+  {
+    resolveEngineFn = resolveEngine,
+    resolveRunnableEngineFn = resolveRunnableEngine,
+    tmuxRouteFn = tmuxRoute,
+    resolveTmuxProjectContextFn = resolveTmuxProjectContext,
+    resolveWslLoginShellFn = resolveWslLoginShell,
+    resolveWslRouteDistroFn = resolveWslRouteDistro,
+    platform = process.platform,
+  } = {}
+) {
+  if (
+    pinnedTmuxTransport !== null &&
+    pinnedTmuxTransport !== "local" &&
+    pinnedTmuxTransport !== "wsl"
+  ) {
+    throw new Error(`Unknown pinned tmux transport ${JSON.stringify(pinnedTmuxTransport)}`);
+  }
+  if (pinnedTmuxTransport === "wsl") {
+    if (typeof pinnedTmuxDistro !== "string" || !pinnedTmuxDistro.trim()) {
+      throw new Error("A pinned WSL runtime must name its distribution");
+    }
+    pinnedTmuxDistro = pinnedTmuxDistro.trim();
+  } else if (pinnedTmuxDistro !== null) {
+    throw new Error("A pinned WSL distribution requires the WSL tmux transport");
+  }
+
+  const finalize = (context) => {
+    if (requestedEngine !== null && context.engine !== requestedEngine) {
+      throw new Error(
+        `Preflight selected engine ${JSON.stringify(requestedEngine)}, but the runner ` +
+          `resolved ${JSON.stringify(context.engine)}`
+      );
+    }
+    if (
+      pinnedTmuxTransport !== null &&
+      context.tmuxTransport !== pinnedTmuxTransport
+    ) {
+      throw new Error(
+        `Preflight selected ${pinnedTmuxTransport} tmux, but the runner resolved ` +
+          `${context.tmuxTransport ?? "no tmux transport"}`
+      );
+    }
+    if (
+      pinnedTmuxTransport === "wsl" &&
+      String(context.tmuxDistro).toLocaleLowerCase("en-US") !==
+        pinnedTmuxDistro.toLocaleLowerCase("en-US")
+    ) {
+      throw new Error(
+        `Preflight selected WSL distribution ${JSON.stringify(pinnedTmuxDistro)}, ` +
+          `but the runner resolved ${JSON.stringify(context.tmuxDistro)}`
+      );
+    }
+    const normalizeCommand = (value, transport, { hostLauncher = false } = {}) => {
+      const normalized = String(value ?? "").trim();
+      const isWindowsHostCommand =
+        platform === "win32" &&
+        ((hostLauncher && transport === "wsl") || transport === "local");
+      return isWindowsHostCommand
+        ? normalized.replace(/\//gu, "\\").toLocaleLowerCase("en-US")
+        : normalized;
+    };
+    for (const [label, pinned, resolved, hostLauncher] of [
+      ["launcher", pinnedTmuxLauncher, context.tmuxLauncher, true],
+      ["control binary", pinnedTmuxControlBinary, context.tmuxControlBinary, false],
+    ]) {
+      if (
+        pinned !== null &&
+        normalizeCommand(pinned, context.tmuxTransport, { hostLauncher }) !==
+          normalizeCommand(resolved, context.tmuxTransport, { hostLauncher })
+      ) {
+        throw new Error(
+          `Preflight selected tmux ${label} ${JSON.stringify(pinned)}, but the runner resolved ${JSON.stringify(resolved)}`
+        );
+      }
+    }
+    if (
+      pinnedTmuxSocketName !== null &&
+      pinnedTmuxSocketName !== context.tmuxSocketName
+    ) {
+      throw new Error(
+        `Preflight selected tmux socket ${JSON.stringify(pinnedTmuxSocketName)}, but the runner resolved ${JSON.stringify(context.tmuxSocketName)}`
+      );
+    }
+    return rememberRuntimeContext(context);
+  };
+
+  const normalizedAgent = normalizeAgent(partnerAgent, "codex");
+  const adapter = getAdapter(normalizedAgent);
+  const nominalEngine = resolveEngineFn(adapter, {
+    requested: requestedEngine,
+    log: undefined,
+  });
+
+  if (nominalEngine !== "tmux-interactive") {
+    const engine = await resolveRunnableEngineFn(adapter, {
+      requested: requestedEngine,
+      partnerCommand,
+      log,
+    });
+    return finalize({
+      engine,
+      adapterId: adapter.id,
+      partnerAgent: normalizedAgent,
+      partnerCommand,
+      requestedEngine,
+      hostProjectPath: projectPath,
+      partnerProjectPath: projectPath,
+      tmuxTransport: null,
+      tmuxDistro: null,
+      tmuxRoute: null,
+      tmuxLauncher: null,
+      tmuxControlBinary: null,
+      tmuxSocketName: null,
+      toPartnerPath: async (value) => value,
+    });
+  }
+
+  let route = tmuxRouteFn();
+  // Keep the executable route from the runner's current trusted environment;
+  // only the namespace decision crosses the process boundary. A local route
+  // intentionally stays local in resolveTmuxRouteForPaths(), so local vs WSL is
+  // real environment drift and must fail below rather than being reconstructed
+  // with a possibly native-only tmux override.
+  if (pinnedTmuxTransport === "wsl" && route.transport === "wsl") {
+    route = { ...route, distro: pinnedTmuxDistro };
+  }
+  route = resolveTmuxRouteForPaths(route, [projectPath, partnerCommand]);
+  // Validate only after applying the same path-aware inference as preflight.
+  // A pinned local decision cannot safely recreate an earlier executable path,
+  // so a genuine local -> WSL route change remains a hard revalidation error.
+  if (pinnedTmuxTransport !== null && route.transport !== pinnedTmuxTransport) {
+    throw new Error(
+      `Preflight selected ${pinnedTmuxTransport} tmux, but the runner environment ` +
+        `now resolves ${route.transport}`
+    );
+  }
+  try {
+    route = await resolveWslRouteDistroFn(route);
+  } catch (routeError) {
+    // An automatic interactive preference is allowed to fall back to the
+    // adapter's native headless engine when WSL cannot even identify a distro.
+    // An explicit tmux request remains a hard contract.
+    if (requestedEngine === "tmux-interactive") throw routeError;
+    const fallbackEngine = await resolveRunnableEngineFn(adapter, {
+      requested: requestedEngine,
+      partnerCommand,
+      log,
+      tmuxRouteFn: () => route,
+      probeTmuxAvailabilityFn: async () => "missing",
+      probeWslPartnerCommandFn: async () => "unavailable",
+    });
+    if (fallbackEngine !== "headless") throw routeError;
+    return finalize({
+      engine: fallbackEngine,
+      adapterId: adapter.id,
+      partnerAgent: normalizedAgent,
+      partnerCommand,
+      requestedEngine,
+      hostProjectPath: projectPath,
+      partnerProjectPath: projectPath,
+      tmuxTransport: null,
+      tmuxDistro: null,
+      tmuxRoute: null,
+      tmuxLauncher: null,
+      tmuxControlBinary: null,
+      tmuxSocketName: null,
+      toPartnerPath: async (value) => value,
+    });
+  }
+  if (route.transport === "wsl") {
+    route = {
+      ...route,
+      loginShell: await resolveWslLoginShellFn(route),
+    };
+  }
+  const engine = await resolveRunnableEngineFn(adapter, {
+    requested: requestedEngine,
+    partnerCommand,
+    log,
+    tmuxRouteFn: () => route,
+    probeTmuxAvailabilityFn: () => probeTmuxAvailability({ route }),
+    probeWslPartnerCommandFn: (command, versionArgs) =>
+      probeWslPartnerCommand(command, versionArgs, { route }),
+  });
+  if (engine !== "tmux-interactive") {
+    return finalize({
+      engine,
+      adapterId: adapter.id,
+      partnerAgent: normalizedAgent,
+      partnerCommand,
+      requestedEngine,
+      hostProjectPath: projectPath,
+      partnerProjectPath: projectPath,
+      tmuxTransport: null,
+      tmuxDistro: null,
+      tmuxRoute: null,
+      tmuxLauncher: null,
+      tmuxControlBinary: null,
+      tmuxSocketName: null,
+      toPartnerPath: async (value) => value,
+    });
+  }
+
+  const projectContext = await resolveTmuxProjectContextFn(projectPath, { route });
+  return finalize({
+    engine,
+    adapterId: adapter.id,
+    partnerAgent: normalizedAgent,
+    partnerCommand,
+    requestedEngine,
+    ...projectContext,
+    toPartnerPath: (value) =>
+      translateTmuxPath(value, { route: projectContext.tmuxRoute }),
+  });
+}
+
+function validatedRuntimeContext(
+  runtimeContext,
+  { adapterId, partnerAgent, partnerCommand, projectPath, requestedEngine }
+) {
+  if (!RESOLVED_RUNTIME_CONTEXTS.has(runtimeContext)) {
+    throw new Error("runtimeContext must come from resolvePartnerRuntimeContext()");
+  }
+  if (
+    runtimeContext.adapterId !== adapterId ||
+    runtimeContext.partnerAgent !== partnerAgent ||
+    runtimeContext.partnerCommand !== partnerCommand ||
+    runtimeContext.hostProjectPath !== projectPath ||
+    runtimeContext.requestedEngine !== requestedEngine
+  ) {
+    throw new Error("runtimeContext does not match this partner invocation");
+  }
+  return runtimeContext;
+}
+
+function promptWithRuntimePathMapping(prompt, runtimeContext) {
+  if (
+    runtimeContext.tmuxTransport !== "wsl" ||
+    runtimeContext.hostProjectPath === runtimeContext.partnerProjectPath
+  ) {
+    return prompt;
+  }
+  const distro = runtimeContext.tmuxDistro
+    ? ` distribution ${JSON.stringify(runtimeContext.tmuxDistro)}`
+    : "";
+  return [
+    "[Dualog runtime path mapping]",
+    `This partner runs inside WSL${distro}. When this task names the host project path ${JSON.stringify(runtimeContext.hostProjectPath)}, use the partner-visible path ${JSON.stringify(runtimeContext.partnerProjectPath)} for shell commands and file access.`,
+    "[/Dualog runtime path mapping]",
+    "",
+    prompt,
+  ].join("\n");
+}
+
+/** Probe one pane PID in the namespace recorded on its handle. */
+export function probePartnerPaneProcess(
+  handle,
+  {
+    probeNativeProcessFn = probeProcess,
+    probeWslPaneProcessFn = probeWslPaneProcess,
+  } = {}
+) {
+  const pid = handle?.panePid;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return "invalid";
+  if (handle.tmuxTransport === "wsl") {
+    return probeWslPaneProcessFn(pid, handle.paneStartedAt ?? null, {
+      transport: "wsl",
+      distro: handle.tmuxDistro ?? null,
+      route: handle.tmuxRoute ?? null,
+    });
+  }
+  return probeNativeProcessFn(pid);
+}
+
+/** Poll until a pane process is gone, or the budget runs out. Never throws. */
+export async function waitForPartnerPaneExit(handle, budgetMs, options = {}) {
   const deadline = Date.now() + budgetMs;
   while (Date.now() < deadline) {
-    if (probeProcess(pid) === "absent") return true;
+    if (probePartnerPaneProcess(handle, options) === "absent") return true;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  return probeProcess(pid) === "absent";
+  return probePartnerPaneProcess(handle, options) === "absent";
 }
 
 /**
@@ -203,6 +516,7 @@ export async function runPartnerCommand({
   responseInstruction,
   sessionDir,
   engine: requestedEngine = null,
+  runtimeContext = null,
   // Decided by the start-tool preflight and carried through the runner. Without
   // it the turn re-validates on stricter terms than the start call used and
   // rejects a model the caller explicitly allowed.
@@ -218,8 +532,6 @@ export async function runPartnerCommand({
   }
 
   const resolvedAdapter = getAdapter(normalizedAgent);
-  const engine = resolveEngine(resolvedAdapter, { requested: requestedEngine, log });
-
   const turnId = `${tempPrefix || normalizedAgent}-${Date.now()}-${crypto
     .randomBytes(4)
     .toString("hex")}`;
@@ -236,14 +548,24 @@ export async function runPartnerCommand({
     fn: "runPartnerCommand turn directory",
   });
 
-  // Only now: whether tmux happens to be installed is an ENVIRONMENT question,
-  // and it used to be asked first -- so on a machine without tmux an unmanaged
-  // session directory was refused with "tmux is required" instead of the
-  // containment error, and the boundary was effectively gated behind a probe.
-  // A security decision must not depend on what is on PATH.
-  if (engine === "tmux-interactive" && !(await isTmuxAvailable())) {
-    throw new Error("tmux is required for interactive partner sessions but was not found on PATH");
-  }
+  // Runtime availability is deliberately checked after containment. Whether
+  // tmux/WSL is installed must not decide if an unsafe session path is refused.
+  const selectedRuntimeContext = runtimeContext
+    ? validatedRuntimeContext(runtimeContext, {
+        adapterId: resolvedAdapter.id,
+        partnerAgent: normalizedAgent,
+        partnerCommand,
+        projectPath,
+        requestedEngine,
+      })
+    : await resolvePartnerRuntimeContext({
+        partnerAgent: normalizedAgent,
+        partnerCommand,
+        projectPath,
+        requestedEngine,
+        log,
+      });
+  const engine = selectedRuntimeContext.engine;
 
   fs.mkdirSync(turnDir, { recursive: true });
 
@@ -312,12 +634,20 @@ export async function runPartnerCommand({
       path.basename(sessionDir),
       turnId
     );
+    const [partnerPromptPath, partnerResultPath, partnerDonePath] = await Promise.all(
+      [promptPath, resultPath, donePath].map((value) =>
+        selectedRuntimeContext.toPartnerPath(value)
+      )
+    );
+    const partnerProjectPath = selectedRuntimeContext.partnerProjectPath;
+    const partnerPrompt = promptWithRuntimePathMapping(prompt, selectedRuntimeContext);
+    if (partnerPrompt !== prompt) fs.writeFileSync(promptPath, partnerPrompt);
     const bootstrap = buildBootstrapPrompt({
       partnerDisplay,
-      promptPath,
-      resultPath,
-      donePath,
-      projectPath,
+      promptPath: partnerPromptPath,
+      resultPath: partnerResultPath,
+      donePath: partnerDonePath,
+      projectPath: partnerProjectPath,
       responseInstruction,
     });
     // Whether the bootstrap goes in argv or gets pasted into the TUI is the
@@ -331,6 +661,8 @@ export async function runPartnerCommand({
     const discoveredModels = await resolveDiscoveryForValidation(adapter, {
       model,
       projectPath,
+      engine: "tmux-interactive",
+      tmuxRoute: selectedRuntimeContext.tmuxRoute,
       log,
     });
     // `projecting` is recorded BEFORE this call, not after it: building the
@@ -340,6 +672,7 @@ export async function runPartnerCommand({
     if (lease) transitionLease(lease, "projecting");
     const { command, args, env, usesInitialPrompt, notices } =
       buildInvocationFromAdapter(adapter, {
+        engine: selectedRuntimeContext.engine,
         partnerCommand,
         projectPath,
         sessionDir,
@@ -378,6 +711,47 @@ export async function runPartnerCommand({
           blocking.map((notice) => notice.message).join("; ")
       );
     }
+    const tmuxInvocation = await prepareTmuxInvocation(
+      {
+        cwd: projectPath,
+        command,
+        args,
+        env,
+      },
+      { route: selectedRuntimeContext.tmuxRoute }
+    );
+
+    // Native config remains authoritative. Only when its normal isolation pass
+    // found no Codex login do we ask the exact WSL distro selected above to copy
+    // ~/.codex/auth.json directly into the already-proven lease directory.
+    if (
+      adapter.id === "codex" &&
+      lease &&
+      tmuxInvocation.tmuxTransport === "wsl" &&
+      typeof env.CODEX_HOME === "string" &&
+      typeof tmuxInvocation.env.CODEX_HOME === "string"
+    ) {
+      const nativeCodexHome = leasePath(lease, env.CODEX_HOME, {
+        fn: "WSL Codex auth target",
+      });
+      const seed = await seedWslCodexAuth({
+        nativeCodexHome,
+        wslCodexHome: tmuxInvocation.env.CODEX_HOME,
+        route: tmuxInvocation.tmuxRoute,
+      });
+      if (
+        [
+          "wsl-auth-missing",
+          "wsl-auth-too-large",
+          "wsl-copy-failed",
+          "wsl-copy-unconfirmed",
+        ].includes(seed.reason)
+      ) {
+        log(
+          `Codex authentication was not available from the selected WSL distribution (${seed.reason}); the partner may request login`
+        );
+      }
+    }
     if (lease) transitionLease(lease, "ready");
 
     const timeoutHint =
@@ -390,9 +764,14 @@ export async function runPartnerCommand({
       display_name: partnerDisplay,
       session_name: sessionName,
       pane_target: `${sessionName}:0.0`,
-      cwd: projectPath,
-      command,
-      args,
+      tmux_transport: tmuxInvocation.tmuxTransport,
+      tmux_distro: tmuxInvocation.tmuxDistro,
+      tmux_launcher: tmuxInvocation.tmuxLauncher,
+      tmux_control_binary: tmuxInvocation.tmuxControlBinary,
+      tmux_socket_name: tmuxInvocation.tmuxSocketName,
+      cwd: tmuxInvocation.cwd,
+      command: tmuxInvocation.command,
+      args: tmuxInvocation.args,
       turn_dir: turnDir,
       prompt_path: promptPath,
       result_path: resultPath,
@@ -410,7 +789,7 @@ export async function runPartnerCommand({
 
     try {
       log(
-        `Invoking ${partnerDisplay} interactively via tmux session "${sessionName}" (prompt: ${prompt.length} chars, tool profile: ${normalizedToolProfile}, timeout hint: ${timeoutHint ? `${timeoutHint / 1000}s` : "none"})`
+        `Invoking ${partnerDisplay} interactively via ${tmuxInvocation.tmuxTransport === "wsl" ? "WSL tmux" : "tmux"} session "${sessionName}" (prompt: ${prompt.length} chars, tool profile: ${normalizedToolProfile}, timeout hint: ${timeoutHint ? `${timeoutHint / 1000}s` : "none"})`
       );
 
       // Recorded BEFORE the pane can exist. tmux session names are deterministic
@@ -420,31 +799,57 @@ export async function runPartnerCommand({
       // what to probe.
       if (lease) {
         transitionLease(lease, "spawning", {
-          consumer: { kind: "tmux", session_name: sessionName },
+          consumer: {
+            kind: "tmux",
+            session_name: sessionName,
+            tmux_transport: tmuxInvocation.tmuxTransport,
+            tmux_distro: tmuxInvocation.tmuxDistro,
+            tmux_launcher: tmuxInvocation.tmuxLauncher,
+            tmux_control_binary: tmuxInvocation.tmuxControlBinary,
+            tmux_socket_name: tmuxInvocation.tmuxSocketName,
+          },
         });
       }
       handle = await startTmuxSession({
         sessionName,
-        cwd: projectPath,
-        command,
-        args,
-        env,
+        cwd: tmuxInvocation.cwd,
+        command: tmuxInvocation.command,
+        args: tmuxInvocation.args,
+        env: tmuxInvocation.env,
+        route: tmuxInvocation.tmuxRoute,
+        socketName: tmuxInvocation.tmuxSocketName,
       });
       if (lease) {
+        const paneStartedAt = handle.panePid
+          ? handle.tmuxTransport === "wsl"
+            ? tmuxPaneProcessStartTime(handle.panePid, {
+                transport: handle.tmuxTransport,
+                distro: handle.tmuxDistro,
+                route: handle.tmuxRoute,
+              })
+            : processStartTime(handle.panePid)
+          : null;
+        handle.paneStartedAt = paneStartedAt;
         transitionLease(lease, "active", {
           // The pane's process as well as the pane. Releasing on the session alone
           // demonstrably reclaimed the home while the partner was still shutting
           // down, and it then recreated the directory to flush its cache.
           consumer: {
-          kind: "tmux",
-          session_name: sessionName,
-          pane_pid: handle.panePid ?? null,
-          // Distinguishes "we could not identify this pane" from "this record
-          // predates pane identities"; see probeConsumer.
-          pane_pid_unavailable: handle.panePidUnavailable === true,
-          // Qualifies the pid against reuse; see probeRecordedProcess.
-          pane_started_at: handle.panePid ? processStartTime(handle.panePid) : null,
-        },
+            kind: "tmux",
+            session_name: sessionName,
+            tmux_transport: handle.tmuxTransport,
+            tmux_distro: handle.tmuxDistro,
+            tmux_launcher: handle.tmuxLauncher,
+            tmux_control_binary: handle.tmuxControlBinary,
+            tmux_socket_name: handle.tmuxSocketName,
+            pane_pid: handle.panePid ?? null,
+            // Distinguishes "we could not identify this pane" from "this record
+            // predates pane identities"; see probeConsumer.
+            pane_pid_unavailable: handle.panePidUnavailable === true,
+            // Qualifies the pid against reuse; WSL PIDs are never probed as
+            // native Windows processes.
+            pane_started_at: paneStartedAt,
+          },
         });
       }
       state = writeTerminalState(
@@ -538,7 +943,7 @@ export async function runPartnerCommand({
       // alone.
       let partnerExited = true;
       if (lease && verdict === "absent" && handle?.panePid) {
-        partnerExited = await waitForProcessExit(handle.panePid, PARTNER_EXIT_GRACE_MS);
+        partnerExited = await waitForPartnerPaneExit(handle, PARTNER_EXIT_GRACE_MS);
       }
       if (partnerExited) {
         releaseLeaseQuietly(lease, log);
@@ -582,14 +987,38 @@ export async function runPartnerCommand({
       // with the error. Record it before releasing: without it the lease is judged
       // on the session name alone, and a session teardown does not prove the
       // process it ran has exited -- which is the whole reason pane_pid exists.
-      if (lease && !handle && err?.panePid) {
+      if (
+        lease &&
+        !handle &&
+        (err?.panePid || err?.panePidUnavailable === true)
+      ) {
         try {
+          const tmuxTransport = err.tmuxTransport ?? tmuxInvocation.tmuxTransport;
+          const tmuxDistro = err.tmuxDistro ?? tmuxInvocation.tmuxDistro;
+          const tmuxLauncher = err.tmuxLauncher ?? tmuxInvocation.tmuxLauncher;
+          const tmuxControlBinary =
+            err.tmuxControlBinary ?? tmuxInvocation.tmuxControlBinary;
+          const tmuxSocketName = err.tmuxSocketName ?? tmuxInvocation.tmuxSocketName;
+          const paneStartedAt =
+            tmuxTransport === "wsl"
+              ? tmuxPaneProcessStartTime(err.panePid, {
+                  transport: "wsl",
+                  distro: tmuxDistro,
+                  route: tmuxInvocation.tmuxRoute,
+                })
+              : processStartTime(err.panePid);
           transitionLease(lease, "spawning", {
             consumer: {
               kind: "tmux",
               session_name: err.sessionName,
+              tmux_transport: tmuxTransport,
+              tmux_distro: tmuxDistro,
+              tmux_launcher: tmuxLauncher,
+              tmux_control_binary: tmuxControlBinary,
+              tmux_socket_name: tmuxSocketName,
               pane_pid: err.panePid,
               pane_pid_unavailable: err.panePidUnavailable === true,
+              pane_started_at: paneStartedAt,
             },
           });
         } catch {
@@ -611,7 +1040,7 @@ export async function runPartnerCommand({
       // and tell the host the terminal is down -- the two things that must not
       // happen while a partner might still be holding a live session.
       const terminalStillAlive = handle
-        ? (await probeTmuxSession(handle.sessionName).catch(() => "unknown")) !== "absent"
+        ? (await probeTmuxSession(handle.sessionName, handle).catch(() => "unknown")) !== "absent"
         : false;
       if (!alreadyTerminated) {
         writeTerminalState(
@@ -657,7 +1086,7 @@ async function waitForInteractiveReady({
     }
     // Only a proven absence ends the turn. See waitForSidecarCompletion for why
     // an unprovable one must not.
-    if ((await probeTmuxSession(handle.sessionName)) === "absent") {
+    if ((await probeTmuxSession(handle.sessionName, handle)) === "absent") {
       const persistedCapturePath = persistCaptureText(capturePath, lastSnapshot, log);
       throw new PartnerTerminalFailureError(
         `${partnerDisplay} tmux session exited before the interactive prompt was ready` +
@@ -681,10 +1110,7 @@ async function waitForInteractiveReady({
       !handledStartupPrompts.has(startupPrompt.kind)
     ) {
       log(`${partnerDisplay} interactive session showed ${startupPrompt.kind}; sending ${startupPrompt.description}`);
-      await sendTextToTmux(handle, startupPrompt.input, {
-        enter: true,
-        submitDelayMs: 0,
-      });
+      await respondToStartupPrompt(handle, startupPrompt);
       handledStartupPrompts.add(startupPrompt.kind);
       await new Promise((resolve) => setTimeout(resolve, 1000));
       continue;
@@ -710,6 +1136,41 @@ async function waitForInteractiveReady({
   persistCaptureText(capturePath, lastSnapshot, log);
 }
 
+/**
+ * Answer one detected startup interstitial using the interaction declared by
+ * its adapter. Older numbered menus accept pasted text plus Enter; current
+ * Claude workspace trust is an arrow-key menu whose safe default is "No" and
+ * therefore needs real named keys rather than a pasted escape sequence.
+ *
+ * The injected senders keep the ordering contract directly testable without a
+ * live partner CLI. Manifest validation guarantees exactly one response shape,
+ * but retain the guard because this helper is exported and startup metadata can
+ * also come from third-party adapters.
+ */
+export async function respondToStartupPrompt(
+  handle,
+  startupPrompt,
+  { sendKey = sendKeyToTmux, sendText = sendTextToTmux } = {}
+) {
+  const hasInput = typeof startupPrompt?.input === "string";
+  const hasKeys = Array.isArray(startupPrompt?.keys) && startupPrompt.keys.length > 0;
+  if (hasInput === hasKeys) {
+    throw new Error("Startup prompt response must declare exactly one of input or keys");
+  }
+
+  if (hasKeys) {
+    for (const key of startupPrompt.keys) {
+      await sendKey(handle, key);
+    }
+    return;
+  }
+
+  await sendText(handle, startupPrompt.input, {
+    enter: true,
+    submitDelayMs: 0,
+  });
+}
+
 async function waitForPromptSubmission({
   agent,
   handle,
@@ -733,7 +1194,7 @@ async function waitForPromptSubmission({
     }
     if (fs.existsSync(donePath) || fs.existsSync(resultPath)) return;
 
-    if ((await probeTmuxSession(handle.sessionName)) === "absent") {
+    if ((await probeTmuxSession(handle.sessionName, handle)) === "absent") {
       throw new PartnerTerminalFailureError(
         `${partnerDisplay} tmux session exited after prompt submission`,
         "terminal_exited"
@@ -832,7 +1293,7 @@ async function waitForSidecarCompletion({
     // pane exited" aborted turns that were running perfectly well. Only a proven
     // absence ends the turn; anything else waits, because the sidecar check at
     // the top of the loop still terminates it the moment real completion lands.
-    const liveness = await probeTmuxSession(handle.sessionName);
+    const liveness = await probeTmuxSession(handle.sessionName, handle);
     if (liveness === "absent") {
       const persistedCapture = readOptionalText(capturePath);
       const inspection = await inspectPartnerTerminal(sessionDir).catch(() => null);

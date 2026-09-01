@@ -29,6 +29,7 @@ import {
 } from "../src/tmux-runtime.mjs";
 import { probeProcess } from "../src/process-probe.mjs";
 import { killTmuxServer } from "./helpers/tmux.mjs";
+import { writeNodeCommand } from "./helpers/node-command.mjs";
 
 const SOCKET = `dualog-liveness-${process.pid}`;
 
@@ -36,16 +37,13 @@ const SOCKET = `dualog-liveness-${process.pid}`;
 function fakeTmux(t, { exitCode = 0, stderr = "", stdout = "" }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-faketmux-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const file = path.join(dir, "tmux");
-  fs.writeFileSync(
-    file,
-    `#!/bin/sh\n` +
-      (stdout ? `printf '%s\\n' ${JSON.stringify(stdout)}\n` : "") +
-      (stderr ? `printf '%s\\n' ${JSON.stringify(stderr)} >&2\n` : "") +
-      `exit ${exitCode}\n`
+  return writeNodeCommand(
+    dir,
+    "tmux",
+    `${stdout ? `process.stdout.write(${JSON.stringify(`${stdout}\n`)});\n` : ""}` +
+      `${stderr ? `process.stderr.write(${JSON.stringify(`${stderr}\n`)});\n` : ""}` +
+      `process.exit(${exitCode});\n`
   );
-  fs.chmodSync(file, 0o755);
-  return file;
 }
 
 function withTmuxBinary(t, binary) {
@@ -266,6 +264,65 @@ test("nothing that can end a turn uses the two-valued predicate", () => {
 
 // --- the pane's process, against a real server --------------------------------
 
+test("native tmux keeps /bin/sh -lc while WSL uses its interactive login shell", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-shell-payload-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const log = path.join(dir, "calls.log");
+  const stub = writeNodeCommand(
+    dir,
+    "tmux-boundary",
+    `import fs from "node:fs";
+const line = process.argv.slice(2).join(" ");
+fs.appendFileSync(${JSON.stringify(log)}, line + "\\n");
+if (line.includes("pane_pid")) process.stdout.write("4242\\n");
+else if (line.includes("pane_id")) process.stdout.write("%0\\n");
+`
+  );
+
+  const localRoute = {
+    transport: "local",
+    command: stub,
+    distro: null,
+    tmuxBinary: stub,
+  };
+  await startTmuxSession({
+    sessionName: "dualog-native-shell-contract",
+    cwd: dir,
+    command: "printf",
+    args: ["hello world"],
+    env: {},
+    route: localRoute,
+  });
+  let creation = fs
+    .readFileSync(log, "utf8")
+    .split("\n")
+    .find((line) => line.includes("new-session"));
+  assert.match(creation, /\/bin\/sh -lc/u);
+  assert.doesNotMatch(creation, /-lic/u);
+
+  fs.writeFileSync(log, "");
+  const wslRoute = {
+    transport: "wsl",
+    command: stub,
+    distro: "Ubuntu",
+    tmuxBinary: "tmux",
+    loginShell: "/bin/bash",
+  };
+  await startTmuxSession({
+    sessionName: "dualog-wsl-shell-contract",
+    cwd: "/mnt/c/repo",
+    command: "claude",
+    args: ["--version"],
+    env: {},
+    route: wslRoute,
+  });
+  creation = fs
+    .readFileSync(log, "utf8")
+    .split("\n")
+    .find((line) => line.includes("new-session"));
+  assert.match(creation, /'\/bin\/bash' -lic/u);
+});
+
 test("a started session reports the process running in its pane", async (t) => {
   if (!realTmuxAvailable()) {
     t.skip("tmux is not installed");
@@ -306,18 +363,17 @@ test("a pane whose process could not be read is marked, not left ambiguous", asy
   // which is what let a partner outlive its pane and lose its home.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-nopid-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const stub = path.join(dir, "tmux");
-  fs.writeFileSync(
-    stub,
-    `#!/bin/sh
-case "$*" in
-  *pane_pid*) echo "cannot read pane_pid" >&2; exit 1;;
-  *pane_id*)  echo "%0"; exit 0;;
-  *)          exit 0;;
-esac
+  const stub = writeNodeCommand(
+    dir,
+    "tmux",
+    `const line = process.argv.slice(2).join(" ");
+if (line.includes("pane_pid")) {
+  process.stderr.write("cannot read pane_pid\\n");
+  process.exit(1);
+}
+if (line.includes("pane_id")) process.stdout.write("%0\\n");
 `
   );
-  fs.chmodSync(stub, 0o755);
   withTmuxBinary(t, stub);
 
   const handle = await startTmuxSession({
@@ -340,18 +396,17 @@ test("a spawn that fails after the pane exists still yields the pane's process",
   // Driven by a stub tmux so the failure lands exactly where it needs to.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-spawnfail-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const stub = path.join(dir, "tmux");
-  fs.writeFileSync(
-    stub,
-    `#!/bin/sh
-case "$*" in
-  *pane_pid*) echo 4242; exit 0;;
-  *pane_id*)  echo "pane_id query failed" >&2; exit 1;;
-  *)          exit 0;;
-esac
+  const stub = writeNodeCommand(
+    dir,
+    "tmux",
+    `const line = process.argv.slice(2).join(" ");
+if (line.includes("pane_pid")) process.stdout.write("4242\\n");
+else if (line.includes("pane_id")) {
+  process.stderr.write("pane_id query failed\\n");
+  process.exit(1);
+}
 `
   );
-  fs.chmodSync(stub, 0o755);
   withTmuxBinary(t, stub);
 
   await assert.rejects(

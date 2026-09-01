@@ -35,8 +35,11 @@ import path from "path";
 import { envWithAliases } from "./platform.mjs";
 import {
   MAX_MESSAGE_BYTES,
+  PANEL_FINDING_LEDGER_VERSION,
   appendMessage,
+  extractGateBlockingFindings,
   getAgentDisplayName,
+  isBlockingFindingCategory,
   normalizeAgent,
   readConversation,
   sleep,
@@ -44,10 +47,12 @@ import {
 import {
   isPartnerTurnCancelledError,
   isPartnerTerminalFailureError,
+  resolvePartnerRuntimeContext,
   runPartnerCommand,
 } from "./partner-invocation.mjs";
 import {
   markSessionRunnerExited,
+  readRunnerRuntimeDecision,
   readRunnerToken,
 } from "./runner-lifecycle.mjs";
 import { tryGetAdapter } from "./adapters/registry.mjs";
@@ -63,8 +68,8 @@ import {
   buildAspectHeader,
   buildAspectPrompt,
   buildFollowUpPrompt,
+  ensureFindingIds,
   extractAspectResult,
-  extractNormalizedFindings,
   suppressVerdictLines,
 } from "./pr-review-aspects.mjs";
 
@@ -86,6 +91,8 @@ const DEFAULT_PARTNER_TIMEOUT_MS = 15 * 60 * 1000;
 const PARTNER_TIMEOUT_MS =
   Math.max(1000, parseInt(process.argv[10], 10)) || DEFAULT_PARTNER_TIMEOUT_MS;
 const RUNNER_TOKEN = readRunnerToken();
+const PREFLIGHT_RUNTIME = readRunnerRuntimeDecision();
+const PREFLIGHT_ENGINE = PREFLIGHT_RUNTIME?.engine ?? null;
 const ALLOW_UNKNOWN_MODEL = process.argv.includes("--allow-unknown-model");
 
 if (!sessionDir || HOST_AGENT === PARTNER_AGENT) {
@@ -183,8 +190,7 @@ process.once("SIGINT", () => {
  */
 function appendBoundedPartnerMessage(content) {
   if (Buffer.byteLength(content, "utf-8") <= MAX_MESSAGE_BYTES) {
-    appendMessage(sessionDir, PARTNER_AGENT, content);
-    return;
+    return appendMessage(sessionDir, PARTNER_AGENT, content);
   }
 
   // Cut from the MIDDLE, keeping the tail.
@@ -221,7 +227,7 @@ function appendBoundedPartnerMessage(content) {
   const tail = buf.subarray(tailStart).toString("utf-8");
 
   log(`Report exceeded the conversation entry limit; kept the head and the trailing ${TAIL_BYTES} bytes`);
-  appendMessage(sessionDir, PARTNER_AGENT, head + marker + tail);
+  return appendMessage(sessionDir, PARTNER_AGENT, head + marker + tail);
 }
 
 /**
@@ -253,16 +259,180 @@ function writePanelState(state) {
     const tmp = `${PANEL_PATH}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
     fs.renameSync(tmp, PANEL_PATH);
+    return true;
   } catch (err) {
     log(`Failed to write panel state: ${err.message}`);
+    return false;
   }
+}
+
+function recordLedgerFindings(
+  panelState,
+  findings,
+  { aspect, phase, messageId }
+) {
+  const known = new Set(panelState.findings.map((finding) => finding.id));
+  for (const finding of findings) {
+    if (!finding.id) {
+      throw new Error(
+        `Runner invariant failed: ${phase} produced an unnumbered blocking finding`
+      );
+    }
+    const isBlocking = isBlockingFindingCategory(finding.category);
+    if (!isBlocking && !known.has(finding.id)) continue;
+    if (
+      !panelState.finding_occurrences.some(
+        (occurrence) =>
+          occurrence.finding_id === finding.id && occurrence.message_id === messageId
+      )
+    ) {
+      panelState.finding_occurrences.push({
+        finding_id: finding.id,
+        message_id: messageId,
+        phase,
+        category: finding.category,
+        text: finding.text,
+        source_kind: finding.source_kind ?? "normalized",
+      });
+    }
+    if (known.has(finding.id) || !isBlocking) continue;
+    panelState.findings.push({
+      id: finding.id,
+      category: finding.category,
+      text: finding.text,
+      aspect,
+      origin_phase: phase,
+      origin_message_id: messageId,
+      source_kind: finding.source_kind ?? "normalized",
+    });
+    known.add(finding.id);
+  }
+}
+
+function collectLedgerFindings(panelState, content, normalizedFindings, prefix) {
+  const findings = normalizedFindings.map((finding) => ({
+    ...finding,
+    source_kind: "normalized",
+  }));
+  const normalizedLineCounts = new Map();
+  for (const finding of findings) {
+    if (!isBlockingFindingCategory(finding.category)) continue;
+    normalizedLineCounts.set(
+      finding.line,
+      (normalizedLineCounts.get(finding.line) ?? 0) + 1
+    );
+  }
+
+  const usedIds = new Set([
+    ...panelState.findings.map((finding) => finding.id),
+    ...findings.map((finding) => finding.id).filter(Boolean),
+  ]);
+  let ordinal = 0;
+  for (const gateFinding of extractGateBlockingFindings(content)) {
+    const normalizedCount = normalizedLineCounts.get(gateFinding.line) ?? 0;
+    if (normalizedCount > 0) {
+      normalizedLineCounts.set(gateFinding.line, normalizedCount - 1);
+      continue;
+    }
+
+    let id;
+    do {
+      ordinal++;
+      id = `F-${prefix}-unindexed-${ordinal}`;
+    } while (usedIds.has(id));
+    usedIds.add(id);
+    findings.push({
+      ...gateFinding,
+      id,
+      source_kind: "gate_readable_unindexed",
+    });
+  }
+  return findings;
+}
+
+function appendLedgeredPartnerMessage({
+  panelState,
+  responseContent,
+  persistedContent,
+  normalizedFindings,
+  prefix,
+  aspect,
+  phase,
+  protocolAmbiguities = [],
+}) {
+  const ledgerFindings = collectLedgerFindings(
+    panelState,
+    responseContent,
+    normalizedFindings,
+    prefix
+  );
+  const knownIds = new Set(panelState.findings.map((finding) => finding.id));
+  const blockingFindings = ledgerFindings.filter(
+    (finding) =>
+      isBlockingFindingCategory(finding.category) || knownIds.has(finding.id)
+  );
+  const ambiguityStart = panelState.finding_protocol_ambiguities.length;
+  panelState.finding_protocol_ambiguities.push(
+    ...protocolAmbiguities.map((ambiguity) => ({
+      ...ambiguity,
+      aspect,
+      phase,
+      message_id: null,
+    }))
+  );
+  const needsCommitMarker =
+    blockingFindings.length > 0 || protocolAmbiguities.length > 0;
+
+  if (needsCommitMarker) {
+    panelState.pending_finding_commit = {
+      phase,
+      finding_ids: blockingFindings.map((finding) => finding.id),
+      protocol_ambiguity_count: protocolAmbiguities.length,
+    };
+    if (!writePanelState(panelState)) {
+      delete panelState.pending_finding_commit;
+      panelState.finding_protocol_ambiguities.splice(ambiguityStart);
+      throw new Error(
+        `Could not persist the ${phase} finding commit marker before appending its response`
+      );
+    }
+  }
+
+  let persistedMessage;
+  try {
+    persistedMessage = appendBoundedPartnerMessage(persistedContent);
+  } catch (err) {
+    if (needsCommitMarker) {
+      delete panelState.pending_finding_commit;
+      panelState.finding_protocol_ambiguities.splice(ambiguityStart);
+      writePanelState(panelState);
+    }
+    throw err;
+  }
+
+  recordLedgerFindings(panelState, ledgerFindings, {
+    aspect,
+    phase,
+    messageId: persistedMessage.id,
+  });
+  for (const ambiguity of panelState.finding_protocol_ambiguities.slice(ambiguityStart)) {
+    ambiguity.message_id = persistedMessage.id;
+  }
+  delete panelState.pending_finding_commit;
+  // A failed write leaves the previously persisted pending marker in place.
+  // That is deliberately fail-closed until a later state write carries the
+  // now-recorded ledger and occurrences to disk.
+  writePanelState(panelState);
+  return { message: persistedMessage, ledgerFindings };
 }
 
 function readActiveDiff(originalDiff) {
   try {
     if (fs.existsSync(REFRESHED_DIFF_PATH)) {
       const refreshed = fs.readFileSync(REFRESHED_DIFF_PATH, "utf-8");
-      if (refreshed.trim()) return refreshed;
+      if (refreshed.trim()) {
+        return { text: refreshed, authoritativePath: REFRESHED_DIFF_PATH };
+      }
     }
   } catch (err) {
     // NOT a bare swallow like the unlink idioms elsewhere in this file. Those
@@ -275,10 +445,10 @@ function readActiveDiff(originalDiff) {
       `Could not read the refreshed diff (${err.message}); falling back to the diff captured at review start`
     );
   }
-  return originalDiff;
+  return { text: originalDiff, authoritativePath: DIFF_PATH };
 }
 
-async function runTurn(prompt, tempPrefix) {
+async function runTurn(prompt, tempPrefix, runtimeContext) {
   return runPartnerCommand({
     partnerAgent: PARTNER_AGENT,
     partnerCommand,
@@ -292,6 +462,8 @@ async function runTurn(prompt, tempPrefix) {
     tempPrefix,
     responseInstruction: "Respond with your report.",
     sessionDir,
+    engine: PREFLIGHT_ENGINE,
+    runtimeContext,
   });
 }
 
@@ -303,16 +475,56 @@ async function main() {
   // tool fell back to `phase: "panel"` with every aspect pending: a runner that
   // died before it started rendering identically to one genuinely working its
   // first pass. `starting` is what it shows now, and only because of this line.
-  writePanelState({ phase: "starting", completed: [], started_at: new Date().toISOString() });
+  writePanelState({
+    phase: "starting",
+    finding_ledger_version: PANEL_FINDING_LEDGER_VERSION,
+    findings: [],
+    finding_occurrences: [],
+    finding_protocol_ambiguities: [],
+    completed: [],
+    started_at: new Date().toISOString(),
+  });
 
   const originalDiff = fs.readFileSync(DIFF_PATH, "utf-8");
   const meta = JSON.parse(fs.readFileSync(META_PATH, "utf-8"));
   const selected = Array.isArray(meta.aspects) ? meta.aspects : [];
   const skipped = Array.isArray(meta.skipped) ? meta.skipped : [];
   const reviewFocus = meta.review_focus || null;
+  // One engine/route decision owns both the path written into every specialist
+  // prompt and the path used to launch that specialist. This avoids telling a
+  // WSL reviewer to inspect a native Windows path while preserving the original
+  // path byte-for-byte for local macOS/Linux and native headless partners.
+  const runtimeContext = await resolvePartnerRuntimeContext({
+    partnerAgent: PARTNER_AGENT,
+    partnerCommand,
+    projectPath,
+    requestedEngine: PREFLIGHT_ENGINE,
+    pinnedTmuxTransport: PREFLIGHT_RUNTIME?.tmuxTransport ?? null,
+    pinnedTmuxDistro: PREFLIGHT_RUNTIME?.tmuxDistro ?? null,
+    pinnedTmuxLauncher: PREFLIGHT_RUNTIME?.tmuxLauncher ?? null,
+    pinnedTmuxControlBinary: PREFLIGHT_RUNTIME?.tmuxControlBinary ?? null,
+    pinnedTmuxSocketName: PREFLIGHT_RUNTIME?.tmuxSocketName ?? null,
+    log,
+  });
+  const partnerProjectPath = runtimeContext.partnerProjectPath;
+  // Both complete artifacts remain authoritative when the prompt embeds only a
+  // prefix. Translate them through the same captured route as the project so a
+  // Windows host never tells a WSL reviewer to open an unusable C:\\ path, and a
+  // selected distro cannot drift between prompt construction and invocation.
+  const partnerDiffPaths = new Map(
+    await Promise.all(
+      [DIFF_PATH, REFRESHED_DIFF_PATH].map(async (hostPath) => [
+        hostPath,
+        await runtimeContext.toPartnerPath(hostPath),
+      ])
+    )
+  );
 
   log("=== PR review runner started ===");
   log(`Project: ${projectPath}`);
+  if (partnerProjectPath !== projectPath) {
+    log(`Partner project: ${partnerProjectPath}`);
+  }
   log(`Scope: ${meta.scope_label}`);
   log(`Host agent: ${HOST_DISPLAY}`);
   log(`Partner agent: ${PARTNER_DISPLAY} (${partnerCommand})`);
@@ -323,6 +535,10 @@ async function main() {
 
   const panelState = {
     phase: "panel",
+    finding_ledger_version: PANEL_FINDING_LEDGER_VERSION,
+    findings: [],
+    finding_occurrences: [],
+    finding_protocol_ambiguities: [],
     total_passes: selected.length + 1,
     completed: [],
     pending: [...selected, "__aggregate__"],
@@ -382,11 +598,13 @@ async function main() {
         );
       }
 
+      const activeDiff = readActiveDiff(originalDiff);
       const prompt = buildAspectPrompt({
         aspect: aspectId,
         meta,
-        diff: readActiveDiff(originalDiff),
-        projectPath,
+        diff: activeDiff.text,
+        projectPath: partnerProjectPath,
+        authoritativeDiffPath: partnerDiffPaths.get(activeDiff.authoritativePath),
         maxDiffChars: MAX_REVIEW_DIFF_CHARS,
         passIndex,
         passTotal,
@@ -396,7 +614,11 @@ async function main() {
         priorFindings: priorFindings.slice(0, 40),
       });
 
-      const response = await runTurn(prompt, `${PARTNER_AGENT}-pr-${aspectId}`);
+      const response = await runTurn(
+        prompt,
+        `${PARTNER_AGENT}-pr-${aspectId}`,
+        runtimeContext
+      );
 
       // An empty response is a FAILED pass, not a clean one.
       //
@@ -439,7 +661,20 @@ async function main() {
           `A verdict survived the masked suppression pass in "${aspectId}"; fell back to neutralizing verdict tokens anywhere in the text`
         );
       }
-      appendBoundedPartnerMessage(header + safeResponse);
+      const annotated = ensureFindingIds(safeResponse, {
+        prefix: aspectId,
+        preserveExisting: false,
+      });
+      const persisted = appendLedgeredPartnerMessage({
+        panelState,
+        responseContent: annotated.text,
+        persistedContent: header + annotated.text,
+        normalizedFindings: annotated.findings,
+        prefix: aspectId,
+        aspect: aspectId,
+        phase: "specialist",
+        protocolAmbiguities: annotated.protocol_ambiguities,
+      });
       // The SANITIZED text, not the raw response.
       //
       // Suppressing the verdict only on the way into conversation.jsonl
@@ -448,9 +683,11 @@ async function main() {
       // the more consequential reader of the two. A specialist's
       // "REVIEW_VERDICT: APPROVE" would have been scrubbed from the record while
       // being embedded verbatim in the prompt of the turn deciding the outcome.
-      reports.push({ aspect: aspectId, content: safeResponse, failed: false });
-      for (const finding of extractNormalizedFindings(safeResponse)) {
-        priorFindings.push(`[${finding.category}] ${finding.text}`);
+      reports.push({ aspect: aspectId, content: annotated.text, failed: false });
+      for (const finding of annotated.findings) {
+        priorFindings.push(
+          `[${finding.category}]${finding.id ? ` [FINDING_ID: ${finding.id}]` : ""} ${finding.text}`
+        );
       }
       // The specialist's own machine-readable claim that it worked its rubric to
       // the end. A pass that omits the footer completed, but did not confirm it
@@ -460,11 +697,21 @@ async function main() {
       // divergence started; today the suppressor cannot touch an ASPECT_RESULT
       // line, but the next widening of it would make that luck rather than
       // design.
-      const aspectResult = extractAspectResult(safeResponse);
+      const aspectResult = extractAspectResult(annotated.text);
+      const hasReportedFinding =
+        annotated.findings.length > 0 ||
+        persisted.ledgerFindings.some(
+          (finding) => finding.source_kind === "gate_readable_unindexed"
+        );
+      const aspectResultConsistent =
+        annotated.protocol_ambiguities.length === 0 &&
+        ((aspectResult === "FINDINGS" && hasReportedFinding) ||
+          (aspectResult === "CLEAN" && !hasReportedFinding));
       panelState.completed.push({
         aspect: aspectId,
-        status: aspectResult ? "complete" : "complete_unverified",
+        status: aspectResultConsistent ? "complete" : "complete_unverified",
         aspect_result: aspectResult,
+        message_id: persisted.message.id,
         chars: response.length,
       });
       log(`Panel pass ${aspectId} complete (${response.length} chars)`);
@@ -534,13 +781,18 @@ async function main() {
     try {
       const prompt = buildAggregationPrompt({
         meta,
-        projectPath,
+        projectPath: partnerProjectPath,
         reports,
         skipped,
         reviewFocus,
         hostDisplay: HOST_DISPLAY,
+        findingLedger: panelState.findings,
       });
-      const response = await runTurn(prompt, `${PARTNER_AGENT}-pr-aggregate`);
+      const response = await runTurn(
+        prompt,
+        `${PARTNER_AGENT}-pr-aggregate`,
+        runtimeContext
+      );
 
       // Same rule as a panel pass, and it matters more here. An empty aggregate
       // was appended as a header-only message reading "Panel complete: 5 of 5
@@ -554,10 +806,25 @@ async function main() {
         );
       }
 
-      appendBoundedPartnerMessage(
-        `${CONSOLIDATED_HEADER}\n_Panel complete: ${reports.filter((r) => !r.failed).length} of ${selected.length} specialist pass(es) reported._\n\n${response}`
-      );
-      panelState.completed.push({ aspect: "__aggregate__", status: "complete" });
+      const annotated = ensureFindingIds(response, {
+        prefix: "aggregate",
+        allowedExistingIds: panelState.findings.map((finding) => finding.id),
+      });
+      const persisted = appendLedgeredPartnerMessage({
+        panelState,
+        responseContent: annotated.text,
+        persistedContent: `${CONSOLIDATED_HEADER}\n_Panel complete: ${reports.filter((r) => !r.failed).length} of ${selected.length} specialist pass(es) reported._\n\n${annotated.text}`,
+        normalizedFindings: annotated.findings,
+        prefix: "aggregate",
+        aspect: "__aggregate__",
+        phase: "consolidation",
+        protocolAmbiguities: annotated.protocol_ambiguities,
+      });
+      panelState.completed.push({
+        aspect: "__aggregate__",
+        status: "complete",
+        message_id: persisted.message.id,
+      });
       log(`Consolidation complete (${response.length} chars)`);
     } catch (err) {
       if (isPartnerTurnCancelledError(err) || fs.existsSync(END_SIGNAL_PATH)) {
@@ -678,10 +945,12 @@ async function main() {
           ];
         }
 
+        const activeDiff = readActiveDiff(originalDiff);
         const prompt = buildFollowUpPrompt({
           meta,
-          projectPath,
-          diff: readActiveDiff(originalDiff),
+          projectPath: partnerProjectPath,
+          diff: activeDiff.text,
+          authoritativeDiffPath: partnerDiffPaths.get(activeDiff.authoritativePath),
           maxDiffChars: MAX_REVIEW_DIFF_CHARS,
           messages: context,
           hostDisplay: HOST_DISPLAY,
@@ -694,9 +963,14 @@ async function main() {
           // Carried for the whole session, not just consolidation. A hole in
           // the panel does not close because a turn went by.
           failedAspects: reports.filter((r) => r.failed).map((r) => r.aspect),
+          findingLedger: panelState.findings,
         });
 
-        const response = await runTurn(prompt, `${PARTNER_AGENT}-pr-followup`);
+        const response = await runTurn(
+          prompt,
+          `${PARTNER_AGENT}-pr-followup`,
+          runtimeContext
+        );
 
         // Without this, an empty reply was appended as an empty partner message
         // and then treated as a successful turn: followUpTurns++, activity
@@ -710,7 +984,20 @@ async function main() {
           );
         }
 
-        appendBoundedPartnerMessage(response);
+        const annotated = ensureFindingIds(response, {
+          prefix: `followup-${followUpTurns + 1}`,
+          allowedExistingIds: panelState.findings.map((finding) => finding.id),
+        });
+        appendLedgeredPartnerMessage({
+          panelState,
+          responseContent: annotated.text,
+          persistedContent: annotated.text,
+          normalizedFindings: annotated.findings,
+          prefix: `followup-${followUpTurns + 1}`,
+          aspect: "__followup__",
+          phase: "follow_up",
+          protocolAmbiguities: annotated.protocol_ambiguities,
+        });
         followUpTurns++;
         lastActivityTime = Date.now();
         consecutiveErrors = 0;

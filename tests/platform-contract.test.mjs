@@ -637,7 +637,13 @@ test("a symlinked component is refused even though it is lexically inside", () =
   const { results } = inThrowawayHome(`
     const outside = path.join(home, "real-config");
     fs.mkdirSync(outside, { recursive: true });
-    fs.symlinkSync(outside, path.join(sessionDir, "codex-home"));
+    // Directory junctions exercise the same lstat/isSymbolicLink boundary on
+    // Windows without depending on Developer Mode or SeCreateSymbolicLinkPrivilege.
+    fs.symlinkSync(
+      outside,
+      path.join(sessionDir, "codex-home"),
+      process.platform === "win32" ? "junction" : "dir"
+    );
     attempt("linked-dir", () =>
       m.assertManagedSessionPath(sessionDir, path.join(sessionDir, "codex-home")));
     attempt("through-linked-dir", () =>
@@ -852,7 +858,11 @@ test("a session directory that is itself a symlink is refused", () => {
     const victim = path.join(home, "victim-repo");
     fs.mkdirSync(victim, { recursive: true });
     const linked = path.join(home, ".dualog/sessions/dialog-1785600000077-000000ff");
-    fs.symlinkSync(victim, linked);
+    fs.symlinkSync(
+      victim,
+      linked,
+      process.platform === "win32" ? "junction" : "dir"
+    );
     attempt("linked-session", () =>
       m.assertManagedSessionPath(linked, path.join(linked, "codex-home")));
     attempt("victim-untouched", () => fs.readdirSync(victim));

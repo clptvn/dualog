@@ -21,10 +21,12 @@ import {
 import {
   isPartnerTurnCancelledError,
   isPartnerTerminalFailureError,
+  resolvePartnerRuntimeContext,
   runPartnerCommand,
 } from "./partner-invocation.mjs";
 import {
   markSessionRunnerExited,
+  readRunnerRuntimeDecision,
   readRunnerToken,
 } from "./runner-lifecycle.mjs";
 import { tryGetAdapter } from "./adapters/registry.mjs";
@@ -51,6 +53,8 @@ const DEFAULT_PARTNER_TIMEOUT_MS = 15 * 60 * 1000;
 const PARTNER_TIMEOUT_MS =
   Math.max(1000, parseInt(process.argv[10], 10)) || DEFAULT_PARTNER_TIMEOUT_MS;
 const RUNNER_TOKEN = readRunnerToken();
+const PREFLIGHT_RUNTIME = readRunnerRuntimeDecision();
+const PREFLIGHT_ENGINE = PREFLIGHT_RUNTIME?.engine ?? null;
 // Read as a flag, not by index: the preflight already decided this, and the
 // turn must validate the model on the same terms or it will reject an id the
 // start call deliberately allowed.
@@ -163,7 +167,14 @@ How to use the budget well:
   return block;
 }
 
-function buildReviewPrompt(originalDiff, refreshedDiff, meta, messages, partnerTurns) {
+function buildReviewPrompt(
+  originalDiff,
+  refreshedDiff,
+  meta,
+  messages,
+  partnerTurns,
+  partnerProjectPath = projectPath
+) {
   let conversationMessages = messages;
   if (messages.length > MAX_CONVERSATION_MESSAGES) {
     const first = messages.slice(0, 2);
@@ -219,7 +230,7 @@ ${meta.diff_stat || "(no stat available)"}
 ${diffSection}
 
 ## Project Directory
-${projectPath}
+${partnerProjectPath}
 
 You can read any files in this directory to understand context beyond the diff.
 
@@ -254,7 +265,7 @@ REFERENCED_FILES: path/to/file1.ext, path/to/file2.ext
 
 Use REVIEW_VERDICT: APPROVE only when all significant issues are resolved and no material concern remains. Use REVIEW_VERDICT: CHANGES_REQUESTED when you found issues that should be addressed. Use REVIEW_VERDICT: NEEDS_DISCUSSION when the remaining decision needs the host or user to answer a question before you can approve.
 
-Use paths relative to the project root (${projectPath}) in REFERENCED_FILES. This line is machine-parsed to ensure your discussion partner verifies your claims by reading the actual code. If you made no file-specific claims, omit REFERENCED_FILES, but always include REVIEW_VERDICT.`;
+Use paths relative to the project root (${partnerProjectPath}) in REFERENCED_FILES. This line is machine-parsed to ensure your discussion partner verifies your claims by reading the actual code. If you made no file-specific claims, omit REFERENCED_FILES, but always include REVIEW_VERDICT.`;
 
   if (isInitialReview) {
     prompt += `## Your Task — Initial Review
@@ -296,6 +307,23 @@ Respond with ONLY your message and the machine-readable footer. Do NOT wrap it i
 async function main() {
   const originalDiff = fs.readFileSync(DIFF_PATH, "utf-8");
   const meta = JSON.parse(fs.readFileSync(META_PATH, "utf-8"));
+  // Capture the partner-visible project path together with the engine/route so
+  // the prompt cannot describe WSL while the command later falls back to a
+  // native headless engine (or vice versa). Diff and conversation contents are
+  // deliberately left verbatim; only prompt-owned path instructions change.
+  const runtimeContext = await resolvePartnerRuntimeContext({
+    partnerAgent: PARTNER_AGENT,
+    partnerCommand,
+    projectPath,
+    requestedEngine: PREFLIGHT_ENGINE,
+    pinnedTmuxTransport: PREFLIGHT_RUNTIME?.tmuxTransport ?? null,
+    pinnedTmuxDistro: PREFLIGHT_RUNTIME?.tmuxDistro ?? null,
+    pinnedTmuxLauncher: PREFLIGHT_RUNTIME?.tmuxLauncher ?? null,
+    pinnedTmuxControlBinary: PREFLIGHT_RUNTIME?.tmuxControlBinary ?? null,
+    pinnedTmuxSocketName: PREFLIGHT_RUNTIME?.tmuxSocketName ?? null,
+    log,
+  });
+  const partnerProjectPath = runtimeContext.partnerProjectPath;
 
   let lastProcessedId = 0;
   let partnerTurns = 0;
@@ -307,6 +335,9 @@ async function main() {
 
   log("=== Review runner started ===");
   log(`Project: ${projectPath}`);
+  if (partnerProjectPath !== projectPath) {
+    log(`Partner project: ${partnerProjectPath}`);
+  }
   log(`Branch: ${meta.branch} vs ${meta.base_branch}`);
   log(`Host agent: ${HOST_DISPLAY}`);
   log(`Partner agent: ${PARTNER_DISPLAY}`);
@@ -322,7 +353,14 @@ async function main() {
   } catch {}
 
   try {
-    const prompt = buildReviewPrompt(originalDiff, null, meta, [], 0);
+    const prompt = buildReviewPrompt(
+      originalDiff,
+      null,
+      meta,
+      [],
+      0,
+      partnerProjectPath
+    );
     const response = await runPartnerCommand({
       partnerAgent: PARTNER_AGENT,
       partnerCommand,
@@ -336,6 +374,8 @@ async function main() {
       tempPrefix: `${PARTNER_AGENT}-review`,
       responseInstruction: "Respond with your review.",
       sessionDir,
+      engine: PREFLIGHT_ENGINE,
+      runtimeContext,
     });
 
     appendMessage(sessionDir, PARTNER_AGENT, response);
@@ -421,7 +461,8 @@ async function main() {
           refreshedDiff,
           meta,
           messages,
-          partnerTurns
+          partnerTurns,
+          partnerProjectPath
         );
         const response = await runPartnerCommand({
           partnerAgent: PARTNER_AGENT,
@@ -436,6 +477,8 @@ async function main() {
           tempPrefix: `${PARTNER_AGENT}-review`,
           responseInstruction: "Respond with your review.",
           sessionDir,
+          engine: PREFLIGHT_ENGINE,
+          runtimeContext,
         });
 
         appendMessage(sessionDir, PARTNER_AGENT, response);

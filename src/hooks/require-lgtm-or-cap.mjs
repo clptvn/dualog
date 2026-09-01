@@ -87,7 +87,18 @@ try {
 }
 
 const messages = readConversation(sessionDir);
-const reviewStatus = computeReviewStatus(status, messages, { problem });
+let panelState = null;
+if (status?.type === "pr_review") {
+  try {
+    panelState = JSON.parse(
+      fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8")
+    );
+  } catch {
+    // Missing or unreadable panel state must fail closed for approval. The
+    // shared gate distinguishes that from an ordinary non-panel review.
+  }
+}
+const reviewStatus = computeReviewStatus(status, messages, { problem, panelState });
 const partnerRounds = messages.filter((m) => m.from === partnerAgent).length;
 if (reviewStatus.close_allowed) process.exit(0);
 

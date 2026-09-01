@@ -203,6 +203,21 @@ test("graceful shutdown escalates to SIGKILL instead of scheduling it", async (t
   // only if the caller sticks around. A signal handler calls process.exit()
   // immediately after, taking the timer with it -- so a CLI that ignores SIGTERM
   // outlives the runner that owned it. The awaiting variant must escalate itself.
+  if (process.platform === "win32") {
+    const calls = [];
+    const signalled = await terminateActiveHeadlessTurnsAndWait({
+      children: [{ pid: 4242 }],
+      platform: "win32",
+      terminateWindowsTreeFn(pid) {
+        calls.push(pid);
+        return { status: "succeeded", attempted: true, reason: null };
+      },
+    });
+    assert.equal(signalled, 1);
+    assert.deepEqual(calls, [4242]);
+    return;
+  }
+
   const stubborn = spawn(
     process.execPath,
     ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"],

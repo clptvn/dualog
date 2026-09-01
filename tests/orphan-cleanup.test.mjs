@@ -116,6 +116,10 @@ test(
   "definitive terminal failure cleans tmux, exits the review runner, and clears its PID",
   { timeout: 30000 },
   async (t) => {
+    if (process.platform === "win32") {
+      t.skip("native POSIX tmux failure fixture; WSL routing has separate coverage");
+      return;
+    }
     if (!(await isTmuxAvailable())) {
       t.skip("tmux is not available");
       return;
@@ -237,6 +241,10 @@ test(
   "undelivered Claude prompt is cleaned up without treating ordinary idle as a timeout",
   { timeout: 30000 },
   async (t) => {
+    if (process.platform === "win32") {
+      t.skip("native POSIX tmux prompt fixture; WSL routing has separate coverage");
+      return;
+    }
     if (!(await isTmuxAvailable())) {
       t.skip("tmux is not available");
       return;

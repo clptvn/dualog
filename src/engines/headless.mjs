@@ -11,7 +11,8 @@
 
 import fs from "fs";
 import path from "path";
-import { spawn, execFileSync } from "child_process";
+import { execFileSync } from "child_process";
+import crossSpawn from "cross-spawn";
 import { buildInvocationFromAdapter } from "../adapters/argv.mjs";
 import { releaseLease, transitionLease } from "../runtime-lease.mjs";
 import { processStartTime } from "../process-probe.mjs";
@@ -19,6 +20,9 @@ import { readCompletion } from "./completion.mjs";
 import { resolveDiscoveryForValidation } from "../adapters/resolve-for-validation.mjs";
 import { isProcessAlive } from "../shared.mjs";
 import { readProcessCommandLine } from "../runner-lifecycle.mjs";
+import { terminateWindowsProcessTree } from "../windows-process-tree.mjs";
+
+export { terminateWindowsProcessTree } from "../windows-process-tree.mjs";
 
 export class HeadlessTurnError extends Error {
   constructor(message, outcome) {
@@ -37,6 +41,71 @@ export class HeadlessTurnError extends Error {
 // no record that it ever existed.
 const activeChildren = new Set();
 
+// Kept on the ChildProcess handle as well as in lease metadata. The in-memory
+// copy protects the headless-child.json breadcrumb when taskkill fails and the
+// direct cmd.exe wrapper happens to disappear anyway; without it the `close`
+// handler would erase the only evidence that a descendant may still be alive.
+const WINDOWS_TREE_TERMINATION = Symbol("dualog.windowsTreeTermination");
+const WINDOWS_TREE_TERMINATION_RECORDER = Symbol("dualog.windowsTreeTerminationRecorder");
+
+function rememberWindowsTreeTermination(child, result) {
+  if (child && typeof child === "object") {
+    child[WINDOWS_TREE_TERMINATION] = result;
+  }
+  return result;
+}
+
+function recordChildWindowsTreeTermination(child, status, reason = null) {
+  try {
+    child?.[WINDOWS_TREE_TERMINATION_RECORDER]?.(status, reason);
+  } catch {
+    // The recorder itself is fail-closed: it marks the owner lifecycle for
+    // retention before attempting its metadata write. Termination must still be
+    // attempted even when diagnostic persistence encounters an I/O failure.
+  }
+}
+
+/**
+ * Build the bridge between process-tree termination and lease metadata.
+ * Exported so Windows behavior can be proven hermetically on non-Windows CI.
+ */
+export function createWindowsTreeTerminationRecorder({
+  platform = process.platform,
+  lease = null,
+  consumer = null,
+  lifecycle = { retainLease: false, retentionReason: null },
+  transitionLeaseFn = transitionLease,
+}) {
+  let currentConsumer = consumer;
+
+  return (status, reason = null) => {
+    if (platform !== "win32") return;
+
+    const retains = !["succeeded", "wrapper-exit-observed"].includes(status);
+    lifecycle.retainLease = retains;
+    lifecycle.retentionReason = retains
+      ? reason || `Windows process-tree termination is ${status}`
+      : null;
+
+    if (!lease || !currentConsumer) return;
+    const nextConsumer = {
+      ...currentConsumer,
+      windows_tree_termination: status,
+    };
+    try {
+      transitionLeaseFn(lease, "active", { consumer: nextConsumer });
+      currentConsumer = nextConsumer;
+    } catch (err) {
+      // A failed proof write cannot be treated as if it landed. Keep the lease
+      // in this owner even when taskkill itself succeeds; a later sweep still
+      // has the child breadcrumb and the previous conservative metadata.
+      lifecycle.retainLease = true;
+      lifecycle.retentionReason =
+        `the Windows tree-termination proof could not be recorded (${err.message})`;
+    }
+  };
+}
+
 /**
  * Terminate every headless partner process and WAIT for it to actually die,
  * escalating to SIGKILL rather than scheduling it.
@@ -54,11 +123,33 @@ export async function terminateActiveHeadlessTurnsAndWait({
   // behavior can be tested against a process the test controls, rather than by
   // exporting a backdoor that mutates the live set.
   children: explicitChildren = null,
+  platform = process.platform,
+  terminateWindowsTreeFn = terminateWindowsProcessTree,
+  recordWindowsTreeTerminationFn = recordChildWindowsTreeTermination,
 } = {}) {
   const children = explicitChildren ? [...explicitChildren] : [...activeChildren];
   if (children.length === 0) return 0;
 
-  for (const child of children) signalTree(child, "SIGTERM");
+  if (platform === "win32") {
+    // taskkill /T /F is synchronous. There is no useful TERM-then-KILL split on
+    // native Windows, and returning only after taskkill exits is what prevents a
+    // signal handler from taking an outstanding escalation timer with it.
+    for (const child of children) {
+      recordWindowsTreeTerminationFn(child, "pending");
+      const result = rememberWindowsTreeTermination(
+        child,
+        terminateWindowsTreeFn(child?.pid)
+      );
+      recordWindowsTreeTerminationFn(
+        child,
+        result?.status ?? "failed",
+        result?.reason ?? null
+      );
+    }
+    return children.length;
+  }
+
+  for (const child of children) signalTree(child, "SIGTERM", { platform });
 
   // Liveness is a property of the GROUP, not of its leader.
   //
@@ -70,12 +161,14 @@ export async function terminateActiveHeadlessTurnsAndWait({
   // escalation it promises never happened.
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
-    if (children.every((c) => !isProcessTreeAlive(c))) return children.length;
+    if (children.every((c) => !isProcessTreeAlive(c, { platform }))) return children.length;
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
 
   for (const child of children) {
-    if (isProcessTreeAlive(child)) signalTree(child, "SIGKILL");
+    if (isProcessTreeAlive(child, { platform })) {
+      signalTree(child, "SIGKILL", { platform });
+    }
   }
   return children.length;
 }
@@ -84,24 +177,40 @@ export async function terminateActiveHeadlessTurnsAndWait({
  * Signal a process tree and wait for it to actually die, escalating within the
  * call rather than on a timer that a departing process would take with it.
  */
-async function terminateProcessTree(handle, { graceMs = 2000, pollMs = 50 } = {}) {
-  signalTree(handle, "SIGTERM");
+async function terminateProcessTree(
+  handle,
+  {
+    graceMs = 2000,
+    pollMs = 50,
+    platform = process.platform,
+    terminateWindowsTreeFn = terminateWindowsProcessTree,
+  } = {}
+) {
+  if (platform === "win32") {
+    const result = rememberWindowsTreeTermination(
+      handle,
+      terminateWindowsTreeFn(handle?.pid)
+    );
+    return result?.status === "succeeded";
+  }
+
+  signalTree(handle, "SIGTERM", { platform });
 
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
-    if (!isProcessTreeAlive(handle)) return true;
+    if (!isProcessTreeAlive(handle, { platform })) return true;
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
 
-  if (!isProcessTreeAlive(handle)) return true;
-  signalTree(handle, "SIGKILL");
+  if (!isProcessTreeAlive(handle, { platform })) return true;
+  signalTree(handle, "SIGKILL", { platform });
 
   const killDeadline = Date.now() + graceMs;
   while (Date.now() < killDeadline) {
-    if (!isProcessTreeAlive(handle)) return true;
+    if (!isProcessTreeAlive(handle, { platform })) return true;
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
-  return !isProcessTreeAlive(handle);
+  return !isProcessTreeAlive(handle, { platform });
 }
 
 /**
@@ -112,11 +221,11 @@ async function terminateProcessTree(handle, { graceMs = 2000, pollMs = 50 } = {}
  * deciding whether to escalate. Falls back to the single PID where there is no
  * group to ask about (Windows, or a child that was never detached).
  */
-function isProcessTreeAlive(child) {
+function isProcessTreeAlive(child, { platform = process.platform } = {}) {
   const pid = child?.pid;
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
 
-  if (process.platform !== "win32") {
+  if (platform !== "win32") {
     try {
       process.kill(-pid, 0);
       return true;
@@ -241,39 +350,52 @@ export function extractStdoutResult(adapter, stdout) {
  * such a lease is retained and swept once the group can be shown absent.
  */
 export async function runHeadlessTurn(options) {
+  // A failed native-Windows tree kill is an explicit reason NOT to call the
+  // ordinary lease releaser. The direct cmd.exe pid may already be absent, but
+  // taskkill's failure means that absence says nothing about its descendants.
+  const lifecycle = { retainLease: false, retentionReason: null };
   try {
-    return await runHeadlessTurnInner(options);
+    return await runHeadlessTurnInner(options, lifecycle);
   } finally {
     const { lease, log } = options;
     if (lease) {
-      try {
-        const { released, reason } = releaseLease(lease);
-        if (!released && reason) log(`Runtime lease ${lease.id} retained: ${reason}`);
-      } catch (err) {
-        log(`Runtime lease ${lease.id} could not be released: ${err.message}`);
+      if (lifecycle.retainLease) {
+        log(
+          `Runtime lease ${lease.id} retained: ${lifecycle.retentionReason || "the Windows process tree could not be proven terminated"}`
+        );
+      } else {
+        try {
+          const { released, reason } = releaseLease(lease);
+          if (!released && reason) log(`Runtime lease ${lease.id} retained: ${reason}`);
+        } catch (err) {
+          log(`Runtime lease ${lease.id} could not be released: ${err.message}`);
+        }
       }
     }
   }
 }
 
-async function runHeadlessTurnInner({
-  adapter,
-  lease = null,
-  partnerCommand,
-  bootstrap,
-  projectPath,
-  sessionDir,
-  turnDir,
-  resultPath,
-  donePath,
-  model,
-  reasoningEffort,
-  toolProfile,
-  timeoutMs,
-  log,
-  endSignalPath,
-  allowUnknownModel = false,
-}) {
+async function runHeadlessTurnInner(
+  {
+    adapter,
+    lease = null,
+    partnerCommand,
+    bootstrap,
+    projectPath,
+    sessionDir,
+    turnDir,
+    resultPath,
+    donePath,
+    model,
+    reasoningEffort,
+    toolProfile,
+    timeoutMs,
+    log,
+    endSignalPath,
+    allowUnknownModel = false,
+  },
+  lifecycle
+) {
   // Self-heal before adding another child. A record still on disk belongs to a
   // turn that never finished, and by definition it is over now -- a session runs
   // one partner turn at a time. This is what closes the SIGKILL gap in practice:
@@ -291,6 +413,7 @@ async function runHeadlessTurnInner({
   const discoveredModels = await resolveDiscoveryForValidation(adapter, {
     model,
     projectPath,
+    engine: "headless",
     log,
   });
 
@@ -364,7 +487,10 @@ async function runHeadlessTurnInner({
     throw err;
   }
   function spawnPartner() {
-    return spawn(command, args, {
+    // cross-spawn preserves child_process.spawn semantics on POSIX while also
+    // resolving npm-installed .cmd shims on native Windows. Using Node's raw
+    // spawn() there makes a valid `claude.cmd` or `codex.cmd` look missing.
+    return crossSpawn(command, args, {
       cwd: projectPath,
       env: { ...process.env, ...env },
       stdio: ["pipe", "pipe", "pipe"],
@@ -380,6 +506,22 @@ async function runHeadlessTurnInner({
   // never fires for the commonest failure there is. Claiming `active` here would
   // record an identity-less consumer that the reaper then retains for the whole
   // boot -- a typo in a manifest holding a credential copy until reboot.
+  const leaseConsumer = child.pid == null
+    ? null
+    : {
+        kind: "headless",
+        pid: child.pid,
+        pgid: process.platform === "win32" ? null : child.pid,
+        started_at: child.pid ? processStartTime(child.pid) : null,
+        // Persist a conservative baseline before any cancellation is possible.
+        // If a later `pending`/`failed` write itself fails, this older record
+        // still retains once the wrapper disappears rather than authorizing a
+        // sweep from metadata that never learned a tree kill was attempted.
+        ...(process.platform === "win32"
+          ? { windows_tree_termination: "running" }
+          : {}),
+      };
+
   if (lease && child.pid == null) {
     child.once("error", () => {
       try {
@@ -392,17 +534,19 @@ async function runHeadlessTurnInner({
     });
   } else if (lease) {
     transitionLease(lease, "active", {
-      consumer: {
-        kind: "headless",
-        pid: child.pid ?? null,
-        // The group, not just the pid: a TERM-ignoring descendant keeps the CLI
-        // that holds our credentials open after the direct child is gone.
-        pgid: process.platform === "win32" ? null : (child.pid ?? null),
-        // Qualifies the pid against reuse; see probeRecordedProcess.
-        started_at: child.pid ? processStartTime(child.pid) : null,
-      },
+      consumer: leaseConsumer,
     });
   }
+
+  // The same object is used for each termination-state transition. Keep it
+  // independent of whether a lease exists so timeout/cancel remains ordinary
+  // process management for adapters that do not project credentials.
+  const recordWindowsTreeTermination = createWindowsTreeTerminationRecorder({
+    lease,
+    consumer: leaseConsumer,
+    lifecycle,
+  });
+  child[WINDOWS_TREE_TERMINATION_RECORDER] = recordWindowsTreeTermination;
   activeChildren.add(child);
   // Both cleanups are tied to `close`, not to the turn returning. On timeout or
   // cancellation waitForExit() resolves as soon as it has SIGNALLED the child --
@@ -411,6 +555,16 @@ async function runHeadlessTurnInner({
   // precisely the orphan the record exists to catch.
   child.once("close", () => {
     activeChildren.delete(child);
+    if (
+      process.platform === "win32" &&
+      child[WINDOWS_TREE_TERMINATION] == null
+    ) {
+      // Preserve the pre-existing behavior for a naturally completed command:
+      // a close observed without a kill attempt is the normal completion proof.
+      // Forced exits use taskkill's stronger tree proof above.
+      recordWindowsTreeTermination("wrapper-exit-observed");
+      if (lifecycle.retainLease) return;
+    }
     // The record may only go when there is nothing left it could point at.
     //
     // `close` means OUR child ended, not that its work did: a launcher that
@@ -418,7 +572,7 @@ async function runHeadlessTurnInner({
     // descendants alive in the same group. Deleting the breadcrumb here was
     // self-erasing in exactly that case -- the one where a later sweep is the
     // only thing that could still find them.
-    clearChildRecordIfGroupGone(turnDir, child.pid);
+    clearChildRecordIfGroupGone(turnDir, child);
   });
   // Leave a breadcrumb a later sweep can act on: SIGKILL gives this process no
   // chance to clean up, and without a persisted identity the child is invisible.
@@ -440,7 +594,12 @@ async function runHeadlessTurnInner({
     child.stdin.end();
   }
 
-  const exit = await waitForExit(child, { timeoutMs, endSignalPath, log });
+  const exit = await waitForExit(child, {
+    timeoutMs,
+    endSignalPath,
+    log,
+    onWindowsTreeTermination: recordWindowsTreeTermination,
+  });
 
   const stdout = stdoutBuffer.value();
   const stderr = stderrBuffer.value();
@@ -549,7 +708,19 @@ function tail(text, max = 1500) {
   return `\nLast output:\n${trimmed.slice(-max)}`;
 }
 
-function waitForExit(child, { timeoutMs, endSignalPath, log }) {
+export function waitForExit(
+  child,
+  {
+    timeoutMs,
+    endSignalPath,
+    log,
+    platform = process.platform,
+    terminateWindowsTreeFn = terminateWindowsProcessTree,
+    pathExistsFn = fs.existsSync,
+    cancelPollMs = 1000,
+    onWindowsTreeTermination = () => {},
+  }
+) {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (value) => {
@@ -564,18 +735,26 @@ function waitForExit(child, { timeoutMs, endSignalPath, log }) {
       Number.isFinite(timeoutMs) && timeoutMs > 0
         ? setTimeout(() => {
             log?.(`Headless turn exceeded ${timeoutMs}ms; terminating the partner process`);
-            kill(child);
-            finish({ kind: "timeout" });
+            const termination = kill(child, {
+              platform,
+              terminateWindowsTreeFn,
+              onWindowsTreeTermination,
+            });
+            finish({ kind: "timeout", termination });
           }, timeoutMs)
         : null;
 
     const cancelPoll = endSignalPath
       ? setInterval(() => {
-          if (fs.existsSync(endSignalPath)) {
-            kill(child);
-            finish({ kind: "cancelled" });
+          if (pathExistsFn(endSignalPath)) {
+            const termination = kill(child, {
+              platform,
+              terminateWindowsTreeFn,
+              onWindowsTreeTermination,
+            });
+            finish({ kind: "cancelled", termination });
           }
-        }, 1000)
+        }, cancelPollMs)
       : null;
 
     child.on("error", (err) =>
@@ -590,17 +769,26 @@ function waitForExit(child, { timeoutMs, endSignalPath, log }) {
  * CLI that shelled out does not leave descendants behind holding the pipes.
  * Falls back to the direct PID when there is no group to address.
  */
-function signalTree(child, signal) {
+function signalTree(
+  child,
+  signal,
+  {
+    platform = process.platform,
+    terminateWindowsTreeFn = terminateWindowsProcessTree,
+  } = {}
+) {
   const pid = child?.pid;
-  if (!Number.isSafeInteger(pid) || pid <= 0) return;
+  if (platform === "win32") {
+    return rememberWindowsTreeTermination(child, terminateWindowsTreeFn(pid));
+  }
 
-  if (process.platform !== "win32") {
-    try {
-      process.kill(-pid, signal);
-      return;
-    } catch {
-      // No group (never detached, or already reaped) -- fall through.
-    }
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+
+  try {
+    process.kill(-pid, signal);
+    return null;
+  } catch {
+    // No group (never detached, or already reaped) -- fall through.
   }
 
   try {
@@ -608,14 +796,36 @@ function signalTree(child, signal) {
   } catch {
     /* already gone */
   }
+  return null;
 }
 
-function kill(child) {
-  signalTree(child, "SIGTERM");
+function kill(
+  child,
+  {
+    platform = process.platform,
+    terminateWindowsTreeFn = terminateWindowsProcessTree,
+    onWindowsTreeTermination = () => {},
+  } = {}
+) {
+  if (platform === "win32") {
+    // Persist the uncertainty BEFORE invoking taskkill. If this process dies in
+    // the call, or the call fails, a missing wrapper pid must not become cleanup
+    // authorization. The succeeding transition is the proof that removes it.
+    onWindowsTreeTermination("pending");
+    const result = signalTree(child, "SIGKILL", {
+      platform,
+      terminateWindowsTreeFn,
+    });
+    onWindowsTreeTermination(result?.status ?? "failed", result?.reason ?? null);
+    return result;
+  }
+
+  signalTree(child, "SIGTERM", { platform });
   // Escalate if the CLI ignores SIGTERM while draining.
   setTimeout(() => {
-    signalTree(child, "SIGKILL");
+    signalTree(child, "SIGKILL", { platform });
   }, 2000).unref?.();
+  return null;
 }
 
 function writeChildRecord(turnDir, child, command) {
@@ -955,10 +1165,10 @@ export async function reapOrphanedHeadlessChildren(
       // record was gone, unfindable. If this process exited inside that
       // two-second window the escalation went with it and nothing could ever
       // locate the orphan again.
-      await terminateProcessTree(handle, { graceMs, pollMs });
+      const terminated = await terminateProcessTree(handle, { graceMs, pollMs });
       signalled += 1;
 
-      if (isProcessTreeAlive(handle)) {
+      if (!terminated || isProcessTreeAlive(handle)) {
         // Survived TERM and KILL. The record is the only handle to it, so it
         // stays for the next sweep rather than being thrown away.
         const attempts = Number.isSafeInteger(record.reap_attempts) ? record.reap_attempts : 0;
@@ -1005,7 +1215,16 @@ function clearChildRecord(turnDir) {
  * Keeping it costs one small file until the next sweep looks at it; dropping it
  * early costs the only means of ever finding a surviving descendant.
  */
-function clearChildRecordIfGroupGone(turnDir, pid) {
-  if (isProcessTreeAlive({ pid })) return;
+function clearChildRecordIfGroupGone(turnDir, child) {
+  // On Windows `close` belongs to the cmd.exe wrapper. If taskkill failed, its
+  // absence cannot prove the Claude/Codex descendant is gone, so retain the
+  // breadcrumb for diagnosis and a later conservative sweep.
+  if (
+    process.platform === "win32" &&
+    child?.[WINDOWS_TREE_TERMINATION]?.status === "failed"
+  ) {
+    return;
+  }
+  if (isProcessTreeAlive(child)) return;
   clearChildRecord(turnDir);
 }

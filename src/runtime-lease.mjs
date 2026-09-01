@@ -55,7 +55,7 @@ import {
 } from "./platform.mjs";
 import { probeGroup, probeProcess, probeRecordedProcess } from "./process-probe.mjs";
 import { probeDirectoryInUse } from "./directory-usage.mjs";
-import { probeTmuxSessionSync } from "./tmux-runtime.mjs";
+import { probeTmuxSessionSync, probeWslPaneProcess } from "./tmux-runtime.mjs";
 
 const LEASE_SCHEMA_VERSION = 1;
 /**
@@ -492,6 +492,19 @@ export function proveLeaseReleasable(meta, { now = Date.now(), dir = null } = {}
     const verdict = probeConsumer(consumer);
     if (verdict === "alive") return keep("the lease's consumer is still running");
     if (verdict !== "absent") {
+      // A failed/interrupted Windows taskkill deliberately records `unknown`
+      // after its cmd.exe wrapper disappears. That must retain on THIS boot,
+      // but it must not turn one failed cleanup into a permanent credential
+      // copy: a precise boot change proves every process from the recorded tree
+      // is gone, even though no descendant identity survived the wrapper.
+      if (
+        verdict === "unknown" &&
+        consumer.kind === "headless" &&
+        consumer.windows_tree_termination != null &&
+        isSameBoot(meta.boot) === false
+      ) {
+        return releasable();
+      }
       return keep(`the lease's consumer could not be probed (${verdict})`);
     }
 
@@ -593,9 +606,10 @@ function probeOwner(meta) {
  * descendant survives":
  *
  *   - a child that calls setsid() leaves the group and becomes invisible here;
- *   - on Windows there is no group at all. The headless engine spawns with
- *     `detached: false` there, so the direct pid is the only handle that exists,
- *     and a launcher which forks and exits reads as absent.
+ *   - on Windows there is no POSIX group. The headless engine therefore uses
+ *     taskkill.exe /T /F for timeout/cancellation and records whether that tree
+ *     operation succeeded. A failed or interrupted tree kill is retained even
+ *     after the direct cmd.exe wrapper disappears.
  *
  * In both cases a descendant could still hold the isolated home when the lease
  * is released. Closing it properly needs a Job Object on Windows and a cgroup
@@ -630,10 +644,27 @@ function probeOwner(meta) {
  * What remains bounded is the credential itself. The user's real auth is never
  * moved, only copied from, so nothing here can damage the source.
  */
-function probeConsumer(consumer) {
+export function probeLeaseConsumer(
+  consumer,
+  {
+    probeTmuxSessionFn = probeTmuxSessionSync,
+    probeWslPaneProcessFn = probeWslPaneProcess,
+    probeRecordedProcessFn = probeRecordedProcess,
+    probeGroupFn = probeGroup,
+    platform = process.platform,
+  } = {}
+) {
   if (consumer.kind === "tmux") {
     if (typeof consumer.session_name !== "string" || !consumer.session_name) return "unknown";
-    const session = probeTmuxSessionSync(consumer.session_name);
+    const session = probeTmuxSessionFn(consumer.session_name, {
+      transport: consumer.tmux_transport ?? null,
+      distro: consumer.tmux_distro ?? null,
+      tmuxLauncher: consumer.tmux_launcher ?? null,
+      tmuxControlBinary: consumer.tmux_control_binary ?? null,
+      tmuxSocketName: consumer.tmux_socket_name ?? null,
+      requireExactIdentity: true,
+      platform,
+    });
     if (session !== "absent") return session;
     // THE PANE BEING GONE IS NOT THE PROGRAM BEING GONE, and the difference was
     // observable on every single turn: codex flushes its models cache during
@@ -657,22 +688,56 @@ function probeConsumer(consumer) {
     // The RECORDED process, not merely its pid: after a crash and pid reuse an
     // unrelated long-lived process would otherwise make this lease look alive
     // forever, retaining a credential copy permanently.
-    const pane = probeRecordedProcess(consumer.pane_pid, consumer.pane_started_at ?? null);
+    const pane =
+      consumer.tmux_transport === "wsl"
+        ? probeWslPaneProcessFn(
+            consumer.pane_pid,
+            consumer.pane_started_at ?? null,
+            {
+              transport: "wsl",
+              distro: consumer.tmux_distro ?? null,
+              tmuxLauncher: consumer.tmux_launcher ?? null,
+              tmuxControlBinary: consumer.tmux_control_binary ?? null,
+              tmuxSocketName: consumer.tmux_socket_name ?? null,
+              requireExactIdentity: true,
+              platform,
+            }
+          )
+        : probeRecordedProcessFn(consumer.pane_pid, consumer.pane_started_at ?? null);
     if (pane === "invalid") return "unknown";
     return pane;
   }
   if (consumer.kind === "headless") {
-    const pidVerdict = probeRecordedProcess(consumer.pid, consumer.started_at ?? null);
+    const pidVerdict = probeRecordedProcessFn(consumer.pid, consumer.started_at ?? null);
     if (pidVerdict === "invalid") return "unknown";
     if (pidVerdict !== "absent") return pidVerdict;
-    if (process.platform === "win32") return "absent";
+    if (platform === "win32") {
+      // A missing cmd.exe wrapper normally means a naturally completed turn.
+      // New records start as `running` and transition either to a naturally
+      // observed wrapper exit or to taskkill's result. Starting conservative is
+      // important: even if persisting `pending` fails, the older `running`
+      // record still retains. `pending`, `failed`, `running`, or a future status
+      // this version does not understand all retain rather than turning wrapper
+      // absence into permission to delete the isolated home.
+      const treeTermination = consumer.windows_tree_termination;
+      const authorizesAbsence =
+        treeTermination == null ||
+        treeTermination === "succeeded" ||
+        treeTermination === "wrapper-exit-observed";
+      if (!authorizesAbsence) return "unknown";
+      return "absent";
+    }
     // The leader is gone, but a TERM-ignoring descendant can keep the group --
     // and the group is what holds the CLI that has our credentials open.
-    const groupVerdict = probeGroup(consumer.pgid);
+    const groupVerdict = probeGroupFn(consumer.pgid);
     if (groupVerdict === "invalid") return "unknown";
     return groupVerdict;
   }
   return "unknown";
+}
+
+function probeConsumer(consumer) {
+  return probeLeaseConsumer(consumer);
 }
 
 /**

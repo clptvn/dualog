@@ -3,8 +3,10 @@ import path from "path";
 import { execFileSync } from "child_process";
 import { fileURLToPath } from "url";
 import { isProcessAlive } from "./shared.mjs";
+import { ENGINES } from "./adapters/schema.mjs";
 
 const RUNNER_TOKEN_PREFIX = "--runner-token=";
+const RUNNER_RUNTIME_PREFIX = "--dualog-runner-runtime=";
 const SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 /**
@@ -34,9 +36,140 @@ export function buildRunnerTokenArg(token) {
   return `${RUNNER_TOKEN_PREFIX}${token}`;
 }
 
+function lastPrefixedArgIndex(argv, prefix) {
+  for (let index = argv.length - 1; index >= 0; index--) {
+    if (argv[index].startsWith(prefix)) return index;
+  }
+  return -1;
+}
+
 export function readRunnerToken(argv = process.argv) {
-  const arg = argv.find((value) => value.startsWith(RUNNER_TOKEN_PREFIX));
-  return arg ? arg.slice(RUNNER_TOKEN_PREFIX.length) : null;
+  // All earlier positions include user-controlled model/command strings. The
+  // server appends its real token after them, so the last token-shaped value is
+  // the only one that can establish the internal-control tail.
+  const index = lastPrefixedArgIndex(argv, RUNNER_TOKEN_PREFIX);
+  return index >= 0 ? argv[index].slice(RUNNER_TOKEN_PREFIX.length) : null;
+}
+
+/**
+ * Carry the runtime decision selected by start-tool preflight into the detached
+ * runner without turning persisted state into executable-path authority.
+ *
+ * Engine and comparison-only tmux identity cross the process boundary. The
+ * runner recomputes executable paths and the login shell from its inherited
+ * trusted environment, then refuses if launcher, control binary, socket, or
+ * WSL distro differs. Encoded values never become executable authority.
+ */
+function normalizeRunnerRuntimeDecision(decision, source) {
+  if (!decision || typeof decision !== "object" || Array.isArray(decision)) {
+    throw new Error(`${source} runtime decision must be an object`);
+  }
+  if (decision.version !== 1) {
+    throw new Error(
+      `${source} runtime decision has unsupported version ${JSON.stringify(decision.version)}`
+    );
+  }
+  const engine = decision.engine;
+  if (!ENGINES.includes(engine)) {
+    throw new Error(
+      `${source} runtime decision has unknown engine ${JSON.stringify(engine)}. ` +
+        `Valid engines: ${ENGINES.join(", ")}`
+    );
+  }
+  const tmuxTransport = decision.tmuxTransport ?? null;
+  const tmuxDistro =
+    typeof decision.tmuxDistro === "string"
+      ? decision.tmuxDistro.trim() || null
+      : decision.tmuxDistro ?? null;
+  const tmuxLauncher = decision.tmuxLauncher ?? null;
+  const tmuxControlBinary = decision.tmuxControlBinary ?? null;
+  const tmuxSocketName = decision.tmuxSocketName ?? null;
+
+  if (engine === "headless") {
+    if (
+      tmuxTransport !== null ||
+      tmuxDistro !== null ||
+      tmuxLauncher !== null ||
+      tmuxControlBinary !== null ||
+      tmuxSocketName !== null
+    ) {
+      throw new Error(`${source} headless runtime decision cannot name a tmux route`);
+    }
+  } else if (engine === "tmux-interactive") {
+    if (tmuxTransport !== "local" && tmuxTransport !== "wsl") {
+      throw new Error(
+        `${source} interactive runtime decision must use local or wsl tmux`
+      );
+    }
+    if (tmuxTransport === "wsl" && !tmuxDistro) {
+      throw new Error(`${source} WSL runtime decision must pin a distribution`);
+    }
+    if (
+      tmuxTransport === "wsl" &&
+      (tmuxDistro.length > 256 || /[\u0000-\u001f\u007f]/u.test(tmuxDistro))
+    ) {
+      throw new Error(`${source} WSL runtime decision has an invalid distribution name`);
+    }
+    if (tmuxTransport === "local" && tmuxDistro !== null) {
+      throw new Error(`${source} local tmux runtime decision cannot name a WSL distribution`);
+    }
+    for (const [label, value, maxLength] of [
+      ["launcher", tmuxLauncher, 4096],
+      ["control binary", tmuxControlBinary, 4096],
+      ["socket", tmuxSocketName, 256],
+    ]) {
+      if (
+        typeof value !== "string" ||
+        !value ||
+        value.length > maxLength ||
+        /[\u0000-\u001f\u007f]/u.test(value)
+      ) {
+        throw new Error(`${source} interactive runtime decision has an invalid tmux ${label}`);
+      }
+    }
+    if (tmuxSocketName.includes("/")) {
+      throw new Error(`${source} interactive runtime decision has an invalid tmux socket`);
+    }
+  }
+
+  return Object.freeze({
+    version: 1,
+    engine,
+    tmuxTransport,
+    tmuxDistro,
+    tmuxLauncher,
+    tmuxControlBinary,
+    tmuxSocketName,
+  });
+}
+
+export function buildRunnerRuntimeArg(decision) {
+  const normalized = normalizeRunnerRuntimeDecision(decision, "Preflight");
+  const encoded = Buffer.from(JSON.stringify(normalized), "utf-8").toString("base64url");
+  return `${RUNNER_RUNTIME_PREFIX}${encoded}`;
+}
+
+export function readRunnerRuntimeDecision(argv = process.argv) {
+  const tokenIndex = lastPrefixedArgIndex(argv, RUNNER_TOKEN_PREFIX);
+  if (tokenIndex < 0) return null;
+  const args = argv
+    .slice(tokenIndex + 1)
+    .filter((value) => value.startsWith(RUNNER_RUNTIME_PREFIX));
+  if (args.length === 0) return null;
+  if (args.length > 1) {
+    throw new Error("Runner received more than one runtime decision");
+  }
+  const encoded = args[0].slice(RUNNER_RUNTIME_PREFIX.length);
+  let parsed;
+  try {
+    parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf-8"));
+  } catch (err) {
+    throw new Error(
+      `Runner received an invalid runtime decision: ${err.message}`,
+      { cause: err }
+    );
+  }
+  return normalizeRunnerRuntimeDecision(parsed, "Runner");
 }
 
 /**

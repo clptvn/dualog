@@ -122,6 +122,10 @@ for (const { hostAgent, partnerAgent, readyBanner } of [
     `sentinel env reaches a spawned ${partnerAgent} partner`,
     { timeout: 40000 },
     async (t) => {
+      if (process.platform === "win32") {
+        t.skip("native POSIX tmux sentinel fixture; WSL env propagation has separate coverage");
+        return;
+      }
       if (!(await isTmuxAvailable())) {
         t.skip("tmux is not available");
         return;

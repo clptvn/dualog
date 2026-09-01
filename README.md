@@ -18,8 +18,8 @@ Run `list_adapters` to see which are installed on your machine.
 
 | Agent | id | Engine | Notes |
 | --- | --- | --- | --- |
-| Claude Code | `claude` | tmux | Renders inline, no alt screen - the best TUI target |
-| Codex | `codex` | tmux | `--oss --local-provider ollama` drives local models with no extra setup |
+| Claude Code | `claude` | tmux or headless | Renders inline, no alt screen — the best TUI target |
+| Codex | `codex` | tmux or headless | `--oss --local-provider ollama` drives local models with no extra setup |
 | Grok Build | `grok` | tmux or headless | Positional prompt seeds the TUI, so no keystroke injection |
 | opencode | `opencode` | headless | Best route to local/OSS models via an OpenAI-compatible base URL |
 | Qwen Code | `qwen` | headless | Full `OPENAI_BASE_URL` support (Ollama, LM Studio, vLLM, OpenRouter) |
@@ -32,19 +32,99 @@ Gemini is deliberately **not** shipped: Google stopped serving Gemini CLI reques
 
 ## Install
 
+### macOS, Linux, or inside WSL
+
 ```bash
 git clone https://github.com/clptvn/dualog.git
 cd dualog
-npm run setup            # or: --claude | --codex | --both
+./install.sh --both      # or: --claude | --codex
 ```
 
-Requires Node ≥ 18, `tmux` for tmux-engine partners, and whichever agent CLIs you actually want to use. macOS, Linux, and WSL (no core Windows compatibility, but a Claude Code or Codex session in their respective Windows GUIs can call CLIs installed in WSL).
+`npm run setup -- --both` is equivalent. The installer detects native Windows;
+on macOS, Linux, and inside WSL it installs locally in the current host. It
+requires Node.js ≥ 18 and whichever partner CLIs you intend to call;
+interactive partners also require `tmux` in the environment where they run.
+
+### Native Windows with WSL
+
+From PowerShell:
+
+```powershell
+git clone https://github.com/clptvn/dualog.git
+cd dualog
+.\install.ps1 -Both
+```
+
+The Windows installer configures both native/Desktop hosts and hosts running
+inside the selected WSL distribution. It detects and pins the exact distribution,
+checks Node.js, `tmux`, Claude Code, and Codex separately on Windows and in WSL,
+and installs the WSL-side commands/skills when WSL has Node.js ≥ 18. If WSL,
+the selected distribution, or WSL's Node.js is unavailable, it leaves the native
+configuration intact and prints the exact manual WSL command. A later path-
+translation or nested-installer failure is a hard error and occurs before any
+new native registrations are written. Earlier legacy cleanup or dependency
+bootstrap work is not transactionally rolled back.
+
+Use `-Distro "Ubuntu-24.04"` to override the default distribution,
+`-WslBinary "C:\path\to\wsl.exe"` for a custom launcher, or `-HostOnly` to skip
+the WSL-host installation. A custom WSL launcher must be an absolute Windows
+`.exe` or `.com` path; relative, PATH-only, `.cmd`, and `.bat` launchers are
+rejected before installation changes anything. The direct Node equivalents are
+`--wsl-distro`, `--wsl-binary`, and `--host-only`:
+
+```powershell
+node scripts/install.mjs --both --wsl-distro Ubuntu-24.04
+```
+
+For all four Windows/WSL directions, install and authenticate Claude Code and
+Codex inside that WSL distribution, and install `tmux` there. Configuration is
+host-local: native Windows Codex clients share the Windows user's
+`~/.codex/config.toml` (or `$env:CODEX_HOME\config.toml`), while the native
+Claude Code CLI and local Windows sessions in Claude Desktop's Code tab share
+the Windows user's `~/.claude.json`. The nested WSL step writes the corresponding
+files in the WSL user's home. A Code-tab session whose environment is WSL uses
+that WSL-side registration.
+
+| Host | Partner | Installation route |
+| --- | --- | --- |
+| Codex Desktop on Windows | Claude Code in WSL | Native registration, pinned WSL runtime |
+| Claude Desktop Code tab, local Windows environment | Codex in WSL | Native registration, pinned WSL runtime and WSL auth seed |
+| Claude Code in WSL | Codex in the same WSL distro | WSL-side registration installed automatically |
+| Codex in WSL | Claude Code in the same WSL distro | WSL-side registration installed automatically |
+
+On native Windows, dualog automatically runs interactive sessions through tmux
+in the pinned WSL distribution. Drive-letter paths and both `\\wsl$` and
+`\\wsl.localhost` paths are translated without changing paths embedded in the
+code or diff being reviewed. If an adapter supports headless mode and its WSL
+CLI is unavailable, dualog can fall back to the native headless CLI. Environment
+overrides remain available as `DUALOG_WSL_DISTRO`, `DUALOG_WSL_BINARY`, and
+`DUALOG_TMUX_BINARY`. On native Windows, custom WSL and tmux control binaries
+must be absolute `.exe` or `.com` paths so Desktop launches and synchronous
+cleanup probes use the same executable.
+
+WSL routing is active only on native Windows. On macOS and Linux, WSL-specific
+environment variables do not change the native tmux route or path handling.
+
+Uninstall is symmetric: use `./uninstall.sh --both` on macOS/Linux/WSL or
+`.\uninstall.ps1 -Both` on Windows. The Windows uninstaller removes the matching
+native and selected-WSL registrations.
 
 ### Upgrading from prior versions
 
 Upgrading from `claude-codex-dialog`? The installer migrates you: it removes the old `codex-dialog` MCP registration, rewrites hook matchers, and deletes the old slash commands. The tool namespace moves from `mcp__codex-dialog__*` to `mcp__dualog__*`, so this is a clean break rather than a dual-registration. Existing sessions under `~/.claude/dialogs` stay readable.
 
 Upgrading to the latest `dualog`? Pull the most recent version of the code, then run the installer. The installer replaces the old `dualog` MCP registration, updates hook matchers, and updates slash commands.
+
+PR-panel sessions created before the durable finding ledger remain readable,
+but they fail closed for new approval. Start a new panel under the updated
+contract when you need a fresh approval.
+
+Security upgrade note: finish active tmux-backed dialogs before updating from a
+version that predates exact tmux route identity. After restart, Dualog retains
+legacy leases and refuses `send_key` or automatic cleanup rather than guessing
+which launcher, distribution, or socket owns them. End or manually clean up any
+pre-upgrade tmux session, then start a fresh turn. Fresh macOS and Linux turns
+continue to use native tmux.
 
 ## Use
 
@@ -79,6 +159,11 @@ design, and optionally simplification — each in its own partner turn carrying
 only that specialist's rubric, and a final pass consolidates them into one
 prioritized report. Aspects are selected from the diff unless you name them, and
 the ones that were *not* run are reported as explicitly as the ones that were.
+
+Every blocking specialist finding receives a durable ID. Approval is rejected if
+a selected pass failed or was unverified, if a finding is still carried forward,
+or if any finding lacks an explicit disposition. Resolved, false-positive,
+pre-existing, and duplicate dispositions require a rationale.
 
 Splitting the lenses is the point. A single prompt holding all six rubrics
 produces a generalist doing six things adequately, which is what the panel exists
@@ -178,7 +263,9 @@ effort **is** validated against the chosen agent — an unsupported effort flag 
 stop a CLI from starting — and a dropped option is reported back to the caller
 rather than silently ignored.
 
-Environment: `DUALOG_TMUX_SOCKET`, `DUALOG_TMUX_BINARY`, `DUALOG_IDLE_SHUTDOWN_MS`, `DUALOG_STRATEGY`, `DUALOG_ADAPTER_PATH`, `DUALOG_MAX_DEPTH`.
+Environment: `DUALOG_TMUX_SOCKET`, `DUALOG_TMUX_BINARY`, `DUALOG_WSL_BINARY`,
+`DUALOG_WSL_DISTRO`, `DUALOG_IDLE_SHUTDOWN_MS`, `DUALOG_STRATEGY`,
+`DUALOG_ADAPTER_PATH`, `DUALOG_MAX_DEPTH`.
 
 Sessions live in `~/.dualog/sessions/`.
 
@@ -193,7 +280,19 @@ npm test                 # contract suite, argv snapshots, marker equivalence, e
 npm run smoke:wait-tool  # boots the real MCP server over stdio
 ```
 
-Most supported CLIs are not installed on any given machine and have no free tier, so everything except the vendor's own behavior is made testable: schema validation, golden argv snapshots, fake CLI binaries driven through the real engines, and marker matching replayed against recorded pane transcripts with a cross-contamination guard (one agent's idle markers must never match another's busy screen).
+CI is configured to run both commands on current macOS, Windows, and Ubuntu
+runners.
+
+The four Windows/WSL routes are covered by deterministic simulations at the
+`wsl.exe` boundary and by the native-Windows CI job. This is not a real
+Desktop-to-WSL end-to-end run: on this Mac, neither Codex Desktop nor Claude
+Desktop was launched against an actual WSL distribution.
+
+Most supported CLIs are not installed on any given machine and have no free tier,
+so most behavior is tested without them: schema validation, golden argv
+snapshots, fake CLI binaries driven through the real engines, and marker matching
+replayed against recorded pane transcripts with a cross-contamination guard (one
+agent's idle markers must never match another's busy screen).
 
 ## License
 

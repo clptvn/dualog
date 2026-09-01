@@ -15,6 +15,7 @@ import {
   getSessionHostAgent,
   getSessionPartnerAgent,
   normalizeAgent,
+  parseFindingDispositions,
   readConversation,
   appendMessage,
   readStatus,
@@ -36,6 +37,7 @@ import {
   requestedReasoningEffortForAdapter,
 } from "./runtime-defaults.mjs";
 import {
+  buildRunnerRuntimeArg,
   buildRunnerTokenArg,
   isSessionRunnerAlive,
   markSessionRunnerStarted,
@@ -62,9 +64,11 @@ import {
   extractNormalizedFindings,
   selectAspects,
 } from "./pr-review-aspects.mjs";
-import { ENGINES, resolveEngine } from "./engines/index.mjs";
+import { ENGINES, resolveRunnableEngine } from "./engines/index.mjs";
 import { reapOrphanedHeadlessChildren } from "./engines/headless.mjs";
+import { resolvePartnerRuntimeContext } from "./partner-invocation.mjs";
 import { sweepLeases } from "./runtime-lease.mjs";
+import { tmuxRoute } from "./tmux-runtime.mjs";
 
 const server = new McpServer({
   name: "dualog",
@@ -207,6 +211,18 @@ function readOptionalJson(filePath) {
   } catch {
     return null;
   }
+}
+
+/** Compute review state with the durable PR-panel integrity record attached. */
+function computeSessionReviewStatus(status, messages, sessionDir) {
+  const panelState =
+    status?.type === "pr_review"
+      ? readOptionalJson(path.join(sessionDir, "panel_state.json"))
+      : null;
+  return computeReviewStatus(status, messages, {
+    problem: readProblem(sessionDir),
+    panelState,
+  });
 }
 
 function resolvePartnerCommandValue(
@@ -381,12 +397,26 @@ async function preflightPartner(partnerAgent, {
     };
   }
 
-  let engine;
+  let runtimeContext;
   try {
-    engine = resolveEngine(adapter);
+    runtimeContext = await resolvePartnerRuntimeContext({
+      partnerAgent,
+      partnerCommand,
+      projectPath: projectPath || process.cwd(),
+    });
   } catch (err) {
     return { ok: false, errorText: err.message };
   }
+  const engine = runtimeContext.engine;
+  const runtimeDecision = Object.freeze({
+    version: 1,
+    engine,
+    tmuxTransport: runtimeContext.tmuxTransport,
+    tmuxDistro: runtimeContext.tmuxDistro,
+    tmuxLauncher: runtimeContext.tmuxLauncher,
+    tmuxControlBinary: runtimeContext.tmuxControlBinary,
+    tmuxSocketName: runtimeContext.tmuxSocketName,
+  });
 
   const requestedEffort = requestedReasoningEffortForAdapter(reasoningEffort);
 
@@ -398,6 +428,8 @@ async function preflightPartner(partnerAgent, {
   const discoveredModels = await resolveDiscoveryForValidation(adapter, {
     model,
     projectPath,
+    engine,
+    tmuxRoute: runtimeContext.tmuxRoute,
   });
 
   let result;
@@ -405,6 +437,12 @@ async function preflightPartner(partnerAgent, {
     result = negotiate(adapter, {
       engine,
       partnerCommand,
+      // resolveRunnableEngine() already ran this exact partner command through
+      // the WSL shell tmux uses. A native PATH probe would reject that verified
+      // WSL executable before a Windows host can start an interactive turn.
+      requireBinary: !(
+        engine === "tmux-interactive" && runtimeContext.tmuxTransport === "wsl"
+      ),
       toolProfile: toolProfile || "read",
       model: model || null,
       reasoningEffort: requestedEffort,
@@ -430,6 +468,8 @@ async function preflightPartner(partnerAgent, {
 
   return {
     ok: true,
+    engine,
+    runtimeDecision,
     // What the caller asked for, echoed back untouched. This is the only field
     // that can prove the parameter survived transport: `effort` below is the
     // RESOLVED value, and a legitimate alias translation (goose maps xhigh ->
@@ -501,9 +541,7 @@ function buildSessionSnapshot(sessionId, options = {}) {
   const errorPath = path.join(sessionDir, "last_error.txt");
   const lastError = readOptionalText(errorPath);
   const budget = computeBudget(status, messages);
-  const reviewStatus = computeReviewStatus(status, messages, {
-    problem: readProblem(sessionDir),
-  });
+  const reviewStatus = computeSessionReviewStatus(status, messages, sessionDir);
   const projectPath = status?.project_path || process.cwd();
   const referencedFiles = extractReferencedFiles(
     newMessages,
@@ -897,6 +935,9 @@ server.tool(
       hard_cap: hardCap,
       reasoning_effort: effectiveReasoningEffort,
       model: effectiveModel ?? null,
+      engine: preflight.engine,
+      tmux_transport: preflight.runtimeDecision.tmuxTransport,
+      tmux_distro: preflight.runtimeDecision.tmuxDistro,
       partner_timeout_ms: partnerTimeoutMs,
       tool_profile: tool_profile || "read",
       allow_unknown_model: allow_unknown_model === true,
@@ -929,6 +970,7 @@ server.tool(
       tool_profile || "read",
       String(partnerTimeoutMs),
       buildRunnerTokenArg(runnerToken),
+      buildRunnerRuntimeArg(preflight.runtimeDecision),
       // Appended as a flag rather than a positional: the runners read their
       // options by index, and the preflight's answer has to survive into the
       // turn or the two validate the same id differently.
@@ -982,12 +1024,15 @@ server.tool(
               warnings: preflightWarnings,
               notices: preflight.notices ?? [],
               model: effectiveModel ?? "default",
+              engine: preflight.engine,
+              tmux_transport: preflight.runtimeDecision.tmuxTransport,
+              tmux_distro: preflight.runtimeDecision.tmuxDistro,
               partner_timeout_ms: partnerTimeoutMs,
               tool_profile: tool_profile || "read",
               subject_path: subjectPath,
               subject_kind: subjectPath ? (subject_kind || "document") : null,
               message:
-                `Dialog started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${effectiveModel ?? "default"}, reasoning effort: ${describeEffort(effectiveReasoningEffort, preflight.effectiveEffort)}, tool profile: ${tool_profile || "read"}. Partner turns run in detached tmux and are not killed by the wait hint. Send your first message with send_message, then wait for ${partnerDisplay}.`,
+                `Dialog started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${effectiveModel ?? "default"}, reasoning effort: ${describeEffort(effectiveReasoningEffort, preflight.effectiveEffort)}, tool profile: ${tool_profile || "read"}. Partner turns run ${preflight.engine === "headless" ? "headlessly and may be stopped by the wait hint" : "in detached tmux and are not killed by the wait hint"}. Send your first message with send_message, then wait for ${partnerDisplay}.`,
             },
             null,
             2
@@ -1208,16 +1253,24 @@ server.tool(
         diffLabel = `commit ${sha}`;
       } else {
         // Branch mode
-        const baseBranch = base_branch || "main";
-        const headBranch = branch || currentBranch;
+        const baseBranch = validateGitBranchName(
+          base_branch || "main",
+          "base_branch",
+          project_path
+        );
+        const headBranch = validateGitBranchName(
+          branch || currentBranch,
+          "branch",
+          project_path
+        );
 
         try {
-          diff = execFileSync("git", ["diff", `${baseBranch}...${headBranch}`], execOpts).toString();
-          diffStat = execFileSync("git", ["diff", "--stat", `${baseBranch}...${headBranch}`], { ...execOpts, timeout: 10000 }).toString();
+          diff = execFileSync("git", ["diff", "--end-of-options", `${baseBranch}...${headBranch}`], execOpts).toString();
+          diffStat = execFileSync("git", ["diff", "--stat", "--end-of-options", `${baseBranch}...${headBranch}`], { ...execOpts, timeout: 10000 }).toString();
         } catch {
           // Fall back to two-dot diff
-          diff = execFileSync("git", ["diff", `${baseBranch}..${headBranch}`], execOpts).toString();
-          diffStat = execFileSync("git", ["diff", "--stat", `${baseBranch}..${headBranch}`], { ...execOpts, timeout: 10000 }).toString();
+          diff = execFileSync("git", ["diff", "--end-of-options", `${baseBranch}..${headBranch}`], execOpts).toString();
+          diffStat = execFileSync("git", ["diff", "--stat", "--end-of-options", `${baseBranch}..${headBranch}`], { ...execOpts, timeout: 10000 }).toString();
         }
         diffLabel = `${headBranch} vs ${baseBranch}`;
       }
@@ -1296,6 +1349,9 @@ server.tool(
       hard_cap: hardCap,
       reasoning_effort: effectiveReasoningEffort,
       model: effectiveModel ?? null,
+      engine: preflight.engine,
+      tmux_transport: preflight.runtimeDecision.tmuxTransport,
+      tmux_distro: preflight.runtimeDecision.tmuxDistro,
       partner_timeout_ms: partnerTimeoutMs,
       allow_unknown_model: allow_unknown_model === true,
       runner_pid: null,
@@ -1324,6 +1380,7 @@ server.tool(
       partnerAgent,
       String(partnerTimeoutMs),
       buildRunnerTokenArg(runnerToken),
+      buildRunnerRuntimeArg(preflight.runtimeDecision),
       // Appended as a flag rather than a positional: the runners read their
       // options by index, and the preflight's answer has to survive into the
       // turn or the two validate the same id differently.
@@ -1388,9 +1445,12 @@ server.tool(
               warnings: preflightWarnings,
               notices: preflight.notices ?? [],
               model: effectiveModel ?? "default",
+              engine: preflight.engine,
+              tmux_transport: preflight.runtimeDecision.tmuxTransport,
+              tmux_distro: preflight.runtimeDecision.tmuxDistro,
               partner_timeout_ms: partnerTimeoutMs,
               message:
-                `Code review started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${effectiveModel ?? "default"}, reasoning effort: ${describeEffort(effectiveReasoningEffort, preflight.effectiveEffort)}. ${partnerDisplay} is generating an initial review in detached tmux and is not killed by the wait hint.` +
+                `Code review started with a soft budget of ${softCap} rounds (hard cap ${hardCap}), partner wait hint ${(partnerTimeoutMs / 60000).toFixed(1)} minutes, model: ${effectiveModel ?? "default"}, reasoning effort: ${describeEffort(effectiveReasoningEffort, preflight.effectiveEffort)}. ${partnerDisplay} is generating an initial review ${preflight.engine === "headless" ? "headlessly and may be stopped by the wait hint" : "in detached tmux and is not killed by the wait hint"}.` +
                 (diff.length > MAX_REVIEW_DIFF_CHARS
                   ? ` NOTE: this diff is ${diff.length} chars and only the first ${MAX_REVIEW_DIFF_CHARS} (${Math.round((MAX_REVIEW_DIFF_CHARS / diff.length) * 100)}%) are embedded in ${partnerDisplay}'s prompt. It is instructed to read the changed files from ${project_path} for the remainder, but treat any finding that depends on the unembedded portion as unverified unless it cites the file it read.`
                   : ""),
@@ -1447,9 +1507,7 @@ server.tool(
     }
 
     const budget = computeBudget(status, messages);
-    const reviewStatus = computeReviewStatus(status, messages, {
-      problem: readProblem(sessionDir),
-    });
+    const reviewStatus = computeSessionReviewStatus(status, messages, sessionDir);
 
     return {
       content: [
@@ -1484,17 +1542,53 @@ server.tool(
  * this fails on a CLI that may be missing, unauthenticated, or pointed at
  * another host -- and each of those needs its own instruction to be actionable.
  */
-function resolvePullRequest(ref, projectPath) {
+function validatePullRequestRef(ref) {
   // A ref is a positional argument, so nothing shell-interprets it -- but `gh`
   // still parses a leading dash as one of its own flags, and `--repo=other/repo`
   // would quietly review a different repository than the one the caller named.
   // The change would be reviewed correctly and be the wrong change.
-  if (typeof ref !== "string" || ref.startsWith("-")) {
+  const value = typeof ref === "number" ? String(ref) : ref;
+  if (typeof value !== "string" || !value.trim() || value.startsWith("-")) {
     throw new Error(
-      `Invalid pull request reference ${JSON.stringify(ref)}: it may not begin with "-", ` +
+      `Invalid pull request reference ${JSON.stringify(ref)}: it must be non-empty and may not begin with "-", ` +
         `which gh would read as one of its own flags rather than as a PR.`
     );
   }
+  return value;
+}
+
+/** Validate a user/persisted branch before placing it in a git revision range. */
+function validateGitBranchName(ref, label, projectPath) {
+  if (typeof ref !== "string" || !ref.trim() || ref.startsWith("-")) {
+    throw new Error(
+      `Invalid ${label} ${JSON.stringify(ref)}: expected a branch name, not a git option.`
+    );
+  }
+  // Detached checkouts report this pseudo-ref, and callers also use HEAD to
+  // compare a branch with itself. Git deliberately rejects HEAD as a *new branch
+  // name*, but it is a safe, unambiguous revision endpoint after
+  // `--end-of-options`.
+  if (ref === "HEAD") return ref;
+  try {
+    // `--branch` applies Git's own branch-name grammar (including the ban on
+    // `..`, which could otherwise change the range we construct below). It does
+    // not require the branch to exist, so remote/not-yet-fetched names remain
+    // valid inputs and the eventual diff retains its useful error message.
+    execFileSync("git", ["check-ref-format", "--branch", ref], {
+      cwd: projectPath,
+      timeout: 10000,
+      stdio: "pipe",
+    });
+  } catch {
+    throw new Error(
+      `Invalid ${label} ${JSON.stringify(ref)}: it is not a valid Git branch name.`
+    );
+  }
+  return ref;
+}
+
+function resolvePullRequest(ref, projectPath) {
+  const safeRef = validatePullRequestRef(ref);
 
   const execOpts = {
     cwd: projectPath,
@@ -1509,7 +1603,7 @@ function resolvePullRequest(ref, projectPath) {
       [
         "pr",
         "view",
-        ref,
+        safeRef,
         "--json",
         "number,title,body,author,baseRefName,headRefName,url,state,isDraft",
       ],
@@ -1529,7 +1623,7 @@ function resolvePullRequest(ref, projectPath) {
       );
     }
     throw new Error(
-      `Could not read pull request "${ref}": ${stderr || err.message}`
+      `Could not read pull request "${safeRef}": ${stderr || err.message}`
     );
   }
 
@@ -1542,7 +1636,7 @@ function resolvePullRequest(ref, projectPath) {
 
   let diff;
   try {
-    diff = execFileSync("gh", ["pr", "diff", ref], execOpts).toString();
+    diff = execFileSync("gh", ["pr", "diff", safeRef], execOpts).toString();
   } catch (err) {
     const stderr = (err.stderr || "").toString().trim();
     throw new Error(
@@ -1810,10 +1904,18 @@ server.tool(
         diff = execFileSync("git", ["show", sha, "--format="], execOpts).toString();
         scopeLabel = `commit ${sha}`;
       } else if (target === "branch") {
-        const baseBranch = base_branch || "main";
-        const headBranch = branch || currentBranch;
+        const baseBranch = validateGitBranchName(
+          base_branch || "main",
+          "base_branch",
+          project_path
+        );
+        const headBranch = validateGitBranchName(
+          branch || currentBranch,
+          "branch",
+          project_path
+        );
         try {
-          diff = execFileSync("git", ["diff", `${baseBranch}...${headBranch}`], execOpts).toString();
+          diff = execFileSync("git", ["diff", "--end-of-options", `${baseBranch}...${headBranch}`], execOpts).toString();
         } catch {
           // Keep the fallback -- it is the right recovery for a stale base, a
           // shallow clone, or a detached HEAD -- but say so. Three dots is
@@ -1821,7 +1923,7 @@ server.tool(
           // the branch point, so the panel can end up reviewing commits the
           // author never wrote and filing findings against them, all under a
           // label that still reads "branch X vs Y".
-          diff = execFileSync("git", ["diff", `${baseBranch}..${headBranch}`], execOpts).toString();
+          diff = execFileSync("git", ["diff", "--end-of-options", `${baseBranch}..${headBranch}`], execOpts).toString();
           startupNotices.push(
             `the three-dot (merge-base) diff of ${baseBranch}...${headBranch} failed, so a two-dot diff was used instead: the review may include commits added to ${baseBranch} since the branch point`
           );
@@ -1970,6 +2072,9 @@ server.tool(
       hard_cap: hardCap,
       reasoning_effort: preflight.effort,
       model: preflight.model ?? null,
+      engine: preflight.engine,
+      tmux_transport: preflight.runtimeDecision.tmuxTransport,
+      tmux_distro: preflight.runtimeDecision.tmuxDistro,
       partner_timeout_ms: partnerTimeoutMs,
       allow_unknown_model: allow_unknown_model === true,
       runner_pid: null,
@@ -1996,6 +2101,7 @@ server.tool(
         partnerAgent,
         String(partnerTimeoutMs),
         buildRunnerTokenArg(runnerToken),
+        buildRunnerRuntimeArg(preflight.runtimeDecision),
         ...(allow_unknown_model === true ? ["--allow-unknown-model"] : []),
       ],
       {
@@ -2049,6 +2155,7 @@ server.tool(
               diff_size: diff.length,
               diff_chars_embedded: Math.min(diff.length, MAX_REVIEW_DIFF_CHARS),
               diff_truncated: diff.length > MAX_REVIEW_DIFF_CHARS,
+              authoritative_diff_path: path.join(sessionDir, "diff.patch"),
               host_agent: hostAgent,
               partner_agent: partnerAgent,
               partner_command: partnerCommand,
@@ -2062,6 +2169,9 @@ server.tool(
               warnings: preflight.warnings ?? [],
               notices,
               model: preflight.model ?? "default",
+              engine: preflight.engine,
+              tmux_transport: preflight.runtimeDecision.tmuxTransport,
+              tmux_distro: preflight.runtimeDecision.tmuxDistro,
               partner_timeout_ms: partnerTimeoutMs,
               message:
                 `PR review panel started: ${panelPasses} specialist pass(es) (${selection.selected.join(", ")}) ` +
@@ -2074,7 +2184,7 @@ server.tool(
                   ? ` Skipped aspects: ${skipped.map((s) => `${s.aspect} (${s.reason})`).join("; ")}. An aspect nobody ran is not an aspect that came back clean.`
                   : "") +
                 (diff.length > MAX_REVIEW_DIFF_CHARS
-                  ? ` NOTE: the diff is ${diff.length} chars and only the first ${MAX_REVIEW_DIFF_CHARS} are embedded in each pass's prompt; specialists are told to read the rest from ${project_path}.`
+                  ? ` NOTE: the diff is ${diff.length} chars and only the first ${MAX_REVIEW_DIFF_CHARS} are embedded in each pass's prompt; the complete authoritative diff remains in this session's diff.patch artifact, whose partner-visible path is supplied to every specialist.`
                   : ""),
             },
             null,
@@ -2122,43 +2232,160 @@ server.tool(
     const partnerAgent = getSessionPartnerAgent(status);
     const meta = readOptionalJson(path.join(sessionDir, "pr_review_meta.json"));
     const panel = readOptionalJson(path.join(sessionDir, "panel_state.json"));
+    const planned = meta?.aspects ?? status?.aspects ?? [];
+    const partnerMessages = messages.filter((message) => message.from === partnerAgent);
+    const partnerById = new Map(partnerMessages.map((message) => [message.id, message]));
+    const reviewStatus = computeSessionReviewStatus(status, messages, sessionDir);
+    const ledgerTrusted =
+      reviewStatus?.panel_integrity?.finding_contract?.valid === true;
 
     // Aspect attribution comes from the header the runner writes, not from
     // guessing at content: a specialist that mentions another aspect by name in
     // its prose must not be filed under it.
     const aspectReports = [];
     let consolidated = null;
-    for (const msg of messages) {
-      if (msg.from !== partnerAgent) continue;
-      // Pattern and producer are imported from one place, so the header cannot
-      // drift out from under the parser and silently empty the report.
-      const header = msg.content.match(ASPECT_HEADER_RE);
-      if (header) {
+    const completed = Array.isArray(panel?.completed) ? panel.completed : [];
+    const uniqueCompletion = (aspect) => {
+      const matches = completed.filter((entry) => entry?.aspect === aspect);
+      return matches.length === 1 ? matches[0] : null;
+    };
+    const hasLinkedPanelState =
+      panel?.finding_ledger_version != null &&
+      completed.some((entry) => Number.isSafeInteger(entry?.message_id));
+
+    if (hasLinkedPanelState) {
+      for (const aspect of planned) {
+        const completion = uniqueCompletion(aspect);
+        const msg = partnerById.get(completion?.message_id);
+        const header = msg?.content?.match(ASPECT_HEADER_RE);
+        if (!msg || header?.[4] !== aspect) continue;
         aspectReports.push({
-          aspect: header[4],
+          aspect,
           message_id: msg.id,
           result: extractAspectResult(msg.content),
           findings: extractNormalizedFindings(msg.content),
           ...(include_reports ? { report: msg.content } : {}),
         });
-        continue;
       }
-      if (CONSOLIDATED_HEADER_RE.test(msg.content)) {
+      const aggregate = uniqueCompletion("__aggregate__");
+      const aggregateMessage = partnerById.get(aggregate?.message_id);
+      if (
+        aggregate?.status === "complete" &&
+        aggregateMessage &&
+        CONSOLIDATED_HEADER_RE.test(aggregateMessage.content)
+      ) {
         consolidated = {
-          message_id: msg.id,
-          content: msg.content,
-          findings: extractNormalizedFindings(msg.content),
+          message_id: aggregateMessage.id,
+          content: aggregateMessage.content,
+          findings: extractNormalizedFindings(aggregateMessage.content),
         };
+      }
+    } else {
+      // Read-only compatibility for historical sessions. They cannot newly
+      // approve without the v1 ledger, but their existing reports remain useful.
+      for (const msg of partnerMessages) {
+        const header = msg.content.match(ASPECT_HEADER_RE);
+        if (header) {
+          aspectReports.push({
+            aspect: header[4],
+            message_id: msg.id,
+            result: extractAspectResult(msg.content),
+            findings: extractNormalizedFindings(msg.content),
+            ...(include_reports ? { report: msg.content } : {}),
+          });
+          continue;
+        }
+        if (CONSOLIDATED_HEADER_RE.test(msg.content)) {
+          consolidated = {
+            message_id: msg.id,
+            content: msg.content,
+            findings: extractNormalizedFindings(msg.content),
+          };
+        }
       }
     }
 
     const byCategory = Object.fromEntries(FINDING_CATEGORIES.map((c) => [c.toLowerCase(), []]));
-    for (const report of aspectReports) {
-      for (const finding of report.findings) {
-        byCategory[finding.category.toLowerCase()].push({
-          aspect: report.aspect,
+    const indexedIds = new Set();
+    if (Array.isArray(panel?.findings)) {
+      for (const finding of panel.findings) {
+        const bucket = byCategory[String(finding?.category || "").toLowerCase()];
+        if (!bucket) continue;
+        bucket.push({
+          id: finding.id,
+          aspect: finding.aspect,
           text: finding.text,
+          origin_phase: finding.origin_phase,
+          origin_message_id: finding.origin_message_id,
+          source_kind: finding.source_kind,
         });
+        if (finding.id && ledgerTrusted) indexedIds.add(finding.id);
+      }
+    }
+
+    const specialistAspectByMessage = new Map(
+      aspectReports.map((report) => [report.message_id, report.aspect])
+    );
+    for (const message of partnerMessages) {
+      const aspect = specialistAspectByMessage.get(message.id) ??
+        (message.id === consolidated?.message_id ? "__aggregate__" : "__followup__");
+      const phase = aspect === "__aggregate__"
+        ? "consolidation"
+        : aspect === "__followup__"
+          ? "follow_up"
+          : "specialist";
+      for (const finding of extractNormalizedFindings(message.content)) {
+        const bucket = byCategory[finding.category.toLowerCase()];
+        if (!bucket || (finding.id && ledgerTrusted && indexedIds.has(finding.id))) continue;
+        bucket.push({
+          id: finding.id ?? null,
+          aspect,
+          text: finding.text,
+          origin_phase: phase,
+          origin_message_id: message.id,
+          source_kind: "normalized",
+        });
+        if (finding.id) indexedIds.add(finding.id);
+      }
+    }
+
+    // A gate-readable blocking line outside the normalized section is present
+    // only in the durable ledger. Keep the human-facing per-pass report aligned
+    // with the category index instead of rendering that specialist as empty.
+    for (const report of aspectReports) {
+      const known = new Set(report.findings.map((finding) => finding.id).filter(Boolean));
+      for (const finding of panel?.findings ?? []) {
+        if (
+          finding.origin_message_id === report.message_id &&
+          !known.has(finding.id)
+        ) {
+          report.findings.push({
+            id: finding.id,
+            category: finding.category,
+            text: finding.text,
+            line: finding.text,
+          });
+          known.add(finding.id);
+        }
+      }
+    }
+    if (consolidated) {
+      const known = new Set(
+        consolidated.findings.map((finding) => finding.id).filter(Boolean)
+      );
+      for (const finding of panel?.findings ?? []) {
+        if (
+          finding.origin_message_id === consolidated.message_id &&
+          !known.has(finding.id)
+        ) {
+          consolidated.findings.push({
+            id: finding.id,
+            category: finding.category,
+            text: finding.text,
+            line: finding.text,
+          });
+          known.add(finding.id);
+        }
       }
     }
 
@@ -2169,11 +2396,22 @@ server.tool(
     // document, and stranding any host that polls for pending to empty.
     const failed = (panel?.completed ?? []).filter((c) => c.status === "failed");
     const failedAspects = new Set(failed.map((c) => c.aspect));
-    const planned = meta?.aspects ?? status?.aspects ?? [];
     const budget = computeBudget(status, messages);
-    const reviewStatus = computeReviewStatus(status, messages, {
-      problem: readProblem(sessionDir),
-    });
+    const dispositionHistory = [];
+    const dispositionErrors = [];
+    for (const message of messages) {
+      if (message.from !== partnerAgent) continue;
+      const parsed = parseFindingDispositions(message.content);
+      dispositionHistory.push(
+        ...parsed.dispositions.map((disposition) => ({
+          ...disposition,
+          message_id: message.id,
+        }))
+      );
+      dispositionErrors.push(
+        ...parsed.invalid_lines.map((error) => ({ ...error, message_id: message.id }))
+      );
+    }
 
     return {
       content: [
@@ -2248,6 +2486,17 @@ server.tool(
               // skipped aspect is invisible here unless it is stated.
               aspects_skipped: meta?.skipped ?? status?.skipped_aspects ?? [],
               findings_by_category: byCategory,
+              finding_ledger: panel?.findings ?? null,
+              finding_occurrences: panel?.finding_occurrences ?? null,
+              finding_protocol_ambiguities:
+                panel?.finding_protocol_ambiguities ?? null,
+              finding_dispositions: dispositionHistory,
+              finding_disposition_errors: dispositionErrors,
+              approval_dispositions:
+                reviewStatus.panel_integrity?.finding_contract?.dispositions ?? [],
+              undispositioned_finding_ids:
+                reviewStatus.panel_integrity?.finding_contract
+                  ?.undispositioned_finding_ids ?? [],
               aspect_reports: aspectReports,
               consolidated_report: consolidated,
               review_status: reviewStatus,
@@ -2317,7 +2566,7 @@ server.tool(
           // the diff we started with" rather than a failed send.
           refreshedDiff = execFileSync(
             "gh",
-            ["pr", "diff", String(status.pr_number ?? status.branch)],
+            ["pr", "diff", validatePullRequestRef(status.pr_number ?? status.branch)],
             refreshOpts
           ).toString();
         } else if (status.diff_target === "staged") {
@@ -2333,16 +2582,24 @@ server.tool(
 
           try {
             refreshedDiff = filesChanged.length > 0
-              ? execFileSync("git", ["diff", baseline, "--", ...filesChanged], refreshOpts).toString()
-              : execFileSync("git", ["diff", baseline], refreshOpts).toString();
+              ? execFileSync("git", ["diff", "--end-of-options", baseline, "--", ...filesChanged], refreshOpts).toString()
+              : execFileSync("git", ["diff", "--end-of-options", baseline], refreshOpts).toString();
           } catch {
             refreshedDiff = execFileSync("git", ["diff", "HEAD"], refreshOpts).toString();
           }
         } else if (status.diff_target === "branch") {
-          const base = status.base_branch || "main";
-          const head = status.branch;
+          const base = validateGitBranchName(
+            status.base_branch || "main",
+            "base_branch",
+            status.project_path
+          );
+          const head = validateGitBranchName(
+            status.branch,
+            "branch",
+            status.project_path
+          );
           try {
-            refreshedDiff = execFileSync("git", ["diff", `${base}...${head}`], refreshOpts).toString();
+            refreshedDiff = execFileSync("git", ["diff", "--end-of-options", `${base}...${head}`], refreshOpts).toString();
           } catch {
             // Same fallback as the start path, and the same hazard: two dots
             // also includes whatever the base gained since the branch point, so
@@ -2350,7 +2607,7 @@ server.tool(
             // scope label stays identical. The partner would then file findings
             // against commits the author never wrote, mid-conversation, with
             // nothing marking the change of subject.
-            refreshedDiff = execFileSync("git", ["diff", `${base}..${head}`], refreshOpts).toString();
+            refreshedDiff = execFileSync("git", ["diff", "--end-of-options", `${base}..${head}`], refreshOpts).toString();
             refreshNotice =
               `the merge-base diff of ${base}...${head} failed, so this refresh used a two-dot diff: ` +
               `the reviewed change may now include commits ${base} gained since the branch point`;
@@ -2358,7 +2615,7 @@ server.tool(
         } else {
           // uncommitted: diff against the original HEAD SHA to keep baseline stable
           try {
-            refreshedDiff = execFileSync("git", ["diff", baseline], refreshOpts).toString();
+            refreshedDiff = execFileSync("git", ["diff", "--end-of-options", baseline], refreshOpts).toString();
           } catch {
             refreshedDiff = execFileSync("git", ["diff"], refreshOpts).toString();
           }
@@ -2392,9 +2649,7 @@ server.tool(
     const msg = appendMsg(session_id, hostAgent, content);
     const messages = readConv(session_id);
     const budget = computeBudget(status, messages);
-    const reviewStatus = computeReviewStatus(status, messages, {
-      problem: readProblem(sessionDir),
-    });
+    const reviewStatus = computeSessionReviewStatus(status, messages, sessionDir);
     return {
       content: [
         {
@@ -2527,9 +2782,7 @@ server.tool(
     const status = readStat(session_id);
     const partnerAgent = getSessionPartnerAgent(status);
     const projectPath = status?.project_path || process.cwd();
-    const reviewStatus = computeReviewStatus(status, messages, {
-      problem: readProblem(sessionDir),
-    });
+    const reviewStatus = computeSessionReviewStatus(status, messages, sessionDir);
     const referencedFiles = extractReferencedFiles(
       messages,
       projectPath,
@@ -2636,9 +2889,7 @@ server.tool(
     }
 
     const budget = computeBudget(status, messages);
-    const reviewStatus = computeReviewStatus(status, messages, {
-      problem: readProblem(sessionDir),
-    });
+    const reviewStatus = computeSessionReviewStatus(status, messages, sessionDir);
     const partnerTerminal = await inspectPartnerTerminal(sessionDir, {
       tailLines: tail_lines,
       includeFullCapture: include_full_capture === true,
@@ -2745,7 +2996,15 @@ server.tool(
       };
     }
 
-    const liveness = await probeTmuxSession(current.session_name);
+    const tmuxIdentity = {
+      tmuxTransport: current.tmux_transport ?? null,
+      tmuxDistro: current.tmux_distro ?? null,
+      tmuxLauncher: current.tmux_launcher ?? null,
+      tmuxControlBinary: current.tmux_control_binary ?? null,
+      tmuxSocketName: current.tmux_socket_name ?? null,
+      tmuxIdentityRequired: true,
+    };
+    const liveness = await probeTmuxSession(current.session_name, tmuxIdentity);
     if (liveness !== "alive") {
       return {
         content: [
@@ -2759,7 +3018,13 @@ server.tool(
         ],
       };
     }
-    if (!(await tmuxPaneBelongsToSession(current.session_name, current.pane_id))) {
+    if (
+      !(await tmuxPaneBelongsToSession(
+        current.session_name,
+        current.pane_id,
+        tmuxIdentity
+      ))
+    ) {
       return {
         content: [
           {
@@ -2772,7 +3037,7 @@ server.tool(
 
     try {
       await sendKeyToTmux(
-        { paneId: current.pane_id },
+        { paneId: current.pane_id, ...tmuxIdentity },
         key,
         { submit: submit === true }
       );
@@ -2896,9 +3161,7 @@ server.tool(
     }
 
     const messages = readConv(session_id);
-    const reviewStatus = computeReviewStatus(status, messages, {
-      problem: readProblem(sessionDir),
-    });
+    const reviewStatus = computeSessionReviewStatus(status, messages, sessionDir);
     return {
       content: [
         {
@@ -3112,7 +3375,9 @@ server.tool(
 
     let resolvedEngine;
     try {
-      resolvedEngine = resolveEngine(adapter, { requested: engine ?? null });
+      resolvedEngine = await resolveRunnableEngine(adapter, {
+        requested: engine ?? null,
+      });
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${err.message}` }] };
     }
@@ -3128,10 +3393,14 @@ server.tool(
     // start_dialog then rejects against the live catalog.
     const discoveredModels = await resolveDiscoveryForValidation(adapter, {
       model: model ?? null,
+      engine: resolvedEngine,
     });
 
     const result = negotiate(adapter, {
       engine: resolvedEngine,
+      requireBinary: !(
+        resolvedEngine === "tmux-interactive" && tmuxRoute().transport === "wsl"
+      ),
       model: model ?? null,
       reasoningEffort: reasoning_effort ?? null,
       toolProfile: tool_profile ?? null,

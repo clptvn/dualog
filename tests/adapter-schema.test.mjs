@@ -38,6 +38,54 @@ test("the base fixture validates", () => {
   assert.deepEqual(parsed.__sources, ["/fixtures/fake.json"]);
 });
 
+test("startup prompts declare one validated interaction shape", () => {
+  const withStartupPrompt = (response) =>
+    baseManifest({
+      engines: { default: "tmux-interactive", allowed: ["tmux-interactive"] },
+      capabilities: { ...baseManifest().capabilities, tuiDrivable: "yes" },
+      promptDelivery: { "tmux-interactive": "tui-paste" },
+      argv: { "tmux-interactive": [{ args: ["run"] }] },
+      tui: {
+        readyAny: ["> "],
+        startupPrompts: [
+          {
+            kind: "workspace_trust",
+            description: "trust selection",
+            matchAll: ["Trust this folder"],
+            ...response,
+          },
+        ],
+      },
+    });
+
+  const parsed = parseManifest(
+    withStartupPrompt({ keys: ["down", "enter"] }),
+    "/fixtures/arrow-menu.json"
+  );
+  assert.deepEqual(parsed.tui.startupPrompts[0].keys, ["down", "enter"]);
+
+  assert.throws(
+    () => parseManifest(withStartupPrompt({}), "/fixtures/no-response.json"),
+    /exactly one of input or keys/
+  );
+  assert.throws(
+    () =>
+      parseManifest(
+        withStartupPrompt({ input: "1", keys: ["down", "enter"] }),
+        "/fixtures/two-responses.json"
+      ),
+    /exactly one of input or keys/
+  );
+  assert.throws(
+    () =>
+      parseManifest(
+        withStartupPrompt({ keys: ["definitely-not-a-key"] }),
+        "/fixtures/bad-key.json"
+      ),
+    /Invalid adapter manifest/
+  );
+});
+
 test("validation errors name the source file", () => {
   assert.throws(
     () => parseManifest(baseManifest({ id: "Not Valid" }), "/fixtures/bad.json"),

@@ -282,6 +282,26 @@ const McpSuppression = z.discriminatedUnion("strategy", [
  * preferred -- they survive vendor UI churn better and are far easier to review
  * for a CLI you cannot run.
  */
+// Closed set understood by tmux-runtime's sendKeyToTmux(). Startup prompts
+// sometimes use arrow-key menus rather than numbered choices, so treating every
+// response as pasted text can select the destructive/default option instead.
+const StartupPromptKey = z.enum([
+  "enter",
+  "escape",
+  "tab",
+  "space",
+  "backspace",
+  "delete",
+  "up",
+  "down",
+  "left",
+  "right",
+  "home",
+  "end",
+  "page_up",
+  "page_down",
+]);
+
 const TuiMarkers = z
   .object({
     // All of `readyAll` and at least one of `readyAny` must match.
@@ -297,11 +317,22 @@ const TuiMarkers = z
           .object({
             kind: z.string(),
             description: z.string(),
-            input: z.string(),
+            input: z.string().optional(),
+            keys: z.array(StartupPromptKey).min(1).optional(),
             matchAll: z.array(z.string()).default([]),
             matchAny: z.array(z.string()).default([]),
           })
           .strict()
+          .superRefine((prompt, ctx) => {
+            const hasInput = typeof prompt.input === "string";
+            const hasKeys = Array.isArray(prompt.keys);
+            if (hasInput === hasKeys) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: "startup prompt must declare exactly one of input or keys",
+              });
+            }
+          })
       )
       .default([]),
     // When true, a ready prompt suppresses interstitial detection. Needed for

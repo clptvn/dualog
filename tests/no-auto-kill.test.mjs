@@ -48,6 +48,10 @@ async function waitForExit(child, timeoutMs = 5000) {
 }
 
 test("runner shutdown preserves an active tmux pane until explicit termination", { timeout: 30000 }, async (t) => {
+  if (process.platform === "win32") {
+    t.skip("native POSIX tmux lifecycle fixture; WSL routing has separate coverage");
+    return;
+  }
   if (!(await isTmuxAvailable())) {
     t.skip("tmux is not available");
     return;

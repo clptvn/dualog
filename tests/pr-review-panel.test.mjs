@@ -23,6 +23,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { writeFakeCli, writeFakeAdapter } from "./helpers/fake-cli.mjs";
+import { writeNodeCommand } from "./helpers/node-command.mjs";
 import {
   ASPECT_HEADER_RE,
   CONSOLIDATED_HEADER_RE,
@@ -95,10 +96,10 @@ const DISOBEDIENT_BIN = writeFakeCli(BIN_DIR, "fake-disobedient.mjs", "sidecar-o
  * separate pieces of shipped safety code exist for and none had ever executed.
  */
 function writeSelectiveFailureCli(name, failingAspect) {
-  const target = path.join(BIN_DIR, name);
-  fs.writeFileSync(
-    target,
-    `#!/usr/bin/env node
+  return writeNodeCommand(
+    BIN_DIR,
+    name,
+    `
 import fs from "fs";
 const failing = ${JSON.stringify(failingAspect)};
 const reply = ${JSON.stringify(FAKE_REPLY)};
@@ -125,11 +126,72 @@ fs.writeFileSync(donePath, JSON.stringify({ status: "ok", result_path: resultPat
 process.exit(0);
 `
   );
-  fs.chmodSync(target, 0o755);
-  return target;
 }
 
-const SELECTIVE_FAIL_BIN = writeSelectiveFailureCli("fake-selective.mjs", "code");
+const SELECTIVE_FAIL_BIN = writeSelectiveFailureCli("fake-selective", "code");
+
+const UNINDEXED_BIN = writeNodeCommand(
+  BIN_DIR,
+  "fake-unindexed",
+  `
+import fs from "fs";
+function readPrompt() {
+  const positional = process.argv.slice(2).filter((a) => !a.startsWith("-"));
+  const fromArgv = positional[positional.length - 1];
+  if (fromArgv && fromArgv.includes("Completion protocol is mandatory")) return fromArgv;
+  try { return fs.readFileSync(0, "utf-8"); } catch { return fromArgv ?? ""; }
+}
+const bootstrap = readPrompt();
+const resultPath = (bootstrap.match(/^(.*result\\.md)$/mu) || [])[1];
+const donePath = (bootstrap.match(/^(.*done\\.json)$/mu) || [])[1];
+const promptPath = (bootstrap.match(/^(.*prompt\\.md)$/mu) || [])[1];
+const taskPrompt = fs.readFileSync(promptPath, "utf-8");
+const reply = /^## Specialist Reports$/m.test(taskPrompt)
+  ? "### Normalized Findings\\n(none)\\nREVIEW_VERDICT: APPROVE"
+  : "Human report: [CRITICAL] src/app.ts:4 — retry loop never terminates\\n\\n### Normalized Findings\\n(none)\\n\\nASPECT_RESULT: FINDINGS";
+fs.writeFileSync(resultPath, reply);
+fs.writeFileSync(donePath, JSON.stringify({ status: "ok", result_path: resultPath }));
+process.exit(0);
+`
+);
+
+function writeProtocolReplyCli(name, specialistReply) {
+  return writeNodeCommand(
+    BIN_DIR,
+    name,
+    `
+import fs from "fs";
+function readPrompt() {
+  const positional = process.argv.slice(2).filter((a) => !a.startsWith("-"));
+  const fromArgv = positional[positional.length - 1];
+  if (fromArgv && fromArgv.includes("Completion protocol is mandatory")) return fromArgv;
+  try { return fs.readFileSync(0, "utf-8"); } catch { return fromArgv ?? ""; }
+}
+const bootstrap = readPrompt();
+const resultPath = (bootstrap.match(/^(.*result\\.md)$/mu) || [])[1];
+const donePath = (bootstrap.match(/^(.*done\\.json)$/mu) || [])[1];
+const promptPath = (bootstrap.match(/^(.*prompt\\.md)$/mu) || [])[1];
+const taskPrompt = fs.readFileSync(promptPath, "utf-8");
+const reply = /^## Specialist Reports$/m.test(taskPrompt)
+  ? "### Normalized Findings\\n(none)\\nREVIEW_VERDICT: APPROVE"
+  : ${JSON.stringify(specialistReply)};
+fs.writeFileSync(resultPath, reply);
+fs.writeFileSync(donePath, JSON.stringify({ status: "ok", result_path: resultPath }));
+process.exit(0);
+`
+  );
+}
+
+const ADVISORY_BIN = writeProtocolReplyCli(
+  "fake-advisory",
+  "### Normalized Findings\n[SUGGESTION] src/app.ts:4 — use the existing helper\nASPECT_RESULT: FINDINGS"
+);
+
+const AMBIGUOUS_PROTOCOL_BIN = writeProtocolReplyCli(
+  "fake-ambiguous-protocol",
+  "```markdown\n### Normalized Findings\n[CRITICAL] src/app.ts:4 — hidden by a second block\n```\n" +
+    "```markdown\n### Normalized Findings\n(none)\n```\nASPECT_RESULT: CLEAN"
+);
 
 const DIFF = [
   "diff --git a/src/app.ts b/src/app.ts",
@@ -322,6 +384,12 @@ test("the panel runs one pass per aspect, then consolidates exactly once", async
       const findings = extractNormalizedFindings(message.content);
       assert.equal(findings.length, 1, "the pass's normalized finding must survive the round trip");
       assert.equal(findings[0].category, "CORRECTNESS");
+      const aspect = message.content.match(ASPECT_HEADER_RE)?.[4];
+      assert.equal(
+        findings[0].id,
+        `F-${aspect}-1`,
+        "the runner must stamp a deterministic aspect-local finding ID"
+      );
       assert.equal(extractAspectResult(message.content), "FINDINGS");
     }
   } finally {
@@ -345,6 +413,28 @@ test("panel progress is recorded on disk while the panel is still running", asyn
     const panel = JSON.parse(fs.readFileSync(panelPath, "utf-8"));
 
     assert.equal(panel.total_passes, 2, "one specialist plus consolidation");
+    assert.equal(panel.finding_ledger_version, 1);
+    const firstFinding = panel.findings[0];
+    assert.deepEqual(
+      {
+        id: firstFinding.id,
+        category: firstFinding.category,
+        aspect: firstFinding.aspect,
+      },
+      { id: "F-code-1", category: "CORRECTNESS", aspect: "code" }
+    );
+    assert.equal(
+      new Set(panel.findings.map((finding) => finding.id)).size,
+      panel.findings.length,
+      "every ledger entry must have a unique ID"
+    );
+    assert.ok(
+      panel.findings.some(
+        (finding) =>
+          finding.id === "F-aggregate-1" && finding.origin_phase === "consolidation"
+      ),
+      "a new consolidation finding was not appended to the durable ledger"
+    );
     const completed = panel.completed.map((c) => c.aspect);
     assert.ok(completed.includes("code"));
     assert.ok(completed.includes("__aggregate__"));
@@ -509,6 +599,105 @@ test("a disobedient specialist cannot approve the session through the real runne
   }
 });
 
+test("a blocking prose finding omitted from normalized output is still durably ledgered", async () => {
+  const aspects = ["code"];
+  const { sessionDir } = setupSession("aaaaaaa-unindexed", aspects);
+  const child = startRunner(sessionDir, 2, UNINDEXED_BIN);
+
+  try {
+    const messages = await waitForPartnerMessages(sessionDir, 2);
+    const panel = JSON.parse(
+      fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8")
+    );
+    const finding = panel.findings.find(
+      (entry) => entry.source_kind === "gate_readable_unindexed"
+    );
+    assert.ok(finding, "the gate-readable prose finding vanished from the ledger");
+    assert.equal(finding.id, "F-code-unindexed-1");
+    assert.equal(finding.category, "CRITICAL");
+    assert.match(finding.text, /retry loop never terminates/);
+    assert.ok(
+      panel.finding_occurrences.some(
+        (occurrence) =>
+          occurrence.finding_id === finding.id &&
+          occurrence.message_id === finding.origin_message_id
+      ),
+      "the prose finding has no durable source occurrence"
+    );
+
+    const status = JSON.parse(
+      fs.readFileSync(path.join(sessionDir, "status.json"), "utf-8")
+    );
+    const review = computeReviewStatus(status, messages, {
+      problem: "",
+      panelState: panel,
+    });
+    assert.equal(review.approved, false);
+    assert.equal(review.source, "panel_integrity");
+    assert.ok(review.panel_integrity.blockers.includes("undispositioned_findings"));
+  } finally {
+    await stopRunner(child, sessionDir);
+  }
+});
+
+test("an advisory-only specialist is complete without entering the blocking ledger", async () => {
+  const { sessionDir } = setupSession("aaaaaaa-advisory", ["code"]);
+  const child = startRunner(sessionDir, 2, ADVISORY_BIN);
+
+  try {
+    const messages = await waitForPartnerMessages(sessionDir, 2);
+    const panel = JSON.parse(
+      fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8")
+    );
+    const specialist = panel.completed.find((entry) => entry.aspect === "code");
+    assert.equal(specialist.status, "complete");
+    assert.equal(specialist.aspect_result, "FINDINGS");
+    assert.deepEqual(panel.findings, []);
+    assert.deepEqual(panel.finding_occurrences, []);
+
+    const status = JSON.parse(
+      fs.readFileSync(path.join(sessionDir, "status.json"), "utf-8")
+    );
+    const review = computeReviewStatus(status, messages, {
+      problem: "",
+      panelState: panel,
+    });
+    assert.equal(review.approved, true);
+  } finally {
+    await stopRunner(child, sessionDir);
+  }
+});
+
+test("the runner durably blocks a shadow normalized-findings block", async () => {
+  const { sessionDir } = setupSession("aaaaaaa-ambiguous", ["code"]);
+  const child = startRunner(sessionDir, 2, AMBIGUOUS_PROTOCOL_BIN);
+
+  try {
+    const messages = await waitForPartnerMessages(sessionDir, 2);
+    const panel = JSON.parse(
+      fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8")
+    );
+    assert.equal(panel.finding_protocol_ambiguities.length, 1);
+    assert.equal(panel.finding_protocol_ambiguities[0].category, "CRITICAL");
+    assert.equal(
+      panel.completed.find((entry) => entry.aspect === "code")?.status,
+      "complete_unverified"
+    );
+
+    const status = JSON.parse(
+      fs.readFileSync(path.join(sessionDir, "status.json"), "utf-8")
+    );
+    const review = computeReviewStatus(status, messages, {
+      problem: "",
+      panelState: panel,
+    });
+    assert.equal(review.approved, false);
+    assert.ok(review.panel_integrity.blockers.includes("finding_protocol_ambiguity"));
+  } finally {
+    await stopRunner(child, sessionDir);
+  }
+});
+
 test("a panel with survivors consolidates, and carries the hole into every verdict prompt", async () => {
   // The state this system's worst failure mode lives in, and until now the only
   // one never exercised: SOME passes fail and others succeed. Three separate
@@ -643,6 +832,16 @@ test("a host message after the panel gets a follow-up turn, not a second panel",
       "a follow-up must not re-run the panel — six specialists to confirm one fix would spend the whole budget"
     );
     assert.ok(!/^## Consolidated PR Review/m.test(followUp.content));
+    const panel = JSON.parse(
+      fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8")
+    );
+    assert.ok(
+      panel.findings.some(
+        (finding) =>
+          finding.id === "F-followup-1-1" && finding.origin_phase === "follow_up"
+      ),
+      "a new follow-up finding was not appended to the durable ledger"
+    );
   } finally {
     await stopRunner(child, sessionDir);
   }

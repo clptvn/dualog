@@ -4,7 +4,7 @@ exports[`argv for every adapter and engine 1`] = `
     "command": "claude",
     "args": [
       "--permission-mode",
-      "bypassPermissions",
+      "dontAsk",
       "--allowedTools",
       "Read,Grep,Glob,Bash,LSP",
       "--mcp-config",
@@ -17,11 +17,40 @@ exports[`argv for every adapter and engine 1`] = `
       "--name",
       "fixture-session",
       "--disallowedTools",
-      "Edit,MultiEdit,Write,NotebookEdit",
+      "Edit,Write,NotebookEdit",
       "--model",
       "fixture-model",
       "--effort",
       "low"
+    ],
+    "env": {
+      "DUALOG_ROLE": "partner",
+      "DUALOG_DEPTH": "1"
+    }
+  },
+  "claude/headless": {
+    "command": "claude",
+    "args": [
+      "--print",
+      "--no-session-persistence",
+      "--permission-mode",
+      "dontAsk",
+      "--allowedTools",
+      "Read,Grep,Glob,Bash,LSP",
+      "--mcp-config",
+      "<SCRATCH_DIR>/claude-empty-mcp.json",
+      "--strict-mcp-config",
+      "--add-dir",
+      "/fixture/project",
+      "--add-dir",
+      "<SESSION_DIR>",
+      "--disallowedTools",
+      "Edit,Write,NotebookEdit",
+      "--model",
+      "fixture-model",
+      "--effort",
+      "low",
+      "Completion protocol is mandatory: write result.md then done.json"
     ],
     "env": {
       "DUALOG_ROLE": "partner",
@@ -40,6 +69,30 @@ exports[`argv for every adapter and engine 1`] = `
       "--ask-for-approval",
       "never",
       "--no-alt-screen",
+      "-c",
+      "approval_policy=\\"never\\"",
+      "--model",
+      "fixture-model",
+      "-c",
+      "model_reasoning_effort=\\"low\\"",
+      "Completion protocol is mandatory: write result.md then done.json"
+    ],
+    "env": {
+      "CODEX_HOME": "<SCRATCH_DIR>/codex-home",
+      "DUALOG_ROLE": "partner",
+      "DUALOG_DEPTH": "1"
+    }
+  },
+  "codex/headless": {
+    "command": "codex",
+    "args": [
+      "exec",
+      "--cd",
+      "/fixture/project",
+      "--sandbox",
+      "workspace-write",
+      "--add-dir",
+      "<SESSION_DIR>",
       "-c",
       "approval_policy=\\"never\\"",
       "--model",

@@ -3,9 +3,28 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { spawnSync } from "child_process";
 import { createRequire } from "module";
 import { fileURLToPath } from "url";
+import {
+  assertSafeConfigWriteTarget,
+  atomicWriteFile,
+  buildClaudeMcpRegistration,
+  buildWslLifecycleInvocation,
+  effectiveExplicitWslSelection,
+  formatInstallEnvironment,
+  probeInstallEnvironment,
+  persistedWslEnv,
+  preflightExplicitWslSelection,
+  readJsonConfig,
+  removeMcpServerConfig,
+  replaceMcpServerSection,
+  resolveCodexPaths,
+  runInstallProbe,
+  validateExplicitWslSelection,
+  writeJsonConfig,
+  wslArgs,
+} from "./install-utils.mjs";
+import { runNpmInstallBootstrap } from "./npm-bootstrap.mjs";
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const require = createRequire(import.meta.url);
@@ -18,10 +37,19 @@ const CLAUDE_HOOKS_DIR = path.join(CLAUDE_HOOKS_ROOT, "dualog");
 const CLAUDE_HOOKS_PLATFORM = path.join(CLAUDE_HOOKS_ROOT, "dualog-platform.mjs");
 const CLAUDE_HOOKS_LEGACY_PLATFORM = path.join(CLAUDE_HOOKS_ROOT, "platform.mjs");
 const CLAUDE_SETTINGS_JSON = path.join(CLAUDE_DIR, "settings.json");
-const CODEX_DIR = path.join(HOME_DIR, ".codex");
-const CODEX_SKILLS_DIR = path.join(CODEX_DIR, "skills");
-const CODEX_CONFIG_TOML = path.join(CODEX_DIR, "config.toml");
+const CODEX_PATHS = resolveCodexPaths();
+const CODEX_DIR = CODEX_PATHS.root;
+const CODEX_SKILLS_DIR = CODEX_PATHS.skills;
+const CODEX_CONFIG_TOML = CODEX_PATHS.config;
 const SERVER_PATH = path.join(REPO_ROOT, "src", "dialog-server.mjs");
+const NODE_PATH = process.execPath;
+const RUNTIME_DEPENDENCY_PROBES = Object.freeze([
+  ["@modelcontextprotocol/sdk", "@modelcontextprotocol/sdk/server/mcp.js"],
+  ["cross-spawn", "cross-spawn"],
+  // Probe the same public entrypoint the runtime imports. A version-specific
+  // subpath is not present in every valid 3.24.x install allowed by package.json.
+  ["zod", "zod"],
+]);
 
 const CLAUDE_COMMANDS = [
   "dualog-review-code",
@@ -70,8 +98,12 @@ const LEGACY_CODEX_SKILLS = [
 function parseMode(argv) {
   let installClaude = true;
   let installCodex = true;
+  let hostOnly = process.env.DUALOG_INSTALL_HOST_ONLY === "1";
+  let wslDistro = null;
+  let wslBinary = null;
 
-  for (const arg of argv) {
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index];
     const normalized = arg.toLowerCase();
     if (normalized === "--claude" || normalized === "-claude") {
       installClaude = true;
@@ -82,12 +114,22 @@ function parseMode(argv) {
     } else if (normalized === "--both" || normalized === "-both") {
       installClaude = true;
       installCodex = true;
+    } else if (normalized === "--host-only" || normalized === "-hostonly") {
+      hostOnly = true;
+    } else if (normalized === "--wsl-distro") {
+      wslDistro = argv[++index]?.trim();
+      if (!wslDistro) throw new Error("--wsl-distro requires a non-empty distribution name");
+    } else if (normalized === "--wsl-binary") {
+      wslBinary = argv[++index]?.trim();
+      if (!wslBinary) throw new Error("--wsl-binary requires a non-empty executable path");
     } else {
-      throw new Error(`Unknown option: ${arg}\nUsage: npm run setup -- [--claude|--codex|--both]`);
+      throw new Error(
+        `Unknown option: ${arg}\nUsage: npm run setup -- [--claude|--codex|--both] [--host-only] [--wsl-distro <name>] [--wsl-binary <path>]`
+      );
     }
   }
 
-  return { installClaude, installCodex };
+  return { installClaude, installCodex, hostOnly, wslDistro, wslBinary };
 }
 
 function modeLabel({ installClaude, installCodex }) {
@@ -98,7 +140,8 @@ function modeLabel({ installClaude, installCodex }) {
 
 function plannedStepCount({ installClaude, installCodex }) {
   // +1 for the legacy-migration step.
-  return 4 + (installClaude ? 2 : 0) + (installCodex ? 2 : 0);
+  const wslStep = process.platform === "win32" ? 1 : 0;
+  return 4 + (installClaude ? 2 : 0) + (installCodex ? 2 : 0) + wslStep;
 }
 
 function createStepLogger(totalSteps) {
@@ -152,10 +195,10 @@ function removeLegacyInstall() {
   // Claude MCP registration
   try {
     if (fs.existsSync(CLAUDE_JSON)) {
-      const config = JSON.parse(fs.readFileSync(CLAUDE_JSON, "utf-8"));
+      const config = readJsonConfig(CLAUDE_JSON);
       if (config?.mcpServers?.[LEGACY_MCP_KEY]) {
         delete config.mcpServers[LEGACY_MCP_KEY];
-        fs.writeFileSync(CLAUDE_JSON, JSON.stringify(config, null, 2) + "\n");
+        writeJsonConfig(CLAUDE_JSON, config);
         console.log(`  removed legacy MCP registration "${LEGACY_MCP_KEY}" from ~/.claude.json`);
         removed++;
       }
@@ -168,13 +211,12 @@ function removeLegacyInstall() {
   try {
     if (fs.existsSync(CODEX_CONFIG_TOML)) {
       const toml = fs.readFileSync(CODEX_CONFIG_TOML, "utf-8");
-      const stripped = toml.replace(
-        /\n?\[mcp_servers\.codex-dialog\]\n(?:.*\n)*?(?=\n\[|$)/g,
-        ""
-      );
+      const stripped = removeMcpServerConfig(toml, [LEGACY_MCP_KEY]);
       if (stripped !== toml) {
-        fs.writeFileSync(CODEX_CONFIG_TOML, stripped);
-        console.log(`  removed legacy [mcp_servers.${LEGACY_MCP_KEY}] from ~/.codex/config.toml`);
+        atomicWriteFile(CODEX_CONFIG_TOML, stripped);
+        console.log(
+          `  removed old Dualog MCP registrations from ${CODEX_CONFIG_TOML}`
+        );
         removed++;
       }
     }
@@ -187,7 +229,10 @@ function removeLegacyInstall() {
     if (fs.existsSync(CLAUDE_SETTINGS_JSON)) {
       const raw = fs.readFileSync(CLAUDE_SETTINGS_JSON, "utf-8");
       if (raw.includes("mcp__codex-dialog__") || raw.includes("hooks/codex-dialog/")) {
-        fs.writeFileSync(
+        // Validate before touching the file. String replacement preserves
+        // unrelated formatting, but malformed JSON must never be overwritten.
+        readJsonConfig(CLAUDE_SETTINGS_JSON);
+        atomicWriteFile(
           CLAUDE_SETTINGS_JSON,
           raw
             .replaceAll("mcp__codex-dialog__", "mcp__dualog__")
@@ -215,15 +260,7 @@ function checkNode() {
 }
 
 function runNpmInstall() {
-  const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
-  const result = spawnSync(npmCmd, ["install", "--silent"], {
-    cwd: REPO_ROOT,
-    stdio: "inherit",
-    windowsHide: true,
-  });
-  if (result.status !== 0) {
-    throw new Error(result.error ? `npm install failed: ${result.error.message}` : "npm install failed");
-  }
+  runNpmInstallBootstrap({ cwd: REPO_ROOT });
 }
 
 function dependencyAvailable(name) {
@@ -236,12 +273,28 @@ function dependencyAvailable(name) {
 }
 
 function ensureDependencies() {
-  if (dependencyAvailable("cross-spawn")) {
+  let missing = RUNTIME_DEPENDENCY_PROBES.filter(([, probe]) => !dependencyAvailable(probe));
+  if (missing.length === 0) {
     console.log("  Dependencies already installed OK");
     return;
   }
   runNpmInstall();
+  missing = RUNTIME_DEPENDENCY_PROBES.filter(([, probe]) => !dependencyAvailable(probe));
+  if (missing.length > 0) {
+    throw new Error(
+      `npm install completed, but runtime dependencies are still unavailable: ${missing
+        .map(([name]) => name)
+        .join(", ")}`
+    );
+  }
   console.log("  Dependencies installed OK");
+}
+
+function prevalidateConfigTargets() {
+  for (const filePath of [CLAUDE_JSON, CLAUDE_SETTINGS_JSON]) {
+    readJsonConfig(filePath);
+  }
+  assertSafeConfigWriteTarget(CODEX_CONFIG_TOML);
 }
 
 async function loadSpawn() {
@@ -249,50 +302,41 @@ async function loadSpawn() {
   return mod.default;
 }
 
-function cliExists(spawn, command) {
-  const result = spawn.sync(command, ["--version"], {
-    stdio: "ignore",
-    windowsHide: true,
-  });
-  return result.status === 0;
-}
-
-function checkPartnerClis(spawn, logStep) {
+async function checkPartnerClis(spawn, logStep, mode) {
   console.log("");
   logStep("Checking partner CLIs...");
-  const hasClaude = cliExists(spawn, "claude");
-  const hasCodex = cliExists(spawn, "codex");
-  const hasTmux = runCli(spawn, "tmux", ["-V"], { allowFailure: true });
-  console.log(hasClaude ? "  Claude Code CLI OK" : "  WARNING: Claude Code CLI not found on PATH.");
-  console.log(hasCodex ? "  Codex CLI OK" : "  WARNING: Codex CLI not found on PATH.");
-  console.log(hasTmux ? "  tmux OK" : "  WARNING: tmux not found on PATH. Partner sessions require tmux.");
-  return { hasClaude, hasCodex, hasTmux };
-}
-
-function runCli(spawn, command, args, { allowFailure = false } = {}) {
-  const result = spawn.sync(command, args, {
+  const status = await probeInstallEnvironment(
+    (command, args, options) =>
+      runInstallProbe(command, args, options, {
+        platform: process.platform,
+        spawnFn: spawn,
+      }),
+    {
+    platform: process.platform,
+    env: {
+      ...process.env,
+      ...(mode.wslDistro ? { DUALOG_WSL_DISTRO: mode.wslDistro } : {}),
+      ...(mode.wslBinary ? { DUALOG_WSL_BINARY: mode.wslBinary } : {}),
+    },
     cwd: REPO_ROOT,
-    stdio: "ignore",
-    windowsHide: true,
-  });
-  if (!allowFailure && result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} failed`);
-  }
-  return result.status === 0;
-}
-
-function readJsonConfig(filePath) {
-  if (!fs.existsSync(filePath)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
-  } catch {
-    return {};
-  }
-}
-
-function writeJsonConfig(filePath, config) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(config, null, 2) + "\n");
+    }
+  );
+  for (const line of formatInstallEnvironment(status)) console.log(line);
+  // An explicit route is a hard constraint, not a hint. Validate it before
+  // either native host registration can be written so a typo can never become
+  // an unpinned registration that later follows a different default distro.
+  validateExplicitWslSelection(
+    effectiveExplicitWslSelection(mode, { env: process.env }),
+    status
+  );
+  return {
+    ...status,
+    // Registration must use the host CLI only. A WSL CLI is a partner and a
+    // separate host installation target, not evidence that a Win32 command can run.
+    hasClaude: status.host.claude,
+    hasCodex: status.host.codex,
+    hasTmux: status.host.tmux,
+  };
 }
 
 function shellQuote(value) {
@@ -302,7 +346,7 @@ function shellQuote(value) {
 }
 
 function hookCommand(fileName) {
-  return `node ${shellQuote(path.join(CLAUDE_HOOKS_DIR, fileName))}`;
+  return `${shellQuote(NODE_PATH)} ${shellQuote(path.join(CLAUDE_HOOKS_DIR, fileName))}`;
 }
 
 function removeOwnedPlatformHelper(filePath) {
@@ -333,36 +377,18 @@ function installSharedFile() {
   fs.writeFileSync(targetPath, content);
 }
 
-function registerClaudeMcp(spawn, hasClaude, logStep) {
+function registerClaudeMcp(cliStatus, logStep) {
   console.log("");
   logStep("Registering MCP server for Claude...");
-
-  if (hasClaude) {
-    runCli(spawn, "claude", ["mcp", "remove", "dualog", "-s", "user"], {
-      allowFailure: true,
-    });
-    runCli(spawn, "claude", [
-      "mcp",
-      "add",
-      "-s",
-      "user",
-      "dualog",
-      "--",
-      "node",
-      SERVER_PATH,
-    ]);
-    console.log("  MCP server registered with Claude CLI OK");
-    return;
-  }
-
   const config = readJsonConfig(CLAUDE_JSON);
   if (!config.mcpServers) config.mcpServers = {};
-  config.mcpServers["dualog"] = {
-    command: "node",
-    args: [SERVER_PATH],
-  };
+  config.mcpServers["dualog"] = buildClaudeMcpRegistration({
+    serverPath: SERVER_PATH,
+    nodePath: NODE_PATH,
+    cliStatus,
+  });
   writeJsonConfig(CLAUDE_JSON, config);
-  console.log("  MCP server written to ~/.claude.json (CLI fallback) OK");
+  console.log(`  MCP server written atomically to ${CLAUDE_JSON} OK`);
 }
 
 function installClaudeCommandsAndHooks(logStep) {
@@ -463,40 +489,25 @@ function installClaudeCommandsAndHooks(logStep) {
   console.log("  Claude hooks installed OK");
 }
 
-function removeCodexMcpSection(content) {
-  return content
-    .replace(/\n?\[mcp_servers\.dualog\]\n(?:.*\n)*?(?=\n\[|$)/g, "\n")
-    .trimEnd();
-}
-
-function registerCodexMcp(spawn, hasCodex, logStep) {
+function registerCodexMcp(cliStatus, logStep) {
   console.log("");
   logStep("Registering MCP server for Codex...");
-
-  if (hasCodex) {
-    runCli(spawn, "codex", ["mcp", "remove", "dualog"], {
-      allowFailure: true,
-    });
-    runCli(spawn, "codex", ["mcp", "add", "dualog", "--", "node", SERVER_PATH]);
-    console.log("  MCP server registered with Codex CLI OK");
-    return;
-  }
 
   fs.mkdirSync(CODEX_DIR, { recursive: true });
   let content = "";
   if (fs.existsSync(CODEX_CONFIG_TOML)) {
-    content = removeCodexMcpSection(fs.readFileSync(CODEX_CONFIG_TOML, "utf-8"));
-    if (content) content += "\n";
+    content = fs.readFileSync(CODEX_CONFIG_TOML, "utf-8");
   }
 
-  const section = [
-    "[mcp_servers.dualog]",
-    'command = "node"',
-    `args = [${JSON.stringify(SERVER_PATH)}]`,
-    "",
-  ].join("\n");
-  fs.writeFileSync(CODEX_CONFIG_TOML, content + section);
-  console.log("  Codex CLI not found; wrote MCP server fallback to ~/.codex/config.toml OK");
+  atomicWriteFile(
+    CODEX_CONFIG_TOML,
+    replaceMcpServerSection(content, {
+      serverPath: SERVER_PATH,
+      nodePath: NODE_PATH,
+      env: persistedWslEnv(cliStatus),
+    })
+  );
+  console.log(`  MCP server written atomically to ${CODEX_CONFIG_TOML} OK`);
 }
 
 function installCodexSkills(logStep) {
@@ -514,7 +525,105 @@ function installCodexSkills(logStep) {
   }
 }
 
-function printSummary(mode, cliStatus) {
+function modeArgument(mode) {
+  if (mode.installClaude && mode.installCodex) return "--both";
+  return mode.installClaude ? "--claude" : "--codex";
+}
+
+function printWslManualInstall(mode, cliStatus) {
+  const distro = cliStatus.wsl?.distro || process.env.DUALOG_WSL_DISTRO || "<distro>";
+  console.log(
+    `  After installing Node.js >= 18 in WSL, open ${distro} and run from this repository:`
+  );
+  console.log(`    node scripts/install.mjs ${modeArgument(mode)} --host-only`);
+}
+
+async function configureWslHosts(spawn, mode, cliStatus, logStep) {
+  console.log("");
+  logStep(
+    mode.hostOnly
+      ? "Skipping WSL host configuration (--host-only)..."
+      : "Configuring the selected WSL distribution..."
+  );
+  if (mode.hostOnly) {
+    console.log("  Host-only mode requested OK");
+    return false;
+  }
+
+  const wsl = cliStatus.wsl;
+  if (!wsl?.binaryAvailable || !wsl.distroAvailable) {
+    console.log(
+      `  WARNING: ${wsl?.binary ?? "wsl.exe"} or the selected WSL distribution is unavailable.`
+    );
+    printWslManualInstall(mode, cliStatus);
+    return false;
+  }
+  if (!wsl.distro) {
+    console.log(
+      "  WARNING: WSL did not report the exact selected distribution, so Dualog will not guess where to install."
+    );
+    console.log("  Set DUALOG_WSL_DISTRO to the distribution name and rerun this installer.");
+    printWslManualInstall(mode, cliStatus);
+    return false;
+  }
+  if (!wsl.node || !wsl.nodePath) {
+    console.log(
+      `  WARNING: Node.js >= 18 was not found in WSL distribution ${wsl.distro}; WSL host configuration was not changed.`
+    );
+    printWslManualInstall(mode, cliStatus);
+    return false;
+  }
+
+  const translated = await runInstallProbe(
+    wsl.binary,
+    wslArgs(["wslpath", "-a", "-u", REPO_ROOT], { route: wsl }),
+    {
+      cwd: REPO_ROOT,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10000,
+      windowsHide: true,
+    },
+    { platform: process.platform, spawnFn: spawn }
+  );
+  const wslRepoRoot = translated.status === 0 ? String(translated.stdout ?? "").trim() : "";
+  if (!wslRepoRoot) {
+    throw new Error(
+      `Could not translate ${REPO_ROOT} for WSL distribution ${wsl.distro}: ` +
+        `${String(translated.stderr ?? translated.error?.message ?? "unknown error").trim()}`
+    );
+  }
+
+  const wslInstaller = path.posix.join(wslRepoRoot, "scripts", "install.mjs");
+  const invocation = buildWslLifecycleInvocation({
+    operation: "install",
+    route: wsl,
+    nodePath: wsl.nodePath,
+    scriptPath: wslInstaller,
+    modeArgument: modeArgument(mode),
+  });
+  const result = await runInstallProbe(
+    invocation.command,
+    invocation.args,
+    {
+      cwd: REPO_ROOT,
+      stdio: "inherit",
+      timeout: 120000,
+      windowsHide: true,
+    },
+    { platform: process.platform, spawnFn: spawn }
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      result.error
+        ? `WSL installer failed: ${result.error.message}`
+        : `WSL installer failed in distribution ${wsl.distro}`
+    );
+  }
+  console.log(`  WSL host configuration installed in ${wsl.distro} OK`);
+  return true;
+}
+
+function printSummary(mode, cliStatus, { wslConfigured = false } = {}) {
   console.log("");
   console.log("Installation complete!");
   console.log("");
@@ -529,7 +638,33 @@ function printSummary(mode, cliStatus) {
   console.log("");
   if (mode.installClaude) console.log(" Restart Claude Code to pick up updated MCP configuration and commands.");
   if (mode.installCodex) console.log(" Restart Codex to pick up updated MCP configuration and skills.");
-  if (!cliStatus.hasClaude || !cliStatus.hasCodex) {
+  if (process.platform === "win32") {
+    console.log("");
+    console.log(" Windows / WSL check:");
+    console.log(
+      `   Native registrations use ${CLAUDE_JSON} and ${CODEX_CONFIG_TOML}.`
+    );
+    if (cliStatus.wsl?.distro) {
+      console.log(
+        `   Runtime WSL distribution pinned as ${cliStatus.wsl.distro} in native MCP registrations.`
+      );
+    }
+    if (wslConfigured) {
+      console.log("   Selected WSL host registrations and skills/commands were installed too.");
+    } else if (!mode.hostOnly) {
+      console.log("   WARNING: WSL host installation did not complete; see the warning above.");
+    }
+    if (!cliStatus.wsl?.tmux) {
+      console.log("   WARNING: tmux was not found in the selected WSL distribution.");
+      console.log("            WSL interactive partner sessions require tmux.");
+    }
+    if (!cliStatus.wsl?.claude) {
+      console.log("   WARNING: Claude Code CLI is unavailable as a WSL review partner.");
+    }
+    if (!cliStatus.wsl?.codex) {
+      console.log("   WARNING: Codex CLI is unavailable as a WSL review partner.");
+    }
+  } else if (!cliStatus.hasClaude || !cliStatus.hasCodex) {
     console.log("");
     console.log(" CLI check:");
     if (!cliStatus.hasClaude) {
@@ -572,6 +707,12 @@ async function main() {
 
   logStep("Checking prerequisites...");
   checkNode();
+  // Explicit Windows routing is a hard prerequisite. Check it before legacy
+  // migration or dependency installation can mutate the repository/user home.
+  await preflightExplicitWslSelection(mode, { cwd: REPO_ROOT });
+  // Migration removes files as well as rewriting configs. Validate every JSON
+  // target first so malformed user data produces zero partial mutations.
+  prevalidateConfigTargets();
 
   console.log("");
   logStep("Migrating any pre-rename install...");
@@ -582,19 +723,27 @@ async function main() {
   ensureDependencies();
 
   const spawn = await loadSpawn();
-  const cliStatus = checkPartnerClis(spawn, logStep);
+  const cliStatus = await checkPartnerClis(spawn, logStep, mode);
+
+  // Finish the required selected-WSL lifecycle step before writing native
+  // registrations. A failed nested install cannot leave a new native route
+  // pointing at an unconfigured WSL host.
+  const wslConfigured =
+    process.platform === "win32"
+      ? await configureWslHosts(spawn, mode, cliStatus, logStep)
+      : false;
 
   if (mode.installClaude) {
-    registerClaudeMcp(spawn, cliStatus.hasClaude, logStep);
+    registerClaudeMcp(cliStatus, logStep);
     installClaudeCommandsAndHooks(logStep);
   }
 
   if (mode.installCodex) {
-    registerCodexMcp(spawn, cliStatus.hasCodex, logStep);
+    registerCodexMcp(cliStatus, logStep);
     installCodexSkills(logStep);
   }
 
-  printSummary(mode, cliStatus);
+  printSummary(mode, cliStatus, { wslConfigured });
 }
 
 main().catch((err) => {

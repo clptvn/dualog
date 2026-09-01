@@ -1,7 +1,7 @@
 ---
 description: Have a partner agent run a multi-specialist PR review (pr-review-toolkit panel) via the dualog MCP server
 argument-hint: [optional: pr:<number|url>] [optional: diff_target (branch|uncommitted|staged|commit:<sha>)] [optional: aspects:code,tests,errors,comments,types,simplify] [optional: review focus] [optional: rounds:N] [optional: effort:<level>] [optional: model:<id>] [optional: partner:<agent-id>]
-allowed-tools: mcp__dualog__start_pr_review, mcp__dualog__get_pr_review_report, mcp__dualog__check_messages, mcp__dualog__send_message, mcp__dualog__get_full_history, mcp__dualog__check_partner_alive, mcp__dualog__send_key, mcp__dualog__end_dialog, mcp__dualog__list_sessions, mcp__dualog__list_models, mcp__dualog__list_adapters, mcp__dualog__check_adapter, Bash, Read, Glob, Grep, Edit, Write, AskUserQuestion, LSP, Monitor
+allowed-tools: mcp__dualog__start_pr_review, mcp__dualog__get_pr_review_report, mcp__dualog__check_messages, mcp__dualog__wait_for_partner_response, mcp__dualog__send_message, mcp__dualog__get_full_history, mcp__dualog__check_partner_alive, mcp__dualog__send_key, mcp__dualog__end_dialog, mcp__dualog__list_sessions, mcp__dualog__list_models, mcp__dualog__list_adapters, mcp__dualog__check_adapter, Bash, Read, Glob, Grep, Edit, Write, AskUserQuestion, LSP, Monitor
 ---
 
 # /dualog-review-pr - Multi-Specialist PR Review

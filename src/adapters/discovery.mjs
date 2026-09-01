@@ -23,15 +23,199 @@
 import fs from "node:fs";
 import os from "node:os";
 import { execFile, spawn } from "node:child_process";
+import crossSpawn from "cross-spawn";
 import { randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 
 import { modelEntries } from "./schema.mjs";
 import { loadCatalog, enrich } from "./catalog.mjs";
+import {
+  resolveWslLoginShell,
+  resolveWslRouteDistro,
+  tmuxRoute,
+} from "../tmux-runtime.mjs";
+import {
+  DEFAULT_WSL_LOGIN_SHELL,
+  wslLoginShellArgs,
+} from "../wsl-shell.mjs";
+import { terminateWindowsProcessTree } from "../windows-process-tree.mjs";
 // Imported rather than restated: the recursion sentinel is a safety mechanism,
 // and a second copy of it here is a second copy that can drift out of step with
 // the one every partner spawn uses.
 import { partnerSentinelEnv } from "./env.mjs";
+
+const DEFAULT_EXECFILE_MAX_BUFFER = 1024 * 1024;
+
+/**
+ * Stop one probe without ever routing an untrusted pid through a shell.
+ * Exported so the native-Windows contract can be tested on every CI host.
+ */
+export function terminateDiscoveryProcess(
+  child,
+  {
+    platform = process.platform,
+    signal = "SIGTERM",
+    terminateWindowsTreeFn = terminateWindowsProcessTree,
+  } = {}
+) {
+  if (platform === "win32") {
+    return terminateWindowsTreeFn(child?.pid);
+  }
+  try {
+    child?.kill(signal);
+    return { status: "succeeded", attempted: true, reason: null };
+  } catch (err) {
+    return {
+      status: "failed",
+      attempted: true,
+      reason: err?.message ?? "could not signal probe process",
+    };
+  }
+}
+
+/** Callback-compatible, maxBuffer-bounded execFile adapter for `.cmd`. */
+export function execFileViaCrossSpawn(
+  command,
+  args,
+  options,
+  callback,
+  {
+    spawnImpl = crossSpawn,
+    platform = process.platform,
+    terminateWindowsTreeFn = terminateWindowsProcessTree,
+  } = {}
+) {
+  let child;
+  try {
+    child = spawnImpl(command, args, {
+      env: options?.env,
+      windowsHide: options?.windowsHide,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (err) {
+    queueMicrotask(() => callback(err, "", ""));
+    return null;
+  }
+
+  const stdoutChunks = [];
+  const stderrChunks = [];
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  let settled = false;
+  let timer = null;
+  const encoding =
+    typeof options?.encoding === "string" && Buffer.isEncoding(options.encoding)
+      ? options.encoding
+      : "utf-8";
+  const outputText = (chunks) => Buffer.concat(chunks).toString(encoding);
+  const finish = (err) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    callback(err, outputText(stdoutChunks), outputText(stderrChunks));
+  };
+  const maxBuffer =
+    options?.maxBuffer === Infinity
+      ? Infinity
+      : Number.isFinite(options?.maxBuffer)
+        ? Math.max(0, options.maxBuffer)
+        : DEFAULT_EXECFILE_MAX_BUFFER;
+  const failAndTerminate = (err) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    // Keep the wrapper and its pipes live while taskkill walks the tree. If we
+    // detach first, cmd.exe can exit and reparent the vendor CLI before /T has
+    // enumerated its descendants.
+    const termination = terminateDiscoveryProcess(child, {
+      platform,
+      signal: options?.killSignal ?? "SIGTERM",
+      terminateWindowsTreeFn,
+    });
+    for (const stream of [child.stdin, child.stdout, child.stderr]) {
+      try { stream?.destroy(); } catch {}
+    }
+    try { child.unref?.(); } catch {}
+    err.termination = termination;
+    if (termination?.status === "failed" && termination.reason) {
+      err.message += `; ${termination.reason}`;
+    }
+    callback(err, outputText(stdoutChunks), outputText(stderrChunks));
+  };
+  const capture = (streamName, chunk) => {
+    if (settled) return;
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding);
+    const previous = streamName === "stdout" ? stdoutBytes : stderrBytes;
+    const chunks = streamName === "stdout" ? stdoutChunks : stderrChunks;
+    if (previous + bytes.length > maxBuffer) {
+      const available = Math.max(0, maxBuffer - previous);
+      if (available > 0) chunks.push(bytes.subarray(0, available));
+      if (streamName === "stdout") stdoutBytes += available;
+      else stderrBytes += available;
+      const err = Object.assign(
+        new RangeError(`${streamName} maxBuffer length exceeded`),
+        {
+          code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+          stream: streamName,
+          killed: true,
+        }
+      );
+      failAndTerminate(err);
+      return;
+    }
+    if (streamName === "stdout") {
+      stdoutBytes += bytes.length;
+      stdoutChunks.push(bytes);
+    } else {
+      stderrBytes += bytes.length;
+      stderrChunks.push(bytes);
+    }
+  };
+  child.stdout.on("data", (chunk) => capture("stdout", chunk));
+  child.stderr.on("data", (chunk) => capture("stderr", chunk));
+  child.once("error", (err) => finish(err));
+  child.once("close", (code, signal) => {
+    if (code === 0) return finish(null);
+    const err = Object.assign(new Error(`process exited with code ${code}`), {
+      code,
+      signal,
+      killed: false,
+    });
+    finish(err);
+  });
+  if (Number.isFinite(options?.timeout) && options.timeout > 0) {
+    timer = setTimeout(() => {
+      const err = Object.assign(new Error(`process timed out after ${options.timeout}ms`), {
+        killed: true,
+        signal: options?.killSignal ?? "SIGTERM",
+      });
+      failAndTerminate(err);
+    }, options.timeout);
+  }
+  return child;
+}
+
+export function discoveryProcessImplementations({
+  platform = process.platform,
+  execFileImpl = null,
+  spawnImpl = null,
+  crossSpawnImpl = crossSpawn,
+  terminateWindowsTreeFn = terminateWindowsProcessTree,
+} = {}) {
+  return {
+    execFileImpl:
+      execFileImpl ??
+      (platform === "win32"
+        ? (command, args, options, callback) =>
+            execFileViaCrossSpawn(command, args, options, callback, {
+              spawnImpl: crossSpawnImpl,
+              platform,
+              terminateWindowsTreeFn,
+            })
+        : execFile),
+    spawnImpl: spawnImpl ?? (platform === "win32" ? crossSpawnImpl : spawn),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Codex -- $CODEX_HOME/models_cache.json
@@ -850,6 +1034,45 @@ export const discoveryCache = createDiscoveryCache();
 // ---------------------------------------------------------------------------
 
 /**
+ * Where process-backed discovery must run to describe the selected partner.
+ *
+ * Native Windows is the one split-host case: this Node server runs on Windows,
+ * while the default interactive Claude/Codex partner runs in WSL with tmux.
+ * Reading the Windows Codex cache or spawning a Windows `claude` there reports
+ * on a different installation -- commonly no installation at all. Mirror the
+ * same engine preference order used by resolveEngine(), then use tmuxRoute() to
+ * select WSL only for an interactive partner. Every other platform and every
+ * headless partner retain the existing local I/O path.
+ */
+function discoveryRuntimeRoute(
+  adapter,
+  { env, platform, engine, strategy, tmuxRouteFn }
+) {
+  // Static/catalog/http discovery does not execute or inspect a partner-local
+  // process. Avoid even resolving WSL for those paths.
+  if (!["local-cache", "cli-command", "sdk-control"].includes(strategy)) {
+    return { transport: "local" };
+  }
+  if (platform !== "win32") return { transport: "local" };
+
+  const preferred = env?.DUALOG_STRATEGY;
+  const selectedEngine =
+    engine ??
+    (preferred && adapter?.engines?.allowed?.includes(preferred)
+      ? preferred
+      : adapter?.engines?.default);
+  if (selectedEngine !== "tmux-interactive") return { transport: "local" };
+
+  return tmuxRouteFn({ env, platform });
+}
+
+/** Keep cached account catalogs scoped to the distro that supplied them. */
+function discoveryCacheAdapterId(adapterId, route) {
+  if (route?.transport !== "wsl") return adapterId;
+  return `${adapterId}@wsl:${route.distro || "default"}`;
+}
+
+/**
  * Discover the models one adapter can currently reach.
  *
  * NEVER THROWS and never rejects. Every failure degrades to the adapter's
@@ -874,31 +1097,117 @@ export async function resolveDiscovery(adapter, options = {}) {
   const {
     env = process.env,
     home = os.homedir(),
+    platform = process.platform,
+    engine = null,
     now = Date.now(),
     refresh = false,
     cache = discoveryCache,
     readFile = defaultReadFile,
+    readWslFile = defaultReadWslFile,
     runCommand = defaultRunCommand,
     runControl = defaultRunControlRequest,
     fetchModels = fetchOpenAIModels,
     fetchShow = fetchOllamaShow,
+    tmuxRouteFn = tmuxRoute,
+    resolveWslRouteDistroFn = resolveWslRouteDistro,
+    resolveWslLoginShellFn = resolveWslLoginShell,
+    execFileImpl = null,
+    spawnImpl = null,
+    terminateWindowsTreeFn = terminateWindowsProcessTree,
   } = options;
 
   const config = adapter?.discovery ?? null;
   const strategy = config?.strategy ?? "static";
+  const processImplementations = discoveryProcessImplementations({
+    platform,
+    execFileImpl,
+    spawnImpl,
+    terminateWindowsTreeFn,
+  });
 
   // `none` is the only setting that guarantees no I/O whatsoever, enrichment
   // included. Everything else may still annotate from the catalog below.
   if (strategy === "none") return staticResult(adapter);
 
+  let route;
+  try {
+    route = discoveryRuntimeRoute(adapter, {
+      env,
+      platform,
+      engine,
+      strategy,
+      tmuxRouteFn,
+    });
+  } catch (err) {
+    let result = staticResult(adapter, [
+      notice(
+        "discovery_failed",
+        `discovery route for "${adapter.id}" could not be resolved: ${err?.message ?? err}`
+      ),
+    ]);
+    result = await applyCatalogEnrichment(result, adapter, config, {
+      now,
+      refresh,
+      options,
+    });
+    return result;
+  }
+
+  if (route?.transport === "wsl") {
+    try {
+      // Standalone status/discovery calls may not arrive with the runtime
+      // context's already-pinned route. Resolve the default exactly once
+      // before selecting a shell or touching partner-owned caches so those
+      // operations cannot straddle a default-distro change.
+      route = await resolveWslRouteDistroFn(route);
+    } catch (err) {
+      let result = staticResult(adapter, [
+        notice(
+          "discovery_failed",
+          `WSL distribution for "${adapter.id}" could not be resolved: ${err?.message ?? err}`
+        ),
+      ]);
+      result = await applyCatalogEnrichment(result, adapter, config, {
+        now,
+        refresh,
+        options,
+      });
+      return result;
+    }
+    let loginShell = DEFAULT_WSL_LOGIN_SHELL;
+    try {
+      loginShell = await resolveWslLoginShellFn(route);
+    } catch {}
+    route = {
+      ...route,
+      loginShell,
+    };
+  }
+
+  const cacheAdapterId = discoveryCacheAdapterId(adapter.id, route);
   if (!refresh) {
-    const hit = cache.get(strategy, adapter.id);
+    const hit = cache.get(strategy, cacheAdapterId);
     if (hit) return hit;
   }
 
   let result;
   try {
-    const context = { env, home, now, readFile, runCommand, runControl, fetchModels, fetchShow };
+    const context = {
+      env,
+      home,
+      now,
+      route,
+      readFile,
+      readWslFile,
+      runCommand,
+      runControl,
+      fetchModels,
+      fetchShow,
+      execFileImpl: processImplementations.execFileImpl,
+      spawnImpl: processImplementations.spawnImpl,
+      platform,
+      terminateWindowsTreeFn,
+    };
     if (strategy === "local-cache") result = await resolveLocalCache(adapter, config, context);
     else if (strategy === "cli-command") result = await resolveCliCommand(adapter, config, context);
     else if (strategy === "sdk-control") result = await resolveSdkControl(adapter, config, context);
@@ -923,7 +1232,9 @@ export async function resolveDiscovery(adapter, options = {}) {
   // pin a bad answer in place for the whole TTL, and the fallback is free to
   // recompute anyway.
   if (result.strategy !== "static" && !result.stale) {
-    cache.set(strategy, adapter.id, result);
+    cache.set(strategy, cacheAdapterId, result, {
+      ttlMs: discoveryTtlMs(strategy, adapter.id),
+    });
   }
   return result;
 }
@@ -1024,8 +1335,33 @@ function notice(code, message) {
 
 // --- local-cache -----------------------------------------------------------
 
-async function resolveLocalCache(adapter, config, { env, home, now, readFile }) {
-  const cachePath = renderDiscoveryPath(config.path, adapter, env, home);
+async function resolveLocalCache(
+  adapter,
+  config,
+  { env, home, now, route, readFile, readWslFile, execFileImpl }
+) {
+  let cachePath;
+  let read;
+
+  if (route?.transport === "wsl") {
+    // Resolve $HOME and adapter-specific config env inside the chosen distro.
+    // The native Windows process has a different home and often has no useful
+    // CODEX_HOME at all, so rendering first on the host can only target the
+    // wrong installation.
+    const wslRead = await readWslFile({
+      adapter,
+      config,
+      route,
+      env,
+      execFileImpl,
+    });
+    cachePath = wslRead.path || config.path;
+    read = wslRead;
+  } else {
+    cachePath = renderDiscoveryPath(config.path, adapter, env, home);
+    read = cachePath ? readFile(cachePath) : null;
+  }
+
   if (!cachePath) {
     return staticResult(adapter, [
       notice(
@@ -1035,13 +1371,20 @@ async function resolveLocalCache(adapter, config, { env, home, now, readFile }) 
     ]);
   }
 
-  const read = readFile(cachePath);
-  if (read.error) {
+  const source =
+    route?.transport === "wsl"
+      ? `wsl${route.distro ? `:${route.distro}` : ""}:${cachePath}`
+      : cachePath;
+
+  if (!read || read.error) {
     // Missing is the common, benign case: the CLI has never run, or runs under
     // a different home. It is still worth naming the exact path, because that
     // is the one fact that makes a wrong home obvious.
     return staticResult(adapter, [
-      notice("cache_unreadable", `${cachePath} could not be read (${read.error})`),
+      notice(
+        "cache_unreadable",
+        `${source} could not be read (${read?.error ?? "unreadable"})`
+      ),
     ]);
   }
 
@@ -1058,7 +1401,7 @@ async function resolveLocalCache(adapter, config, { env, home, now, readFile }) 
     const models = parseCodexCache(json);
     if (models.length === 0) {
       return staticResult(adapter, [
-        notice("discovery_empty", `${cachePath} contains no listable models`),
+        notice("discovery_empty", `${source} contains no listable models`),
       ]);
     }
 
@@ -1076,7 +1419,7 @@ async function resolveLocalCache(adapter, config, { env, home, now, readFile }) 
 
     return {
       models,
-      source: cachePath,
+      source,
       strategy: "local-cache",
       fetchedAt,
       stale,
@@ -1084,7 +1427,7 @@ async function resolveLocalCache(adapter, config, { env, home, now, readFile }) 
         ? [
             notice(
               "cache_stale",
-              `${cachePath} could not be shown to be fresher than its ` +
+              `${source} could not be shown to be fresher than its ` +
                 `${CODEX_CACHE_TTL_MS / 3_600_000}h TTL` +
                 (fetchedAt ? ` (fetched_at ${fetchedAt})` : " (no usable fetched_at)") +
                 `; treat this list as a hint, not as grounds to reject a model`
@@ -1104,7 +1447,7 @@ async function resolveLocalCache(adapter, config, { env, home, now, readFile }) 
     return staticResult(adapter, [
       notice(
         "origin_mismatch",
-        `${cachePath} was written against ${parsed.origin ?? "an unrecorded origin"}, ` +
+        `${source} was written against ${parsed.origin ?? "an unrecorded origin"}, ` +
           `but models are now listed from ${originUrl}; ignoring it`
       ),
     ]);
@@ -1112,13 +1455,13 @@ async function resolveLocalCache(adapter, config, { env, home, now, readFile }) 
 
   if (parsed.models.length === 0) {
     return staticResult(adapter, [
-      notice("discovery_empty", `${cachePath} lists no models`),
+      notice("discovery_empty", `${source} lists no models`),
     ]);
   }
 
   return {
     models: parsed.models,
-    source: cachePath,
+    source,
     strategy: "local-cache",
     fetchedAt: parsed.fetchedAt,
     stale: parsed.stale,
@@ -1128,7 +1471,7 @@ async function resolveLocalCache(adapter, config, { env, home, now, readFile }) 
       ? [
           notice(
             "cache_stale",
-            `${cachePath} is older than its ${GROK_CACHE_TTL_MS / 1000}s TTL; ` +
+            `${source} is older than its ${GROK_CACHE_TTL_MS / 1000}s TTL; ` +
               `treat this list as a hint, not as grounds to reject a model`
           ),
         ]
@@ -1199,7 +1542,11 @@ function resolveUserConfigHome(adapter, env, home) {
 
 // --- cli-command -----------------------------------------------------------
 
-async function resolveCliCommand(adapter, config, { env, now, runCommand }) {
+async function resolveCliCommand(
+  adapter,
+  config,
+  { env, now, route, runCommand, execFileImpl }
+) {
   const command = config.command ?? adapter.binary.default;
   const label = `${command} ${config.args.join(" ")}`;
 
@@ -1211,6 +1558,8 @@ async function resolveCliCommand(adapter, config, { env, now, runCommand }) {
     args: config.args,
     timeoutMs: config.timeoutMs,
     env,
+    route,
+    execFileImpl,
   });
 
   if (run.error) {
@@ -1269,7 +1618,19 @@ export const SDK_CONTROL_TIMEOUT_MS = 15_000;
  * `--model` values that are in no static manifest and no published catalog, and
  * a user who types one would otherwise be told it does not exist.
  */
-async function resolveSdkControl(adapter, config, { env, now, runControl }) {
+async function resolveSdkControl(
+  adapter,
+  config,
+  {
+    env,
+    now,
+    route,
+    runControl,
+    spawnImpl,
+    platform,
+    terminateWindowsTreeFn,
+  }
+) {
   const command = config.command ?? adapter.binary.default;
   const label = `${command} (list_models control request)`;
 
@@ -1279,6 +1640,10 @@ async function resolveSdkControl(adapter, config, { env, now, runControl }) {
     request: { subtype: "list_models" },
     timeoutMs: config.timeoutMs ?? SDK_CONTROL_TIMEOUT_MS,
     env,
+    route,
+    spawnImpl,
+    platform,
+    terminateWindowsTreeFn,
   });
 
   if (run.error) {
@@ -1520,6 +1885,170 @@ function firstEnvValue(env, names) {
 
 // --- default I/O -----------------------------------------------------------
 
+/** Hard bounds for one WSL cache read. */
+const WSL_CACHE_READ_TIMEOUT_MS = 5000;
+const WSL_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * A fixed shell program; every dynamic value is a positional argument.
+ *
+ * The login shell matters because the selected partner is launched under the
+ * same interactive-login contract by tmux-runtime. It sees the distro user's HOME,
+ * profile PATH and CLI-specific config variables instead of the Windows host's
+ * unrelated values. No user-controlled value is interpolated into shell text.
+ */
+const WSL_CACHE_READ_SCRIPT = [
+  "replace_once() {",
+  "  value=$1",
+  "  needle=$2",
+  "  replacement=$3",
+  '  case "$value" in',
+  '    *"$needle"*)',
+  '      prefix=${value%%"$needle"*}',
+  '      suffix=${value#*"$needle"}',
+  '      printf "%s%s%s" "$prefix" "$replacement" "$suffix"',
+  "      ;;",
+  '    *) printf "%s" "$value" ;;',
+  "  esac",
+  "}",
+  "to_wsl_path() {",
+  '  case "$1" in',
+  '    [A-Za-z]:[\\\\/]*) wslpath -a -u "$1" 2>/dev/null || printf "%s" "$1" ;;',
+  '    *) printf "%s" "$1" ;;',
+  "  esac",
+  "}",
+  "seed_name=$1",
+  "fallback_template=$2",
+  "path_template=$3",
+  "output_marker=$4",
+  "config_home=",
+  'if [ -n "$seed_name" ]; then',
+  '  config_home=$(printenv "$seed_name" 2>/dev/null || true)',
+  "fi",
+  'if [ -z "$config_home" ]; then',
+  '  config_home=$(replace_once "$fallback_template" "{{home}}" "$HOME")',
+  "fi",
+  'if [ -z "$config_home" ]; then',
+  '  printf "%s\\n" "cannot resolve the WSL config home" >&2',
+  "  exit 2",
+  "fi",
+  'config_home=$(to_wsl_path "$config_home")',
+  'cache_path=$(replace_once "$path_template" "{{configHome}}" "$config_home")',
+  'cache_path=$(replace_once "$cache_path" "{{home}}" "$HOME")',
+  'cache_path=$(to_wsl_path "$cache_path")',
+  'printf "%s\\n%s\\n" "$output_marker" "$cache_path"',
+  'exec cat -- "$cache_path"',
+].join("\n");
+
+/** Run the partner command through the same login-shell PATH tmux uses. */
+const WSL_PARTNER_EXEC_SCRIPT = [
+  "output_marker=$1",
+  "role=$2",
+  "depth=$3",
+  "partner_command=$4",
+  "shift 4",
+  'export DUALOG_ROLE="$role" DUALOG_DEPTH="$depth"',
+  'case "$partner_command" in',
+  '  [A-Za-z]:[\\\\/]*) partner_command=$(wslpath -a -u "$partner_command") ;;',
+  "esac",
+  'printf "%s\\n" "$output_marker"',
+  'exec "$partner_command" "$@"',
+].join("\n");
+
+function wslExecArgs(route, args) {
+  return [
+    ...(route?.distro ? ["--distribution", route.distro] : []),
+    "--exec",
+    ...args,
+  ];
+}
+
+function prepareDiscoveryCommand(command, args, route) {
+  if (route?.transport !== "wsl") {
+    return { command, args, transport: "local" };
+  }
+  const sentinel = partnerSentinelEnv();
+  const outputMarker = `__DUALOG_WSL_READY_${randomUUID()}__`;
+  return {
+    command: route.command,
+    args: wslExecArgs(
+      route,
+      wslLoginShellArgs(route.loginShell, WSL_PARTNER_EXEC_SCRIPT, {
+        arg0: "dualog-wsl-discovery",
+        args: [
+          outputMarker,
+          sentinel.DUALOG_ROLE,
+          sentinel.DUALOG_DEPTH,
+          command,
+          ...args,
+        ],
+      })
+    ),
+    transport: "wsl",
+    outputMarker,
+  };
+}
+
+/** Read one partner-owned cache file from the selected WSL distribution. */
+function defaultReadWslFile({ adapter, config, route, env, execFileImpl = execFile }) {
+  return new Promise((resolve) => {
+    const outputMarker = `__DUALOG_WSL_CACHE_${randomUUID()}__`;
+    const isolation = adapter?.configIsolation;
+    const args = wslExecArgs(
+      route,
+      wslLoginShellArgs(route.loginShell, WSL_CACHE_READ_SCRIPT, {
+        arg0: "dualog-wsl-cache-read",
+        args: [
+          isolation?.seedFromEnv ?? "",
+          isolation?.seedFromFallback ?? "",
+          config.path,
+          outputMarker,
+        ],
+      })
+    );
+
+    execFileImpl(
+      route.command,
+      args,
+      {
+        timeout: WSL_CACHE_READ_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+        encoding: "utf-8",
+        env,
+        windowsHide: true,
+        maxBuffer: WSL_CACHE_MAX_BYTES,
+      },
+      (err, stdout, stderr) => {
+        const output = String(stdout ?? "");
+        const body = discoveryCommandStdout(output, { outputMarker });
+        const newline = body.indexOf("\n");
+        const cachePath =
+          newline === -1 ? null : body.slice(0, newline).replace(/\r$/u, "");
+        const text = newline === -1 ? null : body.slice(newline + 1);
+
+        if (err) {
+          const detail = String(stderr || "").trim().slice(0, 500);
+          const reason =
+            err.killed || err.signal
+              ? `WSL cache read timed out after ${WSL_CACHE_READ_TIMEOUT_MS}ms`
+              : err.code === "ENOENT"
+                ? `WSL launcher ${JSON.stringify(route.command)} was not found`
+                : detail || err.message || "WSL cache read failed";
+          return resolve({ path: cachePath, text: null, error: reason });
+        }
+        if (!cachePath) {
+          return resolve({
+            path: null,
+            text: null,
+            error: "WSL returned no cache path",
+          });
+        }
+        resolve({ path: cachePath, text, error: null });
+      }
+    );
+  });
+}
+
 /** Read a file, reporting WHY it failed. Never throws. */
 function defaultReadFile(filePath) {
   try {
@@ -1534,27 +2063,65 @@ function defaultReadFile(filePath) {
   }
 }
 
+function discoveryCommandStdout(stdout, invocation) {
+  const output = String(stdout ?? "");
+  if (!invocation?.outputMarker) return output;
+  const marker = invocation.outputMarker;
+  const index = output.indexOf(marker);
+  if (index === -1) return "";
+  const after = output.slice(index + marker.length);
+  if (after.startsWith("\r\n")) return after.slice(2);
+  if (after.startsWith("\n")) return after.slice(1);
+  return "";
+}
+
 /** Run a listing command with a hard timeout. Never throws. */
-function defaultRunCommand({ command, args, timeoutMs, env }) {
+function defaultRunCommand({
+  command,
+  args,
+  timeoutMs,
+  env,
+  route,
+  execFileImpl = execFile,
+}) {
   return new Promise((resolve) => {
-    execFile(
-      command,
-      args,
+    const invocation = prepareDiscoveryCommand(command, args, route);
+    execFileImpl(
+      invocation.command,
+      invocation.args,
       { timeout: timeoutMs, encoding: "utf-8", env, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
-      (err, stdout) => {
+      (err, stdout, stderr) => {
+        const commandStdout = discoveryCommandStdout(stdout, invocation);
         if (err) {
+          const detail = String(stderr || "").trim();
           const reason =
-            err.killed || err.signal
+            err.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"
+              ? `${err.stream || "process output"} exceeded the ${4 * 1024 * 1024}-byte discovery limit`
+              : err.killed || err.signal
               ? `timed out after ${timeoutMs}ms`
               : err.code === "ENOENT"
-                ? "not installed"
-                : (err.message ?? "failed");
-          // Some CLIs write the list and still exit non-zero. Usable stdout is
-          // worth more than the exit code, so it wins when both are present.
-          if (typeof stdout === "string" && stdout.trim()) return resolve({ stdout, error: null });
+                ? invocation.transport === "wsl"
+                  ? "WSL is not installed or not on PATH"
+                  : "not installed"
+                : invocation.transport === "wsl" &&
+                    (err.code === 127 || /(?:not found|execvpe\()/iu.test(detail))
+                  ? `not installed in WSL${route?.distro ? ` distribution ${route.distro}` : ""}`
+                  : (detail || err.message || "failed");
+          // Some CLIs write the list and still exit with an ordinary numeric
+          // status. Usable stdout can win there, but never for timeout,
+          // overflow, spawn failure, or a killed process: that output may be a
+          // truncated prefix that only happens to look like a valid model id.
+          if (
+            Number.isInteger(err.code) &&
+            !err.killed &&
+            !err.signal &&
+            commandStdout.trim()
+          ) {
+            return resolve({ stdout: commandStdout, error: null });
+          }
           return resolve({ stdout: "", error: reason });
         }
-        resolve({ stdout: String(stdout ?? ""), error: null });
+        resolve({ stdout: commandStdout, error: null });
       }
     );
   });
@@ -1583,15 +2150,27 @@ const KILL_GRACE_MS = 2000;
  *   no_control_response it exited first -- usually auth, so stderr is quoted.
  *   spawn_failed        the spawn itself failed.
  */
-function defaultRunControlRequest({ command, args, request, timeoutMs, env }) {
+function defaultRunControlRequest({
+  command,
+  args,
+  request,
+  timeoutMs,
+  env,
+  route,
+  spawnImpl = spawn,
+  platform = process.platform,
+  terminateWindowsTreeFn = terminateWindowsProcessTree,
+}) {
   return new Promise((resolve) => {
     const requestId = `dualog-discovery-${randomUUID()}`;
+    const invocation = prepareDiscoveryCommand(command, args, route);
     let child;
     try {
-      child = spawn(command, args, {
+      child = spawnImpl(invocation.command, invocation.args, {
         // The user's own environment, so the CLI reports what the USER can
         // select -- plus the sentinel, so anything this child spawns knows it
-        // is downstream of us.
+        // is downstream of us. The WSL wrapper exports the same sentinel again
+        // after its login shell, where Windows env forwarding cannot erase it.
         env: { ...env, ...partnerSentinelEnv() },
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
@@ -1599,23 +2178,45 @@ function defaultRunControlRequest({ command, args, request, timeoutMs, env }) {
     } catch (err) {
       return resolve({
         line: null,
-        error: { code: "spawn_failed", message: `could not run \`${command}\`: ${err?.message ?? err}` },
+        error: {
+          code: "spawn_failed",
+          message:
+            invocation.transport === "wsl"
+              ? `could not start WSL to run \`${command}\`: ${err?.message ?? err}`
+              : `could not run \`${command}\`: ${err?.message ?? err}`,
+        },
       });
     }
 
     let settled = false;
-    let pending = "";
-    let stderr = "";
+    let pending = Buffer.alloc(0);
+    let stdoutBytes = 0;
+    const stderrChunks = [];
+    let stderrBytes = 0;
 
-    const finish = (error, line = null) => {
+    const finish = (error, line = null, { terminate = true } = {}) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       // Kill the moment we have the answer. This is a whole CLI process with a
       // session of its own; letting it linger for a fixed interval would add
       // seconds to every discovery call for nothing.
-      killChild(child);
-      resolve({ line, error });
+      // A WSL launcher is not a native `.cmd` tree: taskkill can prove only
+      // that wsl.exe stopped, not that its Linux process did. Keep the prior
+      // launcher signal there; the exact native tree primitive is for local
+      // Windows probes where its proof applies.
+      const terminationPlatform =
+        invocation.transport === "local" ? platform : "wsl";
+      const termination = terminate
+        ? killChild(child, {
+            platform: terminationPlatform,
+            terminateWindowsTreeFn,
+          })
+        : disposeChild(child);
+      if (error && termination?.status === "failed" && termination.reason) {
+        error.message += `; ${termination.reason}`;
+      }
+      resolve({ line, error, termination });
     };
 
     const timer = setTimeout(
@@ -1627,21 +2228,22 @@ function defaultRunControlRequest({ command, args, request, timeoutMs, env }) {
       timeoutMs
     );
 
-    child.stdout.setEncoding("utf-8");
     child.stdout.on("data", (chunk) => {
       if (settled) return;
-      pending += chunk;
-      if (pending.length > MAX_CONTROL_STDOUT) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      stdoutBytes += bytes.length;
+      if (stdoutBytes > MAX_CONTROL_STDOUT) {
         return finish({
-          code: "no_control_response",
+          code: "control_output_limit",
           message: `\`${command}\` streamed more than ${MAX_CONTROL_STDOUT} bytes without answering`,
         });
       }
+      pending = Buffer.concat([pending, bytes]);
 
       let newline;
-      while ((newline = pending.indexOf("\n")) !== -1) {
-        const line = pending.slice(0, newline);
-        pending = pending.slice(newline + 1);
+      while ((newline = pending.indexOf(0x0a)) !== -1) {
+        const line = pending.subarray(0, newline).toString("utf-8").replace(/\r$/u, "");
+        pending = pending.subarray(newline + 1);
         if (!line.trim()) continue;
         // Exactly one request is outstanding, so the first models-bearing
         // control_response is necessarily the answer to it.
@@ -1649,9 +2251,12 @@ function defaultRunControlRequest({ command, args, request, timeoutMs, env }) {
       }
     });
 
-    child.stderr.setEncoding("utf-8");
     child.stderr.on("data", (chunk) => {
-      if (stderr.length < MAX_CONTROL_STDERR) stderr += chunk;
+      if (stderrBytes >= MAX_CONTROL_STDERR) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      const kept = bytes.subarray(0, MAX_CONTROL_STDERR - stderrBytes);
+      stderrChunks.push(kept);
+      stderrBytes += kept.length;
     });
 
     // EPIPE, when the child has already exited. The close handler reports what
@@ -1663,19 +2268,28 @@ function defaultRunControlRequest({ command, args, request, timeoutMs, env }) {
         code: err?.code === "ENOENT" ? "cli_not_found" : "spawn_failed",
         message:
           err?.code === "ENOENT"
-            ? `\`${command}\` is not installed or not on PATH`
+            ? invocation.transport === "wsl"
+              ? `WSL is not installed or not on PATH, so \`${command}\` could not be checked there`
+              : `\`${command}\` is not installed or not on PATH`
             : `\`${command}\` failed to start: ${err?.message ?? err}`,
-      })
+      }, null, { terminate: false })
     );
 
-    child.on("close", (code) =>
+    child.on("close", (code) => {
+      const stderrText = Buffer.concat(stderrChunks).toString("utf-8").trim();
+      const missingInWsl =
+        invocation.transport === "wsl" &&
+        code === 127 &&
+        /(?:not found|execvpe\()/iu.test(stderrText);
       finish({
-        code: "no_control_response",
-        message:
-          `\`${command}\` exited (${code}) before answering the list_models control request` +
-          (stderr.trim() ? `: ${stderr.trim().slice(0, MAX_CONTROL_STDERR)}` : ""),
-      })
-    );
+        code: missingInWsl ? "cli_not_found" : "no_control_response",
+        message: missingInWsl
+          ? `\`${command}\` is not installed or not on PATH in WSL` +
+            (route?.distro ? ` distribution ${route.distro}` : "")
+          : `\`${command}\` exited (${code}) before answering the list_models control request` +
+            (stderrText ? `: ${stderrText}` : ""),
+      }, null, { terminate: false });
+    });
 
     child.stdin.write(
       `${JSON.stringify({ type: "control_request", request_id: requestId, request })}\n`
@@ -1689,13 +2303,13 @@ function defaultRunControlRequest({ command, args, request, timeoutMs, env }) {
 /**
  * SIGTERM, then SIGKILL if it is still there. Never throws.
  *
- * The pipes are torn down FIRST, and the child is unref'd. Killing alone is not
- * enough: a CLI that spawned a helper of its own leaves that helper holding the
- * inherited stdout fd, and a live pipe keeps OUR event loop alive long after we
- * returned an answer. Observed as a caller that produced its result instantly
- * and then sat there until the grandchild's own timer expired.
+ * The pipes are torn down and the child is unref'd. Killing alone is not enough:
+ * a CLI that spawned a helper of its own leaves that helper holding the inherited
+ * stdout fd, and a live pipe keeps OUR event loop alive long after we returned an
+ * answer. Native Windows callers must taskkill the live wrapper tree BEFORE this
+ * helper, or cmd.exe can exit and reparent the vendor child before /T sees it.
  */
-function killChild(child) {
+function disposeChild(child) {
   for (const stream of [child.stdin, child.stdout, child.stderr]) {
     try {
       stream?.destroy();
@@ -1703,12 +2317,32 @@ function killChild(child) {
       /* already closed */
     }
   }
+  if (typeof child.unref === "function") child.unref();
+  return { status: "not-needed", attempted: false, reason: null };
+}
+
+function killChild(
+  child,
+  {
+    platform = process.platform,
+    terminateWindowsTreeFn = terminateWindowsProcessTree,
+  } = {}
+) {
+  if (platform === "win32") {
+    const termination = terminateDiscoveryProcess(child, {
+      platform,
+      terminateWindowsTreeFn,
+    });
+    disposeChild(child);
+    return termination;
+  }
+
+  disposeChild(child);
   try {
     child.kill("SIGTERM");
   } catch {
     /* already gone */
   }
-  if (typeof child.unref === "function") child.unref();
   const grace = setTimeout(() => {
     try {
       child.kill("SIGKILL");
@@ -1719,6 +2353,7 @@ function killChild(child) {
   // Must not hold the event loop open: discovery is often the last thing a
   // short-lived process does.
   if (typeof grace.unref === "function") grace.unref();
+  return { status: "succeeded", attempted: true, reason: null };
 }
 
 // ---------------------------------------------------------------------------

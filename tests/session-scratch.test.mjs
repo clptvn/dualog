@@ -29,6 +29,25 @@ function tempRoot(t, label) {
   return dir;
 }
 
+function createFileSymlinkOrSkip(t, target, link) {
+  try {
+    fs.symlinkSync(target, link, "file");
+    return true;
+  } catch (err) {
+    // Windows hosted runners do not consistently grant file-symlink
+    // privileges. That host capability is unrelated to the sweep contract, so
+    // skip this one assertion rather than failing before it can run.
+    if (
+      process.platform === "win32" &&
+      ["EPERM", "EACCES", "UNKNOWN"].includes(err?.code)
+    ) {
+      t.skip(`file symlinks are unavailable on this Windows runner (${err.code})`);
+      return false;
+    }
+    throw err;
+  }
+}
+
 /** A session with a partner home in it, plus whatever status the case needs. */
 function makeSession(root, sessionId, { status = null, homes = ["codex-home"], extra = {} } = {}) {
   const dir = path.join(root, sessionId);
@@ -182,6 +201,11 @@ test("with no tmux server running, a recorded pane is provably absent and can be
         runtime: "tmux-interactive",
         agent: "codex",
         session_name: "dualog-probe-session-that-does-not-exist",
+        tmux_transport: "local",
+        tmux_distro: null,
+        tmux_launcher: "tmux",
+        tmux_control_binary: "tmux",
+        tmux_socket_name: process.env.DUALOG_TMUX_SOCKET,
       }),
     },
   });
@@ -287,7 +311,11 @@ test("a symlink in place of a generated home is reported and never followed", (t
   const dir = path.join(root, "dialog-1785600000008-00000011");
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ runner_pid: null }));
-  fs.symlinkSync(outside, path.join(dir, "codex-home"));
+  fs.symlinkSync(
+    outside,
+    path.join(dir, "codex-home"),
+    process.platform === "win32" ? "junction" : "dir"
+  );
 
   const receipt = sweepScratch({ apply: true, roots: [root] });
   assert.equal(receipt.removed.length, 0, "a link must not be treated as a removable home");
@@ -628,7 +656,15 @@ test("only regular direct-child files are nominated for the unlink-first pass", 
   });
   const home = path.join(dir, "codex-home");
   fs.mkdirSync(path.join(home, "config.toml"), { recursive: true }); // a DIRECTORY
-  fs.symlinkSync(path.join(outside, "real-secret.json"), path.join(home, "auth.json"));
+  if (
+    !createFileSymlinkOrSkip(
+      t,
+      path.join(outside, "real-secret.json"),
+      path.join(home, "auth.json")
+    )
+  ) {
+    return;
+  }
 
   const plan = planScratchSweep({ roots: [root] });
   const target = plan.sessions[0].targets.find((x) => x.name === "codex-home");

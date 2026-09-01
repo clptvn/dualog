@@ -226,7 +226,8 @@ test("argv for every adapter and engine", (t) => {
       .split(SESSION_DIR)
       .join("<SESSION_DIR>")
       .split(os.homedir())
-      .join("<HOME>");
+      .join("<HOME>")
+      .replaceAll("\\", "/");
 
   for (const adapter of ADAPTERS) {
     for (const engine of adapter.engines.allowed) {

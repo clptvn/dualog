@@ -64,15 +64,21 @@ process.on("exit", () => {
 // Absolute temp paths differ every run. Replace them with stable tokens so the
 // snapshot captures argv *shape and ordering*, which is what we care about.
 function stabilize(value) {
-  return JSON.parse(
-    JSON.stringify(value)
+  if (typeof value === "string") {
+    return value
       .split(SCRATCH_DIR)
       .join("<SCRATCH_DIR>")
       .split(SESSION_DIR)
       .join("<SESSION_DIR>")
       .split(FIXTURE_HOME)
       .join("<HOME>")
-  );
+      .replaceAll("\\", "/");
+  }
+  if (Array.isArray(value)) return value.map(stabilize);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, stabilize(entry)]));
+  }
+  return value;
 }
 
 const { buildInvocationFromAdapter } = await import("../src/adapters/argv.mjs");
@@ -253,18 +259,18 @@ test("an unknown agent id fails with the available ids listed", async () => {
 });
 
 test("requesting an engine the adapter disallows fails at build time", async () => {
-  const adapter = getAdapter("codex", registryOptions);
+  const adapter = getAdapter("cursor", registryOptions);
   assert.throws(
     () =>
       buildInvocationFromAdapter(adapter, {
-        engine: "headless",
+        engine: "tmux-interactive",
         projectPath: PROJECT_PATH,
         sessionDir: SESSION_DIR,
-    scratchDir: SCRATCH_DIR,
+        scratchDir: SCRATCH_DIR,
         sessionName: SESSION_NAME,
       }),
     // Must name the manifest file: a wrong engine in a user-supplied adapter is
     // otherwise very hard to trace back to its source.
-    /does not allow engine "headless".*codex\.json/s
+    /does not allow engine "tmux-interactive".*cursor-agent\.json/s
   );
 });

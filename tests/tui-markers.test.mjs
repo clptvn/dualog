@@ -102,8 +102,10 @@ const PANES = {
     "  Quick safety check",
     "",
     "  Do you trust the files in this folder?",
-    "  1. Yes, I trust this folder",
-    "  2. No, exit",
+    "  ❯ No, exit",
+    "    Yes, I trust this folder",
+    "",
+    "  Enter to confirm · Esc to cancel",
   ].join("\n"),
 
   claudeBypassWarning: [
@@ -162,7 +164,7 @@ function refDetectStartupPrompt(agent, snapshot) {
       snapshot.includes("Yes, I trust this folder") &&
       snapshot.includes("No, exit")
     ) {
-      return { kind: "workspace_trust", input: "1" };
+      return { kind: "workspace_trust", keys: ["down", "enter"] };
     }
     if (
       lowerTail.includes("bypass permissions") &&
@@ -258,6 +260,7 @@ for (const [agent, adapter] of AGENTS) {
         `startup kind diverged for ${agent} on ${paneName}`
       );
       assert.equal(actual?.input ?? null, expected?.input ?? null);
+      assert.deepEqual(actual?.keys ?? null, expected?.keys ?? null);
     });
   }
 }
@@ -277,9 +280,9 @@ test("a stale boot line in scrollback does not pin the pane to not-ready", () =>
 test("startup interstitials are detected before the prompt exists", () => {
   assert.equal(detectStartupPrompt(codex.tui, PANES.codexTrust)?.input, "1");
   assert.equal(detectStartupPrompt(codex.tui, PANES.codexTrustAlt)?.input, "1");
-  assert.equal(
-    detectStartupPrompt(claude.tui, PANES.claudeTrust, { readyWins: true })?.input,
-    "1"
+  assert.deepEqual(
+    detectStartupPrompt(claude.tui, PANES.claudeTrust, { readyWins: true })?.keys,
+    ["down", "enter"]
   );
   assert.equal(
     detectStartupPrompt(claude.tui, PANES.claudeBypassWarning, { readyWins: true })?.input,

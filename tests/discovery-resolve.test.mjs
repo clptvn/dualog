@@ -17,6 +17,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -27,7 +29,11 @@ import {
 } from "../src/adapters/discovery.mjs";
 import { parseCatalog } from "../src/adapters/catalog.mjs";
 import { getAdapter, resetRegistry } from "../src/adapters/registry.mjs";
-import { negotiate } from "../src/adapters/negotiate.mjs";
+import {
+  describeAdapter,
+  findBinary,
+  negotiate,
+} from "../src/adapters/negotiate.mjs";
 
 /**
  * Enrichment off by default, so these tests stay hermetic.
@@ -60,6 +66,84 @@ function fileMap(entries) {
 
 const HOME = "/Users/fixture";
 const NOW = Date.parse("2026-08-01T12:00:00Z");
+
+// --- native Windows and WSL routing ---------------------------------------
+
+test("Windows binary lookup accepts forward-slash absolute paths", () => {
+  const attempted = [];
+  const result = findBinary("C:/Tools/codex.exe", {}, {
+    platform: "win32",
+    accessSync: (candidate) => attempted.push(candidate),
+  });
+
+  assert.equal(result, "C:\\Tools\\codex.exe");
+  assert.deepEqual(attempted, ["C:/Tools/codex.exe"]);
+});
+
+test("Windows binary lookup does not append PATHEXT to an existing exe or cmd suffix", () => {
+  for (const command of ["codex.exe", "claude.cmd"]) {
+    const attempted = [];
+    const result = findBinary(
+      command,
+      { Path: '"C:\\Program Files\\AI";C:\\Tools', Pathext: ".EXE;.CMD" },
+      {
+        platform: "win32",
+        accessSync: (candidate) => {
+          attempted.push(candidate);
+          if (candidate !== `C:\\Program Files\\AI\\${command}`) {
+            throw Object.assign(new Error("missing"), { code: "ENOENT" });
+          }
+        },
+      }
+    );
+
+    assert.equal(result, `C:\\Program Files\\AI\\${command}`);
+    assert.deepEqual(attempted, [`C:\\Program Files\\AI\\${command}`]);
+  }
+});
+
+test("adapter status recognizes a CLI installed only in the selected WSL distro", async () => {
+  const probes = [];
+  const result = await describeAdapter(adapter("claude"), {
+    platform: "win32",
+    env: { DUALOG_WSL_DISTRO: "Ubuntu-24.04" },
+    findBinaryFn: () => null,
+    tmuxRouteFn: ({ platform, env }) => {
+      assert.equal(platform, "win32");
+      assert.equal(env.DUALOG_WSL_DISTRO, "Ubuntu-24.04");
+      return { transport: "wsl", command: "wsl.exe", distro: "Ubuntu-24.04" };
+    },
+    probeWslPartnerCommandFn: async (command, versionArgs, { route }) => {
+      probes.push([command, versionArgs, route.distro]);
+      return "available";
+    },
+  });
+
+  assert.deepEqual(probes, [["claude", ["--version"], "Ubuntu-24.04"]]);
+  assert.equal(result.binary_available, true);
+  assert.equal(result.binary_path, null);
+  assert.equal(result.binary_transport, "wsl");
+  assert.equal(result.wsl_distro, "Ubuntu-24.04");
+});
+
+test("adapter status never probes WSL on macOS or Linux", async () => {
+  for (const platform of ["darwin", "linux"]) {
+    let wslProbes = 0;
+    const result = await describeAdapter(adapter("claude"), {
+      platform,
+      env: {},
+      findBinaryFn: () => null,
+      tmuxRouteFn: () => assert.fail(`tmux route must not be resolved on ${platform}`),
+      probeWslPartnerCommandFn: async () => {
+        wslProbes++;
+        return "available";
+      },
+    });
+    assert.equal(result.binary_available, false);
+    assert.equal(result.binary_transport, null);
+    assert.equal(wslProbes, 0);
+  }
+});
 
 // --- codex: local cache ----------------------------------------------------
 
@@ -97,6 +181,51 @@ test("codex discovery reads the user's real config home, not the session copy", 
       "gpt-5.3-codex-spark",
     ]
   );
+});
+
+test("native Windows reads the selected WSL Codex cache, not the Windows home", async () => {
+  let invocation = null;
+  const result = await resolveDiscovery(adapter("codex"), {
+    platform: "win32",
+    engine: "tmux-interactive",
+    env: { DUALOG_WSL_DISTRO: "Ubuntu-24.04" },
+    now: NOW,
+    cache: createDiscoveryCache(),
+    tmuxRouteFn: () => ({
+      transport: "wsl",
+      command: "wsl.exe",
+      distro: "Ubuntu-24.04",
+      loginShell: "/bin/bash",
+    }),
+    readFile: () => assert.fail("the Windows filesystem must not be read"),
+    execFileImpl: (command, args, options, callback) => {
+      invocation = { command, args, options };
+      const marker = args.at(-1);
+      callback(
+        null,
+        `interactive startup banner 123\n${marker}\n/home/fixture/.codex/models_cache.json\n${readFixture("codex-models-cache.json")}`,
+        ""
+      );
+    },
+  });
+
+  assert.equal(invocation.command, "wsl.exe");
+  assert.deepEqual(invocation.args.slice(0, 3), [
+    "--distribution",
+    "Ubuntu-24.04",
+    "--exec",
+  ]);
+  assert.deepEqual(invocation.args.slice(3, 5), ["/bin/bash", "-lic"]);
+  assert.deepEqual(invocation.args.slice(-5, -1), [
+    "dualog-wsl-cache-read",
+    "CODEX_HOME",
+    "{{home}}/.codex",
+    "{{configHome}}/models_cache.json",
+  ]);
+  assert.equal(invocation.options.timeout, 5000);
+  assert.equal(result.strategy, "local-cache");
+  assert.equal(result.source, "wsl:Ubuntu-24.04:/home/fixture/.codex/models_cache.json");
+  assert.ok(result.models.some((model) => model.id === "gpt-5.6-sol"));
 });
 
 test("codex discovery honors $CODEX_HOME from OUR environment", async () => {
@@ -578,6 +707,135 @@ test("an adapter with no source attempts nothing and reports nothing", async () 
 // The real captured stdout line. The parser is tested against it in
 // discovery.test.mjs; what is tested here is the wiring and the spawn argv.
 const CLAUDE_LINE = readFixture("claude-list-models.jsonl").trim();
+
+test("native Windows runs Claude model discovery inside the selected WSL distro", async () => {
+  let invocation = null;
+  let requestText = "";
+  const result = await resolveDiscovery(adapter("claude"), {
+    platform: "win32",
+    engine: "tmux-interactive",
+    env: { DUALOG_WSL_DISTRO: "Ubuntu-24.04" },
+    now: NOW,
+    cache: createDiscoveryCache(),
+    tmuxRouteFn: () => ({
+      transport: "wsl",
+      command: "wsl.exe",
+      distro: "Ubuntu-24.04",
+      loginShell: "/bin/bash",
+    }),
+    spawnImpl: (command, args, options) => {
+      invocation = { command, args, options };
+      const child = new EventEmitter();
+      child.stdin = new PassThrough();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.stdin.on("data", (chunk) => {
+        requestText += chunk.toString("utf-8");
+      });
+      child.kill = () => true;
+      child.unref = () => {};
+      setImmediate(() => child.stdout.write(`${CLAUDE_LINE}\n`));
+      return child;
+    },
+  });
+
+  assert.equal(invocation.command, "wsl.exe");
+  assert.deepEqual(invocation.args.slice(0, 3), [
+    "--distribution",
+    "Ubuntu-24.04",
+    "--exec",
+  ]);
+  assert.ok(invocation.args.includes("dualog-wsl-discovery"));
+  assert.deepEqual(invocation.args.slice(3, 5), ["/bin/bash", "-lic"]);
+  assert.ok(invocation.args.includes("claude"));
+  assert.ok(invocation.args.includes("--strict-mcp-config"));
+  assert.match(requestText, /"subtype":"list_models"/u);
+  assert.equal(result.strategy, "sdk-control");
+  assert.ok(result.models.some((model) => model.id === "sonnet"));
+});
+
+test("WSL discovery pins the default distro before resolving its login shell", async () => {
+  const events = [];
+  const result = await resolveDiscovery(adapter("claude"), {
+    platform: "win32",
+    engine: "tmux-interactive",
+    env: {},
+    now: NOW,
+    cache: createDiscoveryCache(),
+    tmuxRouteFn: () => ({
+      transport: "wsl",
+      command: "wsl.exe",
+      distro: null,
+    }),
+    resolveWslRouteDistroFn: async (route) => {
+      events.push(`distro:${route.distro}`);
+      return { ...route, distro: "Ubuntu-24.04" };
+    },
+    resolveWslLoginShellFn: async (route) => {
+      events.push(`shell:${route.distro}`);
+      return "/bin/bash";
+    },
+    runControl: async ({ route }) => {
+      events.push(`probe:${route.distro}:${route.loginShell}`);
+      return { line: CLAUDE_LINE, error: null };
+    },
+  });
+
+  assert.deepEqual(events, [
+    "distro:null",
+    "shell:Ubuntu-24.04",
+    "probe:Ubuntu-24.04:/bin/bash",
+  ]);
+  assert.equal(result.strategy, "sdk-control");
+});
+
+test("WSL discovery cache entries are isolated by pinned distro", async () => {
+  const cache = createDiscoveryCache();
+  const probes = [];
+  const discoverIn = (distro) =>
+    resolveDiscovery(adapter("claude"), {
+      platform: "win32",
+      engine: "tmux-interactive",
+      env: { DUALOG_WSL_DISTRO: distro },
+      now: NOW,
+      cache,
+      tmuxRouteFn: ({ env }) => ({
+        transport: "wsl",
+        command: "wsl.exe",
+        distro: env.DUALOG_WSL_DISTRO,
+        loginShell: "/bin/bash",
+      }),
+      runControl: async ({ route }) => {
+        probes.push(route.distro);
+        return { line: CLAUDE_LINE, error: null };
+      },
+    });
+
+  await discoverIn("Ubuntu-A");
+  await discoverIn("Ubuntu-B");
+  await discoverIn("Ubuntu-A");
+
+  assert.deepEqual(probes, ["Ubuntu-A", "Ubuntu-B"]);
+});
+
+test("an explicit headless discovery on Windows stays native", async () => {
+  let seenRoute = null;
+  const result = await resolveDiscovery(adapter("claude"), {
+    platform: "win32",
+    engine: "headless",
+    env: {},
+    now: NOW,
+    cache: createDiscoveryCache(),
+    tmuxRouteFn: () => assert.fail("headless discovery must not select WSL"),
+    runControl: async ({ route }) => {
+      seenRoute = route;
+      return { line: CLAUDE_LINE, error: null };
+    },
+  });
+
+  assert.deepEqual(seenRoute, { transport: "local" });
+  assert.equal(result.strategy, "sdk-control");
+});
 
 test("claude discovery returns the CLI's own aliases, which no manifest lists", async () => {
   const result = await resolveDiscovery(adapter("claude"), {

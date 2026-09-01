@@ -8,6 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 import { sendKeyToTmux } from "../src/tmux-runtime.mjs";
+import { writeNodeCommand } from "./helpers/node-command.mjs";
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const SERVER_PATH = path.join(REPO_ROOT, "src", "dialog-server.mjs");
@@ -29,16 +30,15 @@ function isolatedHomeEnv(home) {
 }
 
 function writeFakeTmux(home, logPath, paneId) {
-  const binary = path.join(home, "fake-tmux.sh");
-  fs.writeFileSync(
-    binary,
-    "#!/bin/sh\n" +
-      `printf '%s\\n' "$*" >> ${JSON.stringify(logPath)}\n` +
-      `case " $* " in *" list-panes "*) printf '%s\\n' ${JSON.stringify(paneId)} ;; esac\n` +
-      "exit 0\n"
+  return writeNodeCommand(
+    home,
+    "fake-tmux",
+    `import fs from "node:fs";
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(logPath)}, args.join(" ") + "\\n");
+if (args.includes("list-panes")) process.stdout.write(${JSON.stringify(`${paneId}\n`)});
+`
   );
-  fs.chmodSync(binary, 0o755);
-  return binary;
 }
 
 function writeSession(home, sessionId, terminal) {
@@ -78,10 +78,16 @@ test("send_key delivers a menu choice and Enter only to the recorded managed pan
   const tmuxSession = `dlg-${sessionId}-turn-1`;
   const logPath = path.join(home, "tmux-args.log");
   const fakeTmux = writeFakeTmux(home, logPath, "%42");
+  const tmuxSocket = `dualog-send-key-${process.pid}`;
   const sessionDir = writeSession(home, sessionId, {
     session_name: tmuxSession,
     pane_target: `${tmuxSession}:0.0`,
     pane_id: "%42",
+    tmux_transport: "local",
+    tmux_distro: null,
+    tmux_launcher: fakeTmux,
+    tmux_control_binary: fakeTmux,
+    tmux_socket_name: tmuxSocket,
   });
 
   const transport = new StdioClientTransport({
@@ -95,7 +101,7 @@ test("send_key delivers a menu choice and Enter only to the recorded managed pan
       DUALOG_DEPTH: "",
       DUALOG_MAX_DEPTH: "",
       DUALOG_TMUX_BINARY: fakeTmux,
-      DUALOG_TMUX_SOCKET: `dualog-send-key-${process.pid}`,
+      DUALOG_TMUX_SOCKET: tmuxSocket,
     },
     stderr: "ignore",
   });
@@ -137,6 +143,11 @@ test("send_key delivers a menu choice and Enter only to the recorded managed pan
       status: "running",
       session_name: tmuxSession,
       pane_id: "%99",
+      tmux_transport: "local",
+      tmux_distro: null,
+      tmux_launcher: fakeTmux,
+      tmux_control_binary: fakeTmux,
+      tmux_socket_name: tmuxSocket,
     })
   );
   const beforeWrongPane = fs.readFileSync(logPath, "utf-8");

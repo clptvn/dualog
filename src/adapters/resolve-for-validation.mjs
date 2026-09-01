@@ -18,17 +18,31 @@ import { ensureModelCapability, resolveDiscovery } from "./discovery.mjs";
 
 export async function resolveDiscoveryForValidation(
   adapter,
-  { model = null, projectPath = null, log } = {}
+  {
+    model = null,
+    projectPath = null,
+    engine = null,
+    tmuxRoute = null,
+    env = process.env,
+    platform = process.platform,
+    log,
+  } = {}
 ) {
   if (!adapter) return null;
 
   try {
-    let discovered = await resolveDiscovery(adapter, { projectPath });
+    let discovered = await resolveDiscovery(adapter, {
+      projectPath,
+      engine,
+      env,
+      platform,
+      ...(tmuxRoute ? { tmuxRouteFn: () => tmuxRoute } : {}),
+    });
 
     // The listing probe is bounded, so the model actually being used may not
     // have been capability-checked. A bounded gate is not a gate.
     if (model) {
-      discovered = await ensureModelCapability(adapter, discovered, model);
+      discovered = await ensureModelCapability(adapter, discovered, model, { env });
     }
     return discovered;
   } catch (err) {

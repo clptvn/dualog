@@ -13,25 +13,68 @@
 import fs from "fs";
 import path from "path";
 import { execFile } from "child_process";
+import { Buffer } from "node:buffer";
+import crossSpawn from "cross-spawn";
 import { resolveContext } from "./argv.mjs";
+import { probeWslPartnerCommand, tmuxRoute } from "../tmux-runtime.mjs";
+import { terminateWindowsProcessTree } from "../windows-process-tree.mjs";
+
+const MAX_VERSION_OUTPUT_BYTES = 64 * 1024;
 
 /** Is `command` runnable -- an executable path, or a name on PATH? */
-export function findBinary(command, env = process.env) {
+export function findBinary(
+  command,
+  env = process.env,
+  { platform = process.platform, accessSync = fs.accessSync } = {}
+) {
   if (!command) return null;
-  if (command.includes(path.sep)) {
+  const pathImpl = platform === "win32" ? path.win32 : path;
+  const isPath =
+    platform === "win32"
+      ? path.win32.isAbsolute(command) || /[\\/]/u.test(command)
+      : command.includes(path.sep);
+
+  if (isPath) {
     try {
-      fs.accessSync(command, fs.constants.X_OK);
-      return path.resolve(command);
+      accessSync(command, fs.constants.X_OK);
+      return pathImpl.resolve(command);
     } catch {
       return null;
     }
   }
-  const exts = process.platform === "win32" ? (env.PATHEXT || ".EXE").split(";") : [""];
-  for (const dir of (env.PATH || "").split(path.delimiter).filter(Boolean)) {
+
+  const envValue = (name) => {
+    if (env?.[name] != null) return env[name];
+    if (platform !== "win32") return undefined;
+    const key = Object.keys(env ?? {}).find((candidate) => candidate.toUpperCase() === name);
+    return key ? env[key] : undefined;
+  };
+  const windowsExts = (envValue("PATHEXT") || ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((ext) => ext.trim())
+    .filter(Boolean)
+    .map((ext) => (ext.startsWith(".") ? ext : `.${ext}`));
+  // PATHEXT is case-insensitive on Windows. If the caller already named one
+  // of its executable suffixes, appending every suffix again turns `codex.exe`
+  // into `codex.exe.EXE` and guarantees a false negative.
+  const exts =
+    platform === "win32"
+      ? windowsExts.some((ext) => command.toLowerCase().endsWith(ext.toLowerCase()))
+        ? [""]
+        : windowsExts
+      : [""];
+  const delimiter = platform === "win32" ? path.win32.delimiter : path.delimiter;
+  for (const rawDir of String(envValue("PATH") || "").split(delimiter).filter(Boolean)) {
+    // Quoted PATH entries are common in hand-written Windows environments;
+    // the quotes delimit the entry and are not part of the directory name.
+    const dir =
+      platform === "win32" && /^".*"$/u.test(rawDir)
+        ? rawDir.slice(1, -1)
+        : rawDir;
     for (const ext of exts) {
-      const candidate = path.join(dir, command + ext);
+      const candidate = pathImpl.join(dir, command + ext);
       try {
-        fs.accessSync(candidate, fs.constants.X_OK);
+        accessSync(candidate, fs.constants.X_OK);
         return candidate;
       } catch {
         /* keep looking */
@@ -42,12 +85,89 @@ export function findBinary(command, env = process.env) {
 }
 
 /** Best-effort version probe; never throws, never blocks for long. */
-export function probeVersion(binaryPath, versionArgs, timeoutMs = 5000) {
+export function probeVersion(
+  binaryPath,
+  versionArgs,
+  timeoutMs = 5000,
+  {
+    platform = process.platform,
+    execFileImpl = execFile,
+    spawnImpl = crossSpawn,
+    terminateWindowsTreeFn = terminateWindowsProcessTree,
+  } = {}
+) {
+  if (platform === "win32") {
+    return new Promise((resolve) => {
+      let child;
+      try {
+        child = spawnImpl(binaryPath, versionArgs, {
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+        });
+      } catch {
+        resolve(null);
+        return;
+      }
+
+      let stdout = "";
+      let stderr = "";
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let settled = false;
+      let timer = null;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const terminateAndFinish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        // Keep the .cmd/cmd.exe wrapper live while taskkill enumerates /T.
+        // Detaching its pipes first can let the wrapper exit and reparent the
+        // actual vendor CLI before the tree walk starts.
+        terminateWindowsTreeFn(child?.pid);
+        for (const stream of [child.stdin, child.stdout, child.stderr]) {
+          try { stream?.destroy(); } catch {}
+        }
+        try { child.unref?.(); } catch {}
+        resolve(null);
+      };
+      child.stdout.setEncoding("utf-8");
+      child.stderr.setEncoding("utf-8");
+      child.stdout.on("data", (chunk) => {
+        if (settled) return;
+        stdoutBytes += Buffer.byteLength(chunk, "utf-8");
+        if (stdoutBytes > MAX_VERSION_OUTPUT_BYTES) return terminateAndFinish();
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk) => {
+        if (settled) return;
+        stderrBytes += Buffer.byteLength(chunk, "utf-8");
+        if (stderrBytes > MAX_VERSION_OUTPUT_BYTES) return terminateAndFinish();
+        stderr += chunk;
+      });
+      child.once("error", () => finish(null));
+      child.once("close", (code) => {
+        if (code !== 0 && !stdout) return finish(null);
+        finish(String(stdout || stderr).trim().split(/\r?\n/u)[0] || null);
+      });
+      timer = setTimeout(terminateAndFinish, timeoutMs);
+    });
+  }
+
   return new Promise((resolve) => {
-    execFile(
+    execFileImpl(
       binaryPath,
       versionArgs,
-      { timeout: timeoutMs, encoding: "utf-8", windowsHide: true },
+      {
+        timeout: timeoutMs,
+        encoding: "utf-8",
+        windowsHide: true,
+        maxBuffer: MAX_VERSION_OUTPUT_BYTES,
+      },
       (err, stdout, stderr) => {
         if (err && !stdout) return resolve(null);
         resolve(String(stdout || stderr).trim().split("\n")[0] || null);
@@ -173,9 +293,51 @@ export function negotiate(adapter, options = {}) {
 }
 
 /** Runtime availability report for one adapter, for the discovery tools. */
-export async function describeAdapter(adapter, { probe = false, env = process.env } = {}) {
+export async function describeAdapter(
+  adapter,
+  {
+    probe = false,
+    env = process.env,
+    platform = process.platform,
+    findBinaryFn = findBinary,
+    probeVersionFn = probeVersion,
+    tmuxRouteFn = tmuxRoute,
+    probeWslPartnerCommandFn = probeWslPartnerCommand,
+  } = {}
+) {
   const command = adapter.binary.default;
-  const binaryPath = findBinary(command, env);
+  const binaryPath = findBinaryFn(command, env, { platform });
+  let wslAvailable = false;
+  let route = null;
+
+  // Native Windows can host this MCP server while the selected interactive
+  // partner lives only in WSL. Startup validates that exact command through
+  // resolveRunnableEngine(); status must ask the same question instead of
+  // declaring the adapter missing from the Windows PATH alone. The probe is
+  // one bounded `--version` call and is skipped everywhere else.
+  if (!binaryPath && platform === "win32") {
+    try {
+      route = tmuxRouteFn({ env, platform });
+      if (
+        route?.transport === "wsl" &&
+        adapter.engines.allowed.includes("tmux-interactive")
+      ) {
+        wslAvailable =
+          (await probeWslPartnerCommandFn(command, adapter.binary.versionArgs, {
+            env,
+            platform,
+            route,
+          })) ===
+          "available";
+      }
+    } catch {
+      // An invalid WSL/tmux override is an unavailable route, not a reason for
+      // the read-only listing tool itself to fail.
+      wslAvailable = false;
+    }
+  }
+
+  const available = Boolean(binaryPath) || wslAvailable;
   return {
     id: adapter.id,
     display_name: adapter.displayName,
@@ -189,11 +351,13 @@ export async function describeAdapter(adapter, { probe = false, env = process.en
     config_isolation: adapter.configIsolation?.env ?? null,
     completion: adapter.completion.sidecar,
     binary: command,
-    binary_available: Boolean(binaryPath),
+    binary_available: available,
     binary_path: binaryPath,
+    binary_transport: binaryPath ? "local" : wslAvailable ? "wsl" : null,
+    wsl_distro: wslAvailable ? (route?.distro ?? null) : null,
     version:
       probe && binaryPath
-        ? await probeVersion(binaryPath, adapter.binary.versionArgs)
+        ? await probeVersionFn(binaryPath, adapter.binary.versionArgs)
         : undefined,
     install_hint: adapter.binary.installHint ?? null,
     sources: adapter.__sources,
