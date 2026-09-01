@@ -7,6 +7,29 @@ import { isProcessAlive } from "./shared.mjs";
 const RUNNER_TOKEN_PREFIX = "--runner-token=";
 const SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
+/**
+ * Which script owns a session type's runner process.
+ *
+ * A table rather than a ternary chain, because the failure mode of getting this
+ * wrong is silent and total. isSessionRunnerAlive() proves identity by matching
+ * this path against the live process's command line, so an unmapped type falls
+ * to the default, never matches, and reports a perfectly healthy runner as dead
+ * forever -- which makes send_message refuse to write, wait_for_partner_response
+ * return `runner_exited` before the first turn finishes, and end_dialog skip the
+ * SIGTERM it exists to send.
+ *
+ * That is exactly what happened when `pr_review` was added as the third type: it
+ * inherited the dialog default and every panel session was born unreachable. A
+ * type absent from this table is a bug, not a fallback, so add the entry when
+ * adding a runner.
+ */
+export const RUNNER_SCRIPT_BY_SESSION_TYPE = {
+  dialog: "dialog-runner.mjs",
+  review: "review-runner.mjs",
+  pr_review: "pr-review-runner.mjs",
+};
+const DEFAULT_RUNNER_SCRIPT = "dialog-runner.mjs";
+
 export function buildRunnerTokenArg(token) {
   return `${RUNNER_TOKEN_PREFIX}${token}`;
 }
@@ -16,30 +39,66 @@ export function readRunnerToken(argv = process.argv) {
   return arg ? arg.slice(RUNNER_TOKEN_PREFIX.length) : null;
 }
 
-export function isSessionRunnerAlive(status, sessionDir) {
+/**
+ * Three-valued liveness: "alive" | "dead" | "unknown".
+ *
+ * isSessionRunnerAlive collapses the last two into `false`, which is right for
+ * its callers -- they gate an action, and refusing to act on an unprovable
+ * runner is the safe default. It is wrong for anything REPORTING liveness: a
+ * caller that maps `false` to "could not determine" throws away a proven death,
+ * and a proven death behind a stale `runner_state: "running"` is exactly the
+ * case a host most needs told. watchRunnerExit only fires inside the server
+ * process that spawned the runner, so anything OUTLIVING that process leaves the
+ * stale record behind a corpse: a server restart, a reboot, or a runner
+ * inherited from an earlier server. (A SIGKILL or OOM kill while that server is
+ * still up does fire the watcher, which records the exit correctly.)
+ */
+export function probeSessionRunner(status, sessionDir) {
   const pid = status?.runner_pid;
   if (!Number.isSafeInteger(pid) || pid <= 0 || !isProcessAlive(pid)) {
-    return false;
+    return "dead";
   }
 
   const commandLine = readProcessCommandLine(pid);
-  if (!commandLine) return false;
+  // The only genuinely indeterminate case: the process exists but we could not
+  // read what it is. readProcessCommandLine swallows every failure and returns
+  // "" -- ps missing, sandboxed, or timing out.
+  if (!commandLine) return "unknown";
 
   const runnerName =
-    status?.type === "review" ? "review-runner.mjs" : "dialog-runner.mjs";
+    RUNNER_SCRIPT_BY_SESSION_TYPE[status?.type] ?? DEFAULT_RUNNER_SCRIPT;
   const expectedRunnerPath = path.join(SOURCE_DIR, runnerName);
   if (
     !commandLine.includes(expectedRunnerPath) ||
     !commandLine.includes(sessionDir)
   ) {
-    return false;
+    return "dead";
   }
 
   if (typeof status.runner_token === "string" && status.runner_token) {
-    return commandLine.includes(buildRunnerTokenArg(status.runner_token));
+    return commandLine.includes(buildRunnerTokenArg(status.runner_token))
+      ? "alive"
+      : "dead";
   }
 
-  return true;
+  return "alive";
+}
+
+/**
+ * Defined in terms of the probe, never as a second copy of it.
+ *
+ * Its callers gate an action, so collapsing "dead" and "unknown" into false is
+ * right for them -- refusing to act on a runner we cannot prove is exactly the
+ * safe default. But that collapse is the ONLY difference, and keeping a parallel
+ * copy of the identity chain to express it would make this the fourth instance
+ * of one question with two implementations in this file's history. The first
+ * three all became defects: the header versus its parser, the suppressor versus
+ * the gate's line pattern, the suppressor versus its fence model. Adding a
+ * session type or changing how the token is matched must not be a change anyone
+ * can make in one place and forget in the other.
+ */
+export function isSessionRunnerAlive(status, sessionDir) {
+  return probeSessionRunner(status, sessionDir) === "alive";
 }
 
 /**

@@ -22,6 +22,7 @@ const CODEX_CONFIG_TOML = path.join(CODEX_DIR, "config.toml");
 
 const CLAUDE_COMMANDS = [
   "dualog-review-code",
+  "dualog-review-pr",
   "dualog-review-plan",
   "dualog-review-spec",
   "dualog-audit",
@@ -40,6 +41,7 @@ const LEGACY_HOOKS_DIR_NAME = "codex-dialog";
 
 const CODEX_SKILLS = [
   "dualog-review-code",
+  "dualog-review-pr",
   "dualog-review-plan",
   "dualog-review-spec",
   "dualog-audit",

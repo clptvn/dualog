@@ -26,6 +26,10 @@ const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const SERVER_SRC = fs.readFileSync(path.join(REPO_ROOT, "src/dialog-server.mjs"), "utf-8");
 const DIALOG_RUNNER_SRC = fs.readFileSync(path.join(REPO_ROOT, "src/dialog-runner.mjs"), "utf-8");
 const REVIEW_RUNNER_SRC = fs.readFileSync(path.join(REPO_ROOT, "src/review-runner.mjs"), "utf-8");
+const PR_REVIEW_RUNNER_SRC = fs.readFileSync(
+  path.join(REPO_ROOT, "src/pr-review-runner.mjs"),
+  "utf-8"
+);
 const INVOCATION_SRC = fs.readFileSync(path.join(REPO_ROOT, "src/partner-invocation.mjs"), "utf-8");
 const HEADLESS_SRC = fs.readFileSync(path.join(REPO_ROOT, "src/engines/headless.mjs"), "utf-8");
 
@@ -113,7 +117,11 @@ test("every hop between the start call and the turn carries the flag", () => {
     "and passed to the spawned runner"
   );
 
-  for (const [name, src] of [["dialog-runner", DIALOG_RUNNER_SRC], ["review-runner", REVIEW_RUNNER_SRC]]) {
+  for (const [name, src] of [
+    ["dialog-runner", DIALOG_RUNNER_SRC],
+    ["review-runner", REVIEW_RUNNER_SRC],
+    ["pr-review-runner", PR_REVIEW_RUNNER_SRC],
+  ]) {
     assert.match(src, /--allow-unknown-model/, `${name} reads the flag`);
     assert.match(src, /allowUnknownModel: ALLOW_UNKNOWN_MODEL/, `${name} forwards it to the turn`);
   }

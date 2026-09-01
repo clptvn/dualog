@@ -39,6 +39,7 @@ import {
   buildRunnerTokenArg,
   isSessionRunnerAlive,
   markSessionRunnerStarted,
+  probeSessionRunner,
   watchRunnerExit,
 } from "./runner-lifecycle.mjs";
 import {
@@ -51,6 +52,16 @@ import { describeAdapter, negotiate } from "./adapters/negotiate.mjs";
 import { isEnumerable, modelIds } from "./adapters/schema.mjs";
 import { resolveDiscovery } from "./adapters/discovery.mjs";
 import { resolveDiscoveryForValidation } from "./adapters/resolve-for-validation.mjs";
+import {
+  ASPECT_HEADER_RE,
+  ASPECT_IDS,
+  CONSOLIDATED_HEADER_RE,
+  FINDING_CATEGORIES,
+  PR_REVIEW_ASPECTS,
+  extractAspectResult,
+  extractNormalizedFindings,
+  selectAspects,
+} from "./pr-review-aspects.mjs";
 import { ENGINES, resolveEngine } from "./engines/index.mjs";
 import { reapOrphanedHeadlessChildren } from "./engines/headless.mjs";
 import { sweepLeases } from "./runtime-lease.mjs";
@@ -182,6 +193,17 @@ function readProblem(sessionDir) {
 function readOptionalText(filePath) {
   try {
     return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf-8") : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A missing or half-written sidecar reads as absent, never as a thrown tool call. */
+function readOptionalJson(filePath) {
+  const text = readOptionalText(filePath);
+  if (text == null) return null;
+  try {
+    return JSON.parse(text);
   } catch {
     return null;
   }
@@ -1404,19 +1426,11 @@ server.tool(
       try { meta = JSON.parse(fs.readFileSync(metaPath, "utf-8")); } catch {}
     }
 
-    // Parse structured findings from codex messages. Keep in sync with the
-    // taxonomy advertised in runner prompts and skill docs.
-    const FINDING_CATEGORIES = [
-      "CRITICAL",
-      "CORRECTNESS",
-      "ARCHITECTURE",
-      "SECURITY",
-      "ROBUSTNESS",
-      "SUGGESTION",
-      "QUESTION",
-      "PRAISE",
-      "NIT",
-    ];
+    // Parse structured findings from partner messages. The taxonomy is imported
+    // rather than restated: it is also stated verbatim to every PR-review
+    // specialist and matched by the approval gate in shared.mjs, and three
+    // copies of one list is three chances for a category to exist in a prompt
+    // that no parser here will ever recognize.
     const findings = Object.fromEntries(
       FINDING_CATEGORIES.map((c) => [c.toLowerCase(), []])
     );
@@ -1450,6 +1464,795 @@ server.tool(
               review_status: reviewStatus,
               budget,
               messages,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// ── PR Review (multi-specialist panel) ──────────────────────────────────────
+
+/**
+ * Resolve a pull request through `gh`.
+ *
+ * Kept separate from the local-diff path because the failure modes are
+ * different in kind: a local diff fails on git state the caller can see, while
+ * this fails on a CLI that may be missing, unauthenticated, or pointed at
+ * another host -- and each of those needs its own instruction to be actionable.
+ */
+function resolvePullRequest(ref, projectPath) {
+  // A ref is a positional argument, so nothing shell-interprets it -- but `gh`
+  // still parses a leading dash as one of its own flags, and `--repo=other/repo`
+  // would quietly review a different repository than the one the caller named.
+  // The change would be reviewed correctly and be the wrong change.
+  if (typeof ref !== "string" || ref.startsWith("-")) {
+    throw new Error(
+      `Invalid pull request reference ${JSON.stringify(ref)}: it may not begin with "-", ` +
+        `which gh would read as one of its own flags rather than as a PR.`
+    );
+  }
+
+  const execOpts = {
+    cwd: projectPath,
+    timeout: 60000,
+    maxBuffer: 10 * 1024 * 1024,
+  };
+
+  let view;
+  try {
+    view = execFileSync(
+      "gh",
+      [
+        "pr",
+        "view",
+        ref,
+        "--json",
+        "number,title,body,author,baseRefName,headRefName,url,state,isDraft",
+      ],
+      execOpts
+    ).toString();
+  } catch (err) {
+    const stderr = (err.stderr || "").toString().trim();
+    if (err.code === "ENOENT") {
+      throw new Error(
+        `The GitHub CLI ("gh") is not installed or not on PATH, so a pull request cannot be fetched. ` +
+          `Install it, or omit "pr" and review the change locally with diff_target instead.`
+      );
+    }
+    if (/auth|login|HTTP 401|HTTP 403/i.test(stderr)) {
+      throw new Error(
+        `gh is not authenticated for this repository: ${stderr || err.message}. Run "gh auth login" and retry.`
+      );
+    }
+    throw new Error(
+      `Could not read pull request "${ref}": ${stderr || err.message}`
+    );
+  }
+
+  let pr;
+  try {
+    pr = JSON.parse(view);
+  } catch (err) {
+    throw new Error(`gh returned output that is not valid JSON: ${err.message}`);
+  }
+
+  let diff;
+  try {
+    diff = execFileSync("gh", ["pr", "diff", ref], execOpts).toString();
+  } catch (err) {
+    const stderr = (err.stderr || "").toString().trim();
+    throw new Error(
+      `Could not read the diff for pull request #${pr.number}: ${stderr || err.message}`
+    );
+  }
+
+  return {
+    number: pr.number,
+    title: pr.title || "",
+    body: (pr.body || "").slice(0, 8000),
+    author: pr.author?.login || null,
+    base: pr.baseRefName || null,
+    head: pr.headRefName || null,
+    url: pr.url || null,
+    state: pr.state || null,
+    is_draft: Boolean(pr.isDraft),
+    diff,
+  };
+}
+
+server.tool(
+  "start_pr_review",
+  "Start a MULTI-SPECIALIST pull request review, where the partner agent reviews the change once per aspect -- general code quality, test coverage, error handling, comment accuracy, type design, and optionally simplification -- and then consolidates those passes into one prioritized report. This is the pr-review-toolkit panel flow, and it is deliberately separate from start_code_review, which runs a single general reviewer in one pass. Any connected agent can serve as the panel, so Codex can review for Claude, Claude for Grok, and so on. Aspects are auto-selected from the diff unless you name them. The response echoes back the model, reasoning_effort, and the selected/skipped aspects it actually used -- compare them against what you passed, because an omitted parameter and one lost in transit are indistinguishable here.",
+  {
+    project_path: z.string().describe("Path to the git project directory"),
+    pr: z
+      .string()
+      .optional()
+      .describe(
+        "Pull request to review: a number ('123'), a URL, or a branch name. Requires an authenticated `gh`. Omit this to review local changes instead, via diff_target."
+      ),
+    diff_target: z
+      .string()
+      .optional()
+      .describe(
+        "What to review when `pr` is omitted. 'branch' (default) = current branch vs base_branch, which is the pre-PR shape. Also accepts 'uncommitted', 'staged', or 'commit:<sha>'."
+      ),
+    branch: z
+      .string()
+      .optional()
+      .describe("Head branch (only used when diff_target='branch', default: current branch)"),
+    base_branch: z
+      .string()
+      .optional()
+      .describe("Base branch to compare against (only used when diff_target='branch', default: 'main')"),
+    aspects: z
+      .array(z.enum(ASPECT_IDS))
+      .optional()
+      .describe(
+        "Explicit panel selection, overriding auto-detection in both directions -- it can add an aspect the diff does not suggest and drop one it does. Aspects: " +
+          ASPECT_IDS.map(
+            (id) =>
+              `'${id}' (${PR_REVIEW_ASPECTS[id].title}${PR_REVIEW_ASPECTS[id].optIn ? ", opt-in only" : ""})`
+          ).join(", ") +
+          ". Each selected aspect costs one partner turn, plus one for consolidation."
+      ),
+    review_focus: z
+      .string()
+      .optional()
+      .describe(
+        "Optional focus applied WITHIN each specialist's lens, e.g. 'the new auth path'. It narrows attention; it does not replace the aspect rubrics."
+      ),
+    host_agent: z
+      .enum(AGENT_IDS)
+      .optional()
+      .describe("Which agent is orchestrating the review (default: 'claude')"),
+    partner_agent: z.enum(AGENT_IDS).optional().describe(AGENT_CHOICE_DESCRIPTION),
+    partner_command: z
+      .string()
+      .optional()
+      .describe("Command to invoke the reviewing partner CLI."),
+    codex_command: z
+      .string()
+      .optional()
+      .describe("Deprecated alias for partner_command when partner_agent='codex'"),
+    claude_command: z
+      .string()
+      .optional()
+      .describe("Alias for partner_command when partner_agent='claude'"),
+    follow_up_rounds: z
+      .number()
+      .int()
+      .min(1)
+      .max(50)
+      .optional()
+      .describe(
+        "Soft budget for the CONVERSATION after the panel reports (default: 5). Panel and consolidation passes are the review itself and are not charged against this. The follow-up conversation's own hard cap is follow_up_rounds + 5; the session-wide `hard_cap` in the response is larger, because it also covers the panel passes."
+      ),
+    reasoning_effort: z.enum(ALL_EFFORTS).optional().describe(REASONING_EFFORT_DESCRIPTION),
+    model: z.string().optional().describe(MODEL_OVERRIDE_DESCRIPTION),
+    partner_timeout_ms: z
+      .number()
+      .int()
+      .min(MIN_PARTNER_TIMEOUT_MS)
+      .optional()
+      .describe(
+        "Per-turn wait hint in milliseconds (default: 900000 = 15 minutes). Note this is PER PASS, and a panel runs several passes back to back, so a full review takes roughly this times the number of aspects. Interactive tmux turns are not killed by this value."
+      ),
+    allow_unknown_model: z
+      .boolean()
+      .optional()
+      .describe(
+        "Start with a model this server's catalog does not list. Only has an effect when a live catalog was consulted."
+      ),
+  },
+  async ({
+    project_path,
+    pr,
+    diff_target,
+    branch,
+    base_branch,
+    aspects,
+    review_focus,
+    host_agent,
+    partner_agent,
+    partner_command,
+    codex_command,
+    claude_command,
+    follow_up_rounds,
+    reasoning_effort,
+    model,
+    partner_timeout_ms,
+    allow_unknown_model,
+  }) => {
+    const hostAgent = normalizeAgent(host_agent, "claude");
+    const partnerAgent = normalizeAgent(partner_agent, "codex");
+    if (hostAgent === partnerAgent) {
+      return {
+        content: [
+          { type: "text", text: "Error: host_agent and partner_agent must be different" },
+        ],
+      };
+    }
+
+    // An empty array is rejected rather than treated as "auto". The two mean
+    // opposite things to a caller, and silently running the full panel for
+    // someone who asked for none of it is the worse guess.
+    if (Array.isArray(aspects) && aspects.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Error: `aspects` was provided but empty. Omit it entirely to auto-select from the diff, " +
+              `or name at least one of: ${ASPECT_IDS.join(", ")}.`,
+          },
+        ],
+      };
+    }
+
+    const followUpRounds = follow_up_rounds || 5;
+    const partnerTimeoutMs = normalizePartnerTimeout(partner_timeout_ms);
+    const partnerCommand = resolvePartnerCommandValue(
+      partnerAgent,
+      partner_command,
+      codex_command,
+      claude_command
+    );
+    const partnerDisplay = getAgentDisplayName(partnerAgent);
+
+    const preflight = await preflightPartner(partnerAgent, {
+      partnerCommand,
+      model,
+      reasoningEffort: reasoning_effort,
+      toolProfile: "read",
+      projectPath: project_path,
+      allowUnknownModel: allow_unknown_model === true,
+    });
+    if (!preflight.ok) {
+      return { content: [{ type: "text", text: `Error: ${preflight.errorText}` }] };
+    }
+
+    // Anything the caller must know about how the reviewed change was resolved,
+    // surfaced in the start response's `notices`. Declared before the first
+    // thing that can append to it, which is the HEAD lookup immediately below.
+    //
+    // Everything here shares one property: the review still runs, but over a
+    // change that is not quite the one the caller believes they asked for. `pr`
+    // selects the change wholesale, so the local-diff parameters have nothing
+    // left to decide; the merge-base diff can fall back to a two-dot range that
+    // includes commits the author never wrote; an unresolvable HEAD leaves the
+    // refresh baseline floating. None is fatal, and none may be silent.
+    const startupNotices = [];
+
+    const execOpts = { cwd: project_path, timeout: 30000, maxBuffer: 10 * 1024 * 1024 };
+    let currentBranch, headSha;
+    try {
+      headSha = execSync("git rev-parse HEAD", { cwd: project_path, timeout: 10000 })
+        .toString()
+        .trim();
+    } catch {
+      // Not fatal, but not silent either. send_message's uncommitted AND staged
+      // refreshes both use `status.head_sha || "HEAD"` as their baseline, so a
+      // null here means that once the author commits, the refreshed diff LOSES
+      // the committed work and shows only what is still uncommitted -- a
+      // quietly narrower change than the one under review. (The `branch`
+      // default, and the `pr` and `commit:` targets, never read head_sha for
+      // refresh at all, so the notice is advisory rather than actionable there.)
+      startupNotices.push(
+        "HEAD could not be resolved, so this session has no fixed baseline; if you commit mid-review, " +
+          "the refreshed diff will show only what remains uncommitted"
+      );
+    }
+    try {
+      currentBranch = execSync("git rev-parse --abbrev-ref HEAD", {
+        cwd: project_path,
+        timeout: 10000,
+      })
+        .toString()
+        .trim();
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: Could not determine current branch. Is "${project_path}" a git repository?\n${err.message}`,
+          },
+        ],
+      };
+    }
+
+    let diff = "";
+    let diffStat = "";
+    let scopeLabel = "";
+    let prInfo = null;
+    const target = pr ? "pr" : diff_target || "branch";
+
+    if (pr) {
+      for (const [name, value] of [
+        ["diff_target", diff_target],
+        ["branch", branch],
+        ["base_branch", base_branch],
+      ]) {
+        if (value != null) {
+          startupNotices.push(
+            `${name} was ignored: "pr" selects the change, and the two cannot both define it`
+          );
+        }
+      }
+    }
+
+    try {
+      if (pr) {
+        const resolved = resolvePullRequest(pr, project_path);
+        diff = resolved.diff;
+        prInfo = { ...resolved };
+        delete prInfo.diff;
+        scopeLabel = `pull request #${resolved.number} (${resolved.head} → ${resolved.base})`;
+      } else if (target === "staged") {
+        diff = execSync("git diff --cached", execOpts).toString();
+        scopeLabel = "staged changes vs HEAD";
+      } else if (target === "uncommitted") {
+        diff = execSync("git diff HEAD", execOpts).toString();
+        scopeLabel = "uncommitted changes vs HEAD";
+        if (!diff.trim()) {
+          diff = execSync("git diff", execOpts).toString();
+          scopeLabel = "unstaged changes";
+        }
+      } else if (target.startsWith("commit:")) {
+        const sha = target.slice("commit:".length);
+        if (!/^[0-9a-fA-F]{4,40}$/.test(sha)) {
+          throw new Error(`Invalid commit SHA: ${sha}`);
+        }
+        diff = execFileSync("git", ["show", sha, "--format="], execOpts).toString();
+        scopeLabel = `commit ${sha}`;
+      } else if (target === "branch") {
+        const baseBranch = base_branch || "main";
+        const headBranch = branch || currentBranch;
+        try {
+          diff = execFileSync("git", ["diff", `${baseBranch}...${headBranch}`], execOpts).toString();
+        } catch {
+          // Keep the fallback -- it is the right recovery for a stale base, a
+          // shallow clone, or a detached HEAD -- but say so. Three dots is
+          // merge-base; two dots also includes everything the base gained since
+          // the branch point, so the panel can end up reviewing commits the
+          // author never wrote and filing findings against them, all under a
+          // label that still reads "branch X vs Y".
+          diff = execFileSync("git", ["diff", `${baseBranch}..${headBranch}`], execOpts).toString();
+          startupNotices.push(
+            `the three-dot (merge-base) diff of ${baseBranch}...${headBranch} failed, so a two-dot diff was used instead: the review may include commits added to ${baseBranch} since the branch point`
+          );
+        }
+        scopeLabel = `branch ${headBranch} vs ${baseBranch}`;
+      } else {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: Unknown diff_target "${target}". Use: branch, uncommitted, staged, or commit:<sha>.`,
+            },
+          ],
+        };
+      }
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error resolving the change to review:\n${err.message}` }],
+      };
+    }
+
+    if (!diff.trim()) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `No changes found (${scopeLabel}). Nothing to review.` +
+              (target === "branch"
+                ? ` start_pr_review defaults to comparing your branch against "${base_branch || "main"}"; if the work is not committed yet, pass diff_target: "uncommitted".`
+                : ""),
+          },
+        ],
+      };
+    }
+
+    // The stat is derived from the diff text itself rather than a second git
+    // call, because for a `gh pr diff` there is no local ref to run `git diff
+    // --stat` against -- the PR may not even be fetched.
+    const changedFiles = [
+      ...new Set(
+        diff
+          .split("\n")
+          .map((l) => l.match(/^diff --git a\/(.+?) b\/(.+)$/))
+          .filter(Boolean)
+          .map((m) => m[2])
+      ),
+    ];
+    diffStat = changedFiles.length
+      ? `${changedFiles.length} file(s) changed:\n${changedFiles.map((f) => `  ${f}`).join("\n")}`
+      : "(no file headers found in diff)";
+
+    let selection;
+    try {
+      selection = selectAspects(diff, aspects);
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error: ${err.message}` }] };
+    }
+    // Defence in depth, not a live path: `code` always applies, an empty
+    // explicit list is rejected above, and an unknown id throws in
+    // selectAspects. It stays because a future aspect-selection change could
+    // make it reachable, and a panel with no passes would otherwise start a
+    // runner that reports nothing and explains nothing.
+    if (selection.selected.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Error: no review aspects were selected, so there is no panel to run. " +
+              `Name at least one of: ${ASPECT_IDS.join(", ")}.`,
+          },
+        ],
+      };
+    }
+
+    const skipped = selection.decisions
+      .filter((d) => !d.selected)
+      .map((d) => ({ aspect: d.aspect, reason: d.reason }));
+
+    // Session ids keep the `review-` prefix on purpose.
+    //
+    // The prefix is a STORAGE key, not the session's identity: it is what
+    // resolveSessionDir's pattern, the list_sessions scan, and -- most
+    // importantly -- session-scratch's GENERATED_SESSION_ID cleanup allowlist
+    // all match on. A new prefix would have to be added to every one of them,
+    // and the cost of missing the last one is not a cosmetic bug: partner
+    // credential copies inside these sessions would stop being reaped. The
+    // session's real identity travels in status.type, which every tool reads.
+    const sessionId = `review-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+    const sessionDir = resolveSessionDir(sessionId);
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(path.join(sessionDir, "diff.patch"), diff);
+
+    const meta = {
+      review_kind: "pr_panel",
+      scope: target,
+      scope_label: scopeLabel,
+      pr: prInfo,
+      branch: prInfo?.head || branch || currentBranch,
+      base_branch: prInfo?.base || base_branch || (target === "branch" ? "main" : "HEAD"),
+      diff_stat: diffStat,
+      files_changed: changedFiles,
+      review_focus: review_focus || null,
+      aspects: selection.selected,
+      skipped,
+      diff_facts: selection.facts,
+    };
+    fs.writeFileSync(
+      path.join(sessionDir, "pr_review_meta.json"),
+      JSON.stringify(meta, null, 2)
+    );
+    fs.writeFileSync(path.join(sessionDir, "conversation.jsonl"), "");
+
+    // Every panel and consolidation pass appends a partner message, and
+    // computeBudget can only count partner messages -- so the budget it reports
+    // is only honest if the panel is included in max_rounds. follow_up_rounds
+    // is reported separately for the caller who wants the conversational half.
+    const panelPasses = selection.selected.length;
+    const maxRounds = panelPasses + 1 + followUpRounds;
+    const hardCap = maxRounds + 5;
+
+    const runnerToken = crypto.randomBytes(16).toString("hex");
+    const status = {
+      session_id: sessionId,
+      type: "pr_review",
+      started_at: new Date().toISOString(),
+      project_path,
+      host_agent: hostAgent,
+      partner_agent: partnerAgent,
+      partner_command: partnerCommand,
+      ...(partnerAgent === "codex" ? { codex_command: partnerCommand } : {}),
+      pr_number: prInfo?.number ?? null,
+      pr_url: prInfo?.url ?? null,
+      diff_target: target,
+      diff_label: scopeLabel,
+      branch: meta.branch,
+      base_branch: meta.base_branch,
+      head_sha: headSha || null,
+      review_focus: review_focus || null,
+      aspects: selection.selected,
+      skipped_aspects: skipped,
+      panel_passes: panelPasses,
+      follow_up_rounds: followUpRounds,
+      max_rounds: maxRounds,
+      hard_cap: hardCap,
+      reasoning_effort: preflight.effort,
+      model: preflight.model ?? null,
+      partner_timeout_ms: partnerTimeoutMs,
+      allow_unknown_model: allow_unknown_model === true,
+      runner_pid: null,
+      runner_token: runnerToken,
+      runner_state: "starting",
+    };
+    fs.writeFileSync(
+      path.join(sessionDir, "status.json"),
+      JSON.stringify(status, null, 2)
+    );
+
+    const runnerPath = fileURLToPath(new URL("pr-review-runner.mjs", import.meta.url));
+    const runner = spawn(
+      process.execPath,
+      [
+        runnerPath,
+        sessionDir,
+        project_path,
+        partnerCommand,
+        String(followUpRounds),
+        preflight.effort || "",
+        preflight.model || "",
+        hostAgent,
+        partnerAgent,
+        String(partnerTimeoutMs),
+        buildRunnerTokenArg(runnerToken),
+        ...(allow_unknown_model === true ? ["--allow-unknown-model"] : []),
+      ],
+      {
+        detached: true,
+        stdio: ["ignore", "ignore", "ignore"],
+        env: { ...process.env },
+        windowsHide: true,
+      }
+    );
+    runner.on("error", () => {});
+    runner.unref();
+
+    status.runner_pid = runner.pid;
+    status.runner_state = "running";
+    markSessionRunnerStarted(sessionDir, { runnerToken, pid: runner.pid });
+    watchRunnerExit(runner, sessionDir, { runnerToken });
+
+    const totalPasses = panelPasses + 1;
+    const notices = [...(preflight.notices ?? []), ...startupNotices];
+    if (prInfo?.is_draft) notices.push("pull request is a DRAFT");
+    if (prInfo?.state && prInfo.state !== "OPEN") {
+      notices.push(`pull request state is ${prInfo.state}, not OPEN`);
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              session_id: sessionId,
+              runner_pid: runner.pid,
+              review_dir: sessionDir,
+              review_kind: "pr_panel",
+              scope: target,
+              scope_label: scopeLabel,
+              pr: prInfo
+                ? {
+                    number: prInfo.number,
+                    title: prInfo.title,
+                    url: prInfo.url,
+                    state: prInfo.state,
+                    is_draft: prInfo.is_draft,
+                  }
+                : null,
+              aspects: selection.selected,
+              skipped_aspects: skipped,
+              panel_passes: panelPasses,
+              total_passes: totalPasses,
+              files_changed: changedFiles.length,
+              diff_size: diff.length,
+              diff_chars_embedded: Math.min(diff.length, MAX_REVIEW_DIFF_CHARS),
+              diff_truncated: diff.length > MAX_REVIEW_DIFF_CHARS,
+              host_agent: hostAgent,
+              partner_agent: partnerAgent,
+              partner_command: partnerCommand,
+              follow_up_rounds: followUpRounds,
+              max_rounds: maxRounds,
+              hard_cap: hardCap,
+              requested_model: preflight.requestedModel,
+              requested_reasoning_effort: preflight.requestedEffort,
+              reasoning_effort: preflight.effort,
+              effective_reasoning_effort: preflight.effectiveEffort,
+              warnings: preflight.warnings ?? [],
+              notices,
+              model: preflight.model ?? "default",
+              partner_timeout_ms: partnerTimeoutMs,
+              message:
+                `PR review panel started: ${panelPasses} specialist pass(es) (${selection.selected.join(", ")}) ` +
+                `then 1 consolidation pass, run by ${partnerDisplay} at model ${preflight.model ?? "default"}, ` +
+                `effort ${describeEffort(preflight.effort, preflight.effectiveEffort)}. ` +
+                `Each pass appends its report as it lands, so expect ${totalPasses} partner messages before the follow-up ` +
+                `conversation begins — do not read the first one as the finished review. ` +
+                `Poll with wait_for_partner_response, or call get_pr_review_report for panel progress and the consolidated findings.` +
+                (skipped.length
+                  ? ` Skipped aspects: ${skipped.map((s) => `${s.aspect} (${s.reason})`).join("; ")}. An aspect nobody ran is not an aspect that came back clean.`
+                  : "") +
+                (diff.length > MAX_REVIEW_DIFF_CHARS
+                  ? ` NOTE: the diff is ${diff.length} chars and only the first ${MAX_REVIEW_DIFF_CHARS} are embedded in each pass's prompt; specialists are told to read the rest from ${project_path}.`
+                  : ""),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "get_pr_review_report",
+  "Get the state and findings of a multi-specialist PR review: which aspects ran, which are still pending, which failed, the per-aspect normalized findings, and the consolidated report once it exists. Use this rather than get_review_summary for sessions started by start_pr_review -- it is the only view that distinguishes an aspect that found nothing from an aspect that never ran.",
+  {
+    session_id: z.string().describe("The PR review session ID"),
+    include_reports: z
+      .boolean()
+      .optional()
+      .describe(
+        "Include each specialist's full prose report (default: false). The findings index and the consolidated report are always included; the full reports are long and usually only needed when you are chasing one aspect's reasoning."
+      ),
+  },
+  async ({ session_id, include_reports }) => {
+    const sessionDir = resolveSessionDir(session_id);
+    if (!fs.existsSync(sessionDir)) {
+      return { content: [{ type: "text", text: "Error: Session not found" }] };
+    }
+
+    const status = readStat(session_id);
+    if (status?.type && status.type !== "pr_review") {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Error: session ${session_id} is a "${status.type}" session, not a PR review panel. ` +
+              `Use get_review_summary for it.`,
+          },
+        ],
+      };
+    }
+
+    const messages = readConv(session_id);
+    const partnerAgent = getSessionPartnerAgent(status);
+    const meta = readOptionalJson(path.join(sessionDir, "pr_review_meta.json"));
+    const panel = readOptionalJson(path.join(sessionDir, "panel_state.json"));
+
+    // Aspect attribution comes from the header the runner writes, not from
+    // guessing at content: a specialist that mentions another aspect by name in
+    // its prose must not be filed under it.
+    const aspectReports = [];
+    let consolidated = null;
+    for (const msg of messages) {
+      if (msg.from !== partnerAgent) continue;
+      // Pattern and producer are imported from one place, so the header cannot
+      // drift out from under the parser and silently empty the report.
+      const header = msg.content.match(ASPECT_HEADER_RE);
+      if (header) {
+        aspectReports.push({
+          aspect: header[4],
+          message_id: msg.id,
+          result: extractAspectResult(msg.content),
+          findings: extractNormalizedFindings(msg.content),
+          ...(include_reports ? { report: msg.content } : {}),
+        });
+        continue;
+      }
+      if (CONSOLIDATED_HEADER_RE.test(msg.content)) {
+        consolidated = {
+          message_id: msg.id,
+          content: msg.content,
+          findings: extractNormalizedFindings(msg.content),
+        };
+      }
+    }
+
+    const byCategory = Object.fromEntries(FINDING_CATEGORIES.map((c) => [c.toLowerCase(), []]));
+    for (const report of aspectReports) {
+      for (const finding of report.findings) {
+        byCategory[finding.category.toLowerCase()].push({
+          aspect: report.aspect,
+          text: finding.text,
+        });
+      }
+    }
+
+    const ran = new Set(aspectReports.map((r) => r.aspect));
+    // A failed pass appends a system message, not a headered partner report, so
+    // it never enters `ran`. Without subtracting it here it would sit in
+    // aspects_pending forever -- contradicting aspects_failed in the same
+    // document, and stranding any host that polls for pending to empty.
+    const failed = (panel?.completed ?? []).filter((c) => c.status === "failed");
+    const failedAspects = new Set(failed.map((c) => c.aspect));
+    const planned = meta?.aspects ?? status?.aspects ?? [];
+    const budget = computeBudget(status, messages);
+    const reviewStatus = computeReviewStatus(status, messages, {
+      problem: readProblem(sessionDir),
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              session_id,
+              review_kind: "pr_panel",
+              scope_label: meta?.scope_label ?? status?.diff_label ?? null,
+              pr: meta?.pr
+                ? {
+                    number: meta.pr.number,
+                    title: meta.pr.title,
+                    url: meta.pr.url,
+                    state: meta.pr.state,
+                    is_draft: meta.pr.is_draft,
+                  }
+                : null,
+              phase: panel?.phase ?? (consolidated ? "follow_up" : "panel"),
+              panel_complete: Boolean(consolidated),
+              // Liveness, because otherwise this tool cannot tell you the panel
+              // is dead.
+              //
+              // The runner now writes a `starting` marker before reading its
+              // meta and diff, so a corrupt sidecar surfaces as phase
+              // "starting". But writePanelState swallows its own failure, so a
+              // full disk or a lost write permission leaves no state and then
+              // kills the runner at its first unguarded write -- no
+              // panel_state.json, no system message -- and the report then
+              // falls back to `phase: "panel"` with every aspect pending,
+              // forever, while a host polls a corpse. `panel_state_available`
+              // separates "the runner never got far enough to write state" from
+              // "state exists".
+              // Tri-state, resolved in the probe rather than at this call site.
+              //
+              // isSessionRunnerAlive folds "cannot read the command line" into
+              // `false`, so reporting it directly calls a healthy panel dead in
+              // any sandboxed environment. But mapping its `false` to `null`
+              // was worse: it erased a PROVEN death, which is the case this
+              // field exists for -- a runner killed without recording it, sitting
+              // behind a stale `runner_state: "running"`. Now `null` means only
+              // "the process exists and we could not identify it".
+              runner_alive: { alive: true, dead: false, unknown: null }[
+                probeSessionRunner(status, sessionDir)
+              ],
+              runner_state: status?.runner_state ?? null,
+              runner_exit_reason: status?.runner_exit_reason ?? null,
+              last_error: readOptionalText(path.join(sessionDir, "last_error.txt")),
+              panel_state_available: panel != null,
+              aspects_planned: planned,
+              aspects_reported: [...ran],
+              aspects_pending: planned.filter(
+                (a) => !ran.has(a) && !failedAspects.has(a)
+              ),
+              aspects_failed: failed.map((c) => ({
+                aspect: c.aspect,
+                error: c.error,
+              })),
+              // A pass that produced a report but omitted its mandatory
+              // ASPECT_RESULT footer. It ran, so it is not failed -- but it
+              // never confirmed it worked its rubric to the end, and without a
+              // top-level field the only trace is `result: null` buried in
+              // aspect_reports, which a reader scanning the summary will not
+              // see. Same class the whole design defends against: a pass that
+              // did not confirm it finished reading as one that did.
+              aspects_unverified: (panel?.completed ?? [])
+                .filter((c) => c.status === "complete_unverified")
+                .map((c) => c.aspect),
+              // Carried through verbatim from the start call. The report is the
+              // place a reader decides what this review actually covered, and a
+              // skipped aspect is invisible here unless it is stated.
+              aspects_skipped: meta?.skipped ?? status?.skipped_aspects ?? [],
+              findings_by_category: byCategory,
+              aspect_reports: aspectReports,
+              consolidated_report: consolidated,
+              review_status: reviewStatus,
+              budget,
+              total_messages: messages.length,
             },
             null,
             2
@@ -1498,16 +2301,32 @@ server.tool(
 
     // Auto-refresh diff BEFORE appending message so it's ready when the runner
     // sees the new message and immediately starts building the prompt.
-    if (status?.type === "review" && status.diff_target && !status.diff_target.startsWith("commit:")) {
+    let refreshError = null;
+    let refreshNotice = null;
+    const isReviewSession = status?.type === "review" || status?.type === "pr_review";
+    if (isReviewSession && status.diff_target && !status.diff_target.startsWith("commit:")) {
       try {
         const refreshOpts = { cwd: status.project_path, timeout: 30000, maxBuffer: 10 * 1024 * 1024 };
         const baseline = status.head_sha || "HEAD";
         let refreshedDiff;
-        if (status.diff_target === "staged") {
+        if (status.diff_target === "pr") {
+          // The only refresh path that leaves the machine. A PR review's subject
+          // lives on the remote, so re-reading it locally would show the partner
+          // a diff the PR does not have -- but it also means this branch can be
+          // slow or fail offline, which the catch below turns into "keep using
+          // the diff we started with" rather than a failed send.
+          refreshedDiff = execFileSync(
+            "gh",
+            ["pr", "diff", String(status.pr_number ?? status.branch)],
+            refreshOpts
+          ).toString();
+        } else if (status.diff_target === "staged") {
           let filesChanged = [];
           try {
+            const metaFile =
+              status.type === "pr_review" ? "pr_review_meta.json" : "review_meta.json";
             const meta = JSON.parse(
-              fs.readFileSync(path.join(sessionDir, "review_meta.json"), "utf-8")
+              fs.readFileSync(path.join(sessionDir, metaFile), "utf-8")
             );
             filesChanged = Array.isArray(meta?.files_changed) ? meta.files_changed : [];
           } catch {}
@@ -1525,7 +2344,16 @@ server.tool(
           try {
             refreshedDiff = execFileSync("git", ["diff", `${base}...${head}`], refreshOpts).toString();
           } catch {
+            // Same fallback as the start path, and the same hazard: two dots
+            // also includes whatever the base gained since the branch point, so
+            // the reviewed change can quietly GROW between rounds while the
+            // scope label stays identical. The partner would then file findings
+            // against commits the author never wrote, mid-conversation, with
+            // nothing marking the change of subject.
             refreshedDiff = execFileSync("git", ["diff", `${base}..${head}`], refreshOpts).toString();
+            refreshNotice =
+              `the merge-base diff of ${base}...${head} failed, so this refresh used a two-dot diff: ` +
+              `the reviewed change may now include commits ${base} gained since the branch point`;
           }
         } else {
           // uncommitted: diff against the original HEAD SHA to keep baseline stable
@@ -1536,8 +2364,27 @@ server.tool(
           }
         }
         writeFileAtomic(path.join(sessionDir, "diff_refreshed.patch"), refreshedDiff);
-      } catch {
-        // On failure, remove stale refreshed diff so runner falls back to original
+      } catch (err) {
+        // Caught WITH the error. This catch covers every refresh target, not
+        // just `pr` -- a branch/staged/uncommitted refresh failing lands here
+        // too -- but the `pr` path is the one that leaves the machine, and its
+        // failure modes are the ones that used to vanish: a dead network, an
+        // expired gh token, a rate limit, a diff past maxBuffer, or a
+        // force-pushed ref all arrived here identically and
+        // silently -- while send_message still returned sent: true and the
+        // partner was handed the session-start diff under a header calling it
+        // current, alongside an instruction to verify fixes against it.
+        //
+        // Removing the stale file is still right (the runner falls back to the
+        // original), but a refresh that worked last round and fails this one
+        // regresses the partner to strictly older content, which is worth
+        // saying out loud.
+        refreshError = err.message;
+        // The fallback notice describes a refresh that was computed and then
+        // thrown away -- emitting both would tell the caller in one breath that
+        // the diff could not be refreshed and that the refresh included extra
+        // commits, with no way to tell which diff the partner actually has.
+        refreshNotice = null;
         try { fs.unlinkSync(path.join(sessionDir, "diff_refreshed.patch")); } catch {}
       }
     }
@@ -1561,7 +2408,21 @@ server.tool(
               partner_timeout_ms: normalizePartnerTimeout(status?.partner_timeout_ms),
               budget,
               review_status: reviewStatus,
-              message: `Message sent (id: ${msg.id}). ${partnerDisplay} will be invoked to respond.`,
+              // Always present, never conditionally spread. start_pr_review
+              // returns `notices` unconditionally, so a caller writing
+              // `result.notices.length` worked against one tool and threw
+              // against the other.
+              notices: [
+                ...(refreshError
+                  ? [
+                      `The diff could not be refreshed (${refreshError}). ${partnerDisplay} is reviewing the diff captured when the review started, not the current state — treat any claim about a fix as unverified.`,
+                    ]
+                  : []),
+                ...(refreshNotice ? [refreshNotice] : []),
+              ],
+              message:
+                `Message sent (id: ${msg.id}). ${partnerDisplay} will be invoked to respond.` +
+                (refreshError || refreshNotice ? ` NOTE: see notices about the refreshed diff.` : ""),
             },
             null,
             2
@@ -1675,9 +2536,16 @@ server.tool(
       partnerAgent
     );
 
-    // Return problem for dialogs, meta for reviews
+    // Return problem for dialogs, meta for reviews.
+    //
+    // The filename is type-dependent: a panel writes pr_review_meta.json, so
+    // reading only review_meta.json here reported `review_meta: null` for every
+    // PR review -- the same oversight that made send_message's refresh miss them.
     const problemPath = path.join(sessionDir, "problem.md");
-    const metaPath = path.join(sessionDir, "review_meta.json");
+    const metaPath = path.join(
+      sessionDir,
+      status?.type === "pr_review" ? "pr_review_meta.json" : "review_meta.json"
+    );
     const problem = fs.existsSync(problemPath)
       ? fs.readFileSync(problemPath, "utf-8")
       : null;
@@ -2341,7 +3209,13 @@ server.tool(
         const budget = computeBudget(status, messages);
         results.push({
         session_id: sessionId,
-        type: sessionId.startsWith("review-") ? "review" : "dialog",
+        // status.type is the session's real identity; the id prefix is only the
+        // storage key, and PR review panels deliberately share the `review-`
+        // prefix so they inherit its path validation and scratch cleanup. Read
+        // the prefix alone and every panel reports as a plain review.
+        type:
+          status?.type ||
+          (sessionId.startsWith("review-") ? "review" : "dialog"),
         started_at: status?.started_at,
         host_agent: getSessionHostAgent(status),
         partner_agent: getSessionPartnerAgent(status),

@@ -79,14 +79,134 @@ export function isReviewApprovalDialog(problem) {
   );
 }
 
+/**
+ * The prefix of a line this module will read as a session verdict.
+ *
+ * Not consumed directly outside this file -- the panel reaches it through
+ * matchVerdictLine() below -- but kept as the single definition both halves
+ * derive from, because they were written separately once already and diverged.
+ * The PR review panel must SUPPRESS exactly the lines
+ * this file would ACT on -- suppress fewer and a single specialist can approve a
+ * review whose other passes have not run; suppress more and it rewrites the
+ * reviewer's own prose. Both happened: a hand-written suppressor missed
+ * `## VERDICT: APPROVE` (a heading, which is the shape a model naturally writes
+ * under a "Machine-Readable Footer" section) while mangling `**Status:**` inside
+ * a report.
+ *
+ * Keep the two halves derivable from this constant rather than similar to it.
+ */
+export const VERDICT_LINE_PREFIX_SOURCE =
+  "^\\s*(?:[-*#]+\\s*)?(?:\\*\\*|__|\\*)?\\s*(?:REVIEW[_\\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)(?:\\*\\*|__|\\*)?\\s*:";
+
+/** Blockquoted or indented: content the verdict scan never reads. */
+function isNoiseLine(line) {
+  return line.trimStart().startsWith(">") || /^(?: {4,}|\t)/.test(line);
+}
+
+const NOISE_BLOCKS = [/```[\s\S]*?```/g, /~~~[\s\S]*?~~~/g, /<!--[\s\S]*?-->/g];
+
+/**
+ * Which lines of `content` would the verdict scan actually read?
+ *
+ * Returns a boolean per line, parallel to `content.split("\n")`. THE one
+ * implementation of that question, exported so the PR review panel's suppressor
+ * consumes it rather than modelling it a second time.
+ *
+ * Modelling it twice has now failed twice, the same way both times. The most
+ * recent: the suppressor walked lines toggling an `inFence` boolean, so an
+ * UNCLOSED fence latched it for the rest of the document and it skipped
+ * everything after -- while this scan uses PAIRED, non-greedy regexes, which
+ * match nothing when a fence is unclosed and therefore read straight past it.
+ * They diverged in the dangerous direction: the gate reading text the suppressor
+ * had decided not to look at, so `` ```diff `` left open (a very ordinary model
+ * malformation) let a verdict through with `suppressed: 0` logged.
+ *
+ * Pairing is deliberately preserved here rather than "fixed": an unbalanced
+ * fence is now wrong in BOTH halves identically, which is safe, instead of wrong
+ * in one, which is not.
+ */
+export function gateReadableLineMask(content) {
+  const text = String(content || "");
+  const lines = text.split("\n");
+
+  const starts = [];
+  let offset = 0;
+  for (const line of lines) {
+    starts.push(offset);
+    offset += line.length + 1;
+  }
+
+  // Patterns are consumed SEQUENTIALLY, each over the previous result, because
+  // that is what stripMarkdownNoise does -- and applying them independently over
+  // the original text is not the same thing when marker types interleave.
+  //
+  // A fuzz over 300,000 generated reports found 519 documents where they differ,
+  // reduced to: a `<!--` on line 0, a verdict on line 1, then two ```js lines
+  // whose pairing consumes the `-->` between them. Sequentially, the fences go
+  // first and eat the comment's terminator, leaving `<!--` unpaired so the gate
+  // reads the verdict. Independently, both a comment span and a fence span
+  // exist, the verdict line is blocked, and the suppressor never looks at it.
+  // That is not exotic: the `comments` specialist's literal job is writing about
+  // comment syntax while also quoting fenced snippets.
+  //
+  // Redaction is length-preserving rather than deleting, so offsets stay valid
+  // AND a consumed span cannot participate in a later pattern's match -- which
+  // is precisely what sequential excision does.
+  // Redacted to spaces rather than to a magic character, which is safe because
+  // the only question asked of the result is "did any NON-SPACE character of
+  // this line survive". A verdict always contains non-space characters, so a
+  // line whose surviving remnant is whitespace cannot carry one, and treating
+  // it as blocked costs nothing.
+  let redacted = text;
+  for (const pattern of NOISE_BLOCKS) {
+    redacted = redacted.replace(pattern, (match) => " ".repeat(match.length));
+  }
+
+  // A line is blocked only when NO character of it survived redaction --
+  // equivalently, wholly inside the consumed regions rather than merely
+  // overlapping them.
+  //
+  // stripMarkdownNoise excises a span and keeps scanning what remains of the
+  // line, so if any character survives the gate may read that part, and a
+  // consumer of this mask must therefore examine the line. An earlier version
+  // blocked on partial overlap and broke exactly that, in the direction that
+  // matters: a finding line containing an inline ``` paired with a later fence,
+  // the span covered the line's tail, and the whole line vanished -- so
+  // `[CRITICAL] ... an unclosed ``` ...` stopped being a blocking finding and
+  // the review flipped to approved, for every session type.
+  //
+  // The guarantee is LINE-granular and cannot be more than that: excision can
+  // splice the head of one line onto the tail of another, and can repair a token
+  // from the inside (`VERDICT<!-- x -->: APPROVE`). suppressVerdictLines covers
+  // both by checking its postcondition against the gate rather than trusting
+  // this mask alone.
+  const blocked = lines.map((line, i) => {
+    if (line.length === 0) return false;
+    const slice = redacted.slice(starts[i], starts[i] + line.length);
+    return !/\S/.test(slice);
+  });
+
+  return lines.map((line, i) => !blocked[i] && !isNoiseLine(line));
+}
+
+/**
+ * Behaviour left exactly as it was, deliberately. (The two chained noise filters
+ * are now one call to isNoiseLine, which the mask also uses; `!(A || B)` is the
+ * chained `!A` then `!B`, so the predicate is unchanged.)
+ *
+ * The suppressor needed to stop modelling markdown noise for itself; the GATE
+ * did not need to change, and rewriting it on top of the mask is what produced
+ * the regression described above. Excision semantics -- remove the span, keep
+ * the rest of the line -- are preserved here, and gateReadableLineMask is only
+ * ever a conservative "could the gate read any of this line".
+ */
 function stripMarkdownNoise(content) {
   return String(content || "")
     .replace(/```[\s\S]*?```/g, "")
     .replace(/~~~[\s\S]*?~~~/g, "")
     .replace(/<!--[\s\S]*?-->/g, "")
     .split("\n")
-    .filter((line) => !line.trimStart().startsWith(">"))
-    .filter((line) => !/^(?: {4,}|\t)/.test(line))
+    .filter((line) => !isNoiseLine(line))
     .join("\n");
 }
 
@@ -136,31 +256,62 @@ function normalizeStructuredVerdict(raw) {
   return null;
 }
 
+const VERDICT_LINE_RE = new RegExp(
+  `${VERDICT_LINE_PREFIX_SOURCE}\\s*(?:\\*\\*|__|\\*)?\\s*([A-Z][A-Z_\\s-]*)\\b`,
+  "i"
+);
+
+/**
+ * Would this ONE line be read as a session verdict?
+ *
+ * The decision function, exported so the PR review panel's suppressor asks the
+ * same question rather than approximating it. Approximating it failed in both
+ * directions -- the prefix alone matched `**Status:** the error path is fine`,
+ * which this rejects because nothing verdict-shaped follows the colon, while a
+ * hand-written pattern missed `## VERDICT: APPROVE` entirely.
+ *
+ * Returns { match, normalized } or null. `match.index` and `match[0]` let a
+ * caller rewrite exactly the matched span and keep the rest of the line.
+ */
+export function matchVerdictLine(line) {
+  const match = String(line ?? "").match(VERDICT_LINE_RE);
+  if (!match) return null;
+  const normalized = normalizeStructuredVerdict(match[1]);
+  return normalized ? { match, normalized } : null;
+}
+
 function extractStructuredVerdict(content) {
   const searchable = stripMarkdownNoise(content);
   let lastVerdict = null;
   for (const line of searchable.split("\n")) {
-    const match = line.match(
-      /^\s*(?:[-*#]+\s*)?(?:\*\*|__|\*)?\s*(?:REVIEW[_\s-]?(?:VERDICT|STATUS)|VERDICT|STATUS)(?:\*\*|__|\*)?\s*:\s*(?:\*\*|__|\*)?\s*([A-Z][A-Z_\s-]*)\b/i
-    );
-    if (!match) continue;
-    const normalized = normalizeStructuredVerdict(match[1]);
-    if (normalized) {
-      lastVerdict = { ...normalized, source: "structured_verdict" };
+    const hit = matchVerdictLine(line);
+    if (hit) {
+      lastVerdict = { ...hit.normalized, source: "structured_verdict" };
     }
   }
   return lastVerdict;
 }
 
-function hasLegacyApprovalLine(content, token) {
+/**
+ * Would this ONE line be read as a bare legacy approval token?
+ *
+ * Exported for the same reason as matchVerdictLine: the panel's suppressor has
+ * to neutralize every signal this file acts on, and a bare `LGTM` approves a
+ * session on its own, with no verdict footer anywhere.
+ */
+export function matchLegacyApprovalLine(line, token) {
   const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const tokenAtLineStart = new RegExp(
     `^\\s*(?:[-*]\\s*)?(?:\\*\\*)?${escaped}(?:\\*\\*)?(?=$|[\\s.!,:;])`,
     "i"
   );
+  return String(line ?? "").match(tokenAtLineStart);
+}
+
+function hasLegacyApprovalLine(content, token) {
   return stripMarkdownNoise(content)
     .split("\n")
-    .some((line) => tokenAtLineStart.test(line));
+    .some((line) => matchLegacyApprovalLine(line, token));
 }
 
 function hasLegacyApproval(content, allowsApproveVerdict) {

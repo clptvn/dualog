@@ -142,6 +142,7 @@ test("source contains no pane inactivity watchdog or automatic orphan sweep", ()
     "src/dialog-server.mjs",
     "src/dialog-runner.mjs",
     "src/review-runner.mjs",
+    "src/pr-review-runner.mjs",
     "src/tmux-runtime.mjs",
   ]
     .map((relativePath) => fs.readFileSync(path.join(repoRoot, relativePath), "utf8"))
