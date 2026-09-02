@@ -223,14 +223,17 @@ function fsyncDirectory(directory) {
   try {
     fd = fs.openSync(directory, "r");
     fs.fsyncSync(fd);
-  } catch {
-    // Windows commonly refuses directory handles. The same-directory rename
-    // protocol and durable journal still provide recoverability there.
+  } catch (error) {
+    const unsupportedWindowsDirectorySync =
+      process.platform === "win32" &&
+      ["EPERM", "EINVAL", "ENOTSUP"].includes(error?.code);
+    if (!unsupportedWindowsDirectorySync) throw error;
+    // Windows does not consistently expose flushable directory handles. File
+    // contents, journals, and locks are still fsynced before publication; only
+    // the unsupported parent-directory metadata flush is omitted here.
   } finally {
     if (fd !== undefined) {
-      try {
-        fs.closeSync(fd);
-      } catch {}
+      fs.closeSync(fd);
     }
   }
 }
@@ -290,7 +293,10 @@ function fsyncTree(root) {
     return;
   }
   if (!stat.isFile()) return;
-  const fd = fs.openSync(root, "r");
+  // Flush staged files through a writable handle on Windows. Flushing a
+  // read-only file handle is rejected with EPERM there even when the underlying
+  // file is writable; actual file fsync failures remain fatal.
+  const fd = fs.openSync(root, process.platform === "win32" ? "r+" : "r");
   try {
     fs.fsyncSync(fd);
   } finally {

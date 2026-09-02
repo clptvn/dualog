@@ -589,3 +589,105 @@ test("identity failure happens before a canonical lock or install artifact is cr
   );
   assert.equal(fs.existsSync(path.join(home, ".dualog")), false);
 });
+
+test("win32 directory fsync EPERM is tolerated and crash recovery stays exact", (t) => {
+  const home = tempHome(t);
+  const target = path.join(home, "owned artifact.txt");
+  write(target, "original\n");
+  const allowedLogicalPaths = new Set([target]);
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalFsync = fs.fsyncSync;
+  let directoryFailures = 0;
+  Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+  fs.fsyncSync = (fd) => {
+    if (fs.fstatSync(fd).isDirectory()) {
+      directoryFailures++;
+      const error = new Error("injected Windows directory fsync failure");
+      error.code = "EPERM";
+      throw error;
+    }
+    return originalFsync(fd);
+  };
+  try {
+    const transaction = new InstallTransaction({
+      home,
+      allowedLogicalPaths,
+      identityProvider: testIdentityProvider({ startTime: "directory-sync-owner" }),
+      faultInjector({ phase, index }) {
+        if (phase === "after-operation" && index === 0) {
+          const error = new Error("simulated crash after directory sync");
+          error.dualogSimulatedCrash = true;
+          throw error;
+        }
+      },
+    });
+    transaction.stageFile(target, "replacement\n");
+    assert.throws(() => transaction.commit(), /simulated crash after directory sync/u);
+    assert.ok(directoryFailures > 0);
+    assert.equal(
+      recoverPendingInstallTransaction({
+        home,
+        allowedLogicalPaths,
+        identityProvider: testIdentityProvider({
+          processState: "absent",
+          startTime: "directory-sync-recovery",
+        }),
+      }),
+      true
+    );
+    assert.equal(fs.readFileSync(target, "utf-8"), "original\n");
+  } finally {
+    fs.fsyncSync = originalFsync;
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
+});
+
+test("win32 file fsync EPERM remains fatal for locks and staged content", (t) => {
+  const home = tempHome(t);
+  const target = path.join(home, "owned artifact.txt");
+  write(target, "original\n");
+  const allowedLogicalPaths = new Set([target]);
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalFsync = fs.fsyncSync;
+  let failFileSync = true;
+  Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+  fs.fsyncSync = (fd) => {
+    if (failFileSync && fs.fstatSync(fd).isFile()) {
+      const error = new Error("injected Windows file fsync failure");
+      error.code = "EPERM";
+      throw error;
+    }
+    return originalFsync(fd);
+  };
+  try {
+    assert.throws(
+      () =>
+        new InstallTransaction({
+          home,
+          allowedLogicalPaths,
+          identityProvider: testIdentityProvider(),
+        }),
+      /injected Windows file fsync failure/u
+    );
+    const lockPath = path.join(home, ".dualog", "install-transactions", "install.lock");
+    assert.equal(fs.existsSync(lockPath), false);
+
+    failFileSync = false;
+    const transaction = new InstallTransaction({
+      home,
+      allowedLogicalPaths,
+      identityProvider: testIdentityProvider(),
+    });
+    failFileSync = true;
+    assert.throws(
+      () => transaction.stageFile(target, "replacement\n"),
+      /injected Windows file fsync failure/u
+    );
+    assert.equal(fs.readFileSync(target, "utf-8"), "original\n");
+    failFileSync = false;
+    transaction.abort();
+  } finally {
+    fs.fsyncSync = originalFsync;
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
+});
