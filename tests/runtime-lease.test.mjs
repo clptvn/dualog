@@ -1693,11 +1693,63 @@ test("a runner can clean up after its own failed pre-spawn turn", (t) => {
 
   // The counterweight: this must be about being the OWNER, not about being any
   // process that asks. A lease belonging to a different, live runner is refused.
-  const other = newLease({ runnerPid: 1 });
+  // PID 1 is not a portable liveness fixture: it is reliably init/launchd on
+  // POSIX, but need not name any live process on native Windows. Use a real
+  // child generation so the assertion means the same thing on every host.
+  const other = newLease({ runnerPid: liveProcess(t) });
   const refused = releaseLease(other);
   assert.equal(refused.released, false, "another process may not reclaim a live owner's lease");
   assert.match(refused.reason, /still alive/);
   fs.rmSync(other.dir, { recursive: true, force: true });
+});
+
+test("native Windows release retains a foreign live pre-spawn owner", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-win-live-owner-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const script = `
+    const fs = require("node:fs"), path = require("node:path");
+    const cp = require("node:child_process");
+    const { syncBuiltinESMExports } = require("node:module");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    process.env.SystemRoot = "C:\\\\Windows";
+    process.env.HOME = ${JSON.stringify(home)};
+    process.env.USERPROFILE = ${JSON.stringify(home)};
+    process.env.HOMEDRIVE = "";
+    process.env.HOMEPATH = ${JSON.stringify(home)};
+    cp.execFileSync = () => "638923456789012345";
+    syncBuiltinESMExports();
+
+    const owner = cp.spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+      stdio: "ignore",
+    });
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const turnDir = path.join(${JSON.stringify(home)}, ".dualog", "sessions", "win-owner", "turns", "t1");
+      fs.mkdirSync(turnDir, { recursive: true });
+      const lease = m.allocateLease({
+        sessionId: "win-owner",
+        turnId: "t1",
+        agent: "codex",
+        engine: "headless",
+        turnDir,
+        runnerPid: owner.pid,
+      });
+      const released = m.releaseLease(lease);
+      const record = JSON.parse(fs.readFileSync(lease.metaPath, "utf-8"));
+      console.log(JSON.stringify({
+        released,
+        ownerPid: owner.pid,
+        recordedOwnerPid: record.runner_pid,
+        directorySurvives: fs.existsSync(lease.dir),
+      }));
+    }).finally(() => owner.kill("SIGKILL"));
+  `;
+  const out = JSON.parse(
+    execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+  );
+  assert.equal(out.recordedOwnerPid, out.ownerPid);
+  assert.equal(out.released.released, false);
+  assert.match(out.released.reason, /owning runner.*still alive/u);
+  assert.equal(out.directorySurvives, true, "Windows unknown evidence cannot override a live owner");
 });
 
 test("releasing a lease whose consumer is still live does nothing", () => {

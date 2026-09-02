@@ -70,9 +70,30 @@ const parseToolText = (result) => {
   return text.startsWith("Error:") ? text : JSON.parse(text);
 };
 
-test("send_key delivers a menu choice and Enter only to the recorded managed pane", async (t) => {
+const SEND_KEY_MANAGED_PANE_TEST =
+  process.platform === "win32"
+    ? "send_key fails closed for an unsupported native Windows cmd tmux override"
+    : "send_key delivers a menu choice and Enter only to the recorded managed pane";
+
+test(SEND_KEY_MANAGED_PANE_TEST, async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-send-key-"));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  let client = null;
+  // node:test runs after hooks in registration order and stops after a hook
+  // throws. On Windows, removing `home` while the MCP child still has it as
+  // cwd fails; registering deletion before client.close() therefore leaked the
+  // live server and pinned the whole test worker until CI's job timeout.
+  t.after(async () => {
+    try {
+      await client?.close();
+    } finally {
+      fs.rmSync(home, {
+        recursive: true,
+        force: true,
+        maxRetries: process.platform === "win32" ? 5 : 0,
+        retryDelay: 100,
+      });
+    }
+  });
 
   const sessionId = "dialog-123-abcdef";
   const tmuxSession = `dlg-${sessionId}-turn-1`;
@@ -105,12 +126,11 @@ test("send_key delivers a menu choice and Enter only to the recorded managed pan
     },
     stderr: "ignore",
   });
-  const client = new Client(
+  client = new Client(
     { name: "send-key-contract", version: "1.0.0" },
     { capabilities: {} }
   );
   await client.connect(transport);
-  t.after(() => client.close());
 
   const listed = await client.listTools();
   assert.ok(listed.tools.some((tool) => tool.name === "send_key"));
@@ -121,6 +141,21 @@ test("send_key delivers a menu choice and Enter only to the recorded managed pan
       arguments: { session_id: sessionId, key: "2", submit: true },
     })
   );
+
+  if (process.platform === "win32") {
+    // The helper intentionally produces a .cmd package-style shim. Native
+    // Windows tmux control launchers must be direct .exe/.com images because
+    // synchronous cleanup probes cannot safely time out a cmd.exe descendant.
+    // Desktop's supported interactive route is WSL; its direct wsl.exe path is
+    // covered by the Windows tmux/WSL suites. This fixture must be rejected
+    // promptly and, crucially, its MCP child must still be closed before home
+    // cleanup.
+    assert.equal(typeof result, "string");
+    assert.match(result, /could not confirm/i);
+    assert.equal(fs.existsSync(logPath), false, "an unsafe tmux shim must not be invoked");
+    return;
+  }
+
   assert.equal(result.sent, true);
   assert.equal(result.key, "2");
   assert.equal(result.submitted, true);
