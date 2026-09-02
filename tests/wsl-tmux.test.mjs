@@ -630,8 +630,15 @@ test("partner runtime context reuses one inferred distro for prompts and extra p
       log: () => {},
     },
     {
+      platform: "win32",
       tmuxRouteFn: () => ({ ...WSL_ROUTE, distro: null }),
       resolveWslLoginShellFn: async () => "/bin/bash",
+      resolveWslPartnerExecutableFn: async (command, { projectPath, route }) => {
+        assert.equal(command, "codex");
+        assert.equal(projectPath, "/home/cameron/repo");
+        assert.equal(route.distro, "Ubuntu");
+        return "/usr/local/bin/codex";
+      },
       resolveRunnableEngineFn: async (_adapter, options) => {
         assert.equal(options.tmuxRouteFn().distro, "Ubuntu");
         return "tmux-interactive";
@@ -641,6 +648,7 @@ test("partner runtime context reuses one inferred distro for prompts and extra p
   assert.equal(context.engine, "tmux-interactive");
   assert.equal(context.partnerProjectPath, "/home/cameron/repo");
   assert.equal(context.tmuxDistro, "Ubuntu");
+  assert.equal(context.partnerCommand, "/usr/local/bin/codex");
   assert.equal(
     await context.toPartnerPath(
       "\\\\wsl$\\Ubuntu\\home\\cameron\\repo\\.dualog\\diff.patch"
@@ -659,6 +667,7 @@ test("partner runtime context pins the default distro before any availability pr
       log: () => {},
     },
     {
+      platform: "win32",
       tmuxRouteFn: () => ({ ...WSL_ROUTE, distro: null }),
       resolveWslRouteDistroFn: async (route) => {
         events.push("pin-distro");
@@ -668,8 +677,15 @@ test("partner runtime context pins the default distro before any availability pr
         events.push(`shell-${route.distro}`);
         return "/bin/bash";
       },
-      resolveRunnableEngineFn: async (_adapter, options) => {
+      resolveRunnableEngineFn: async (adapter, options) => {
         events.push(`probe-${options.tmuxRouteFn().distro}`);
+        assert.equal(
+          await options.probeWslPartnerCommandFn(
+            "codex",
+            adapter.binary.versionArgs
+          ),
+          "available"
+        );
         return "tmux-interactive";
       },
       resolveTmuxProjectContextFn: async (projectPath, { route }) => {
@@ -682,6 +698,16 @@ test("partner runtime context pins the default distro before any availability pr
           tmuxRoute: route,
         };
       },
+      resolveWslPartnerExecutableFn: async (command, { projectPath, route }) => {
+        events.push(`resolve-partner-${route.distro}`);
+        assert.equal(command, "codex");
+        assert.equal(projectPath, "/mnt/c/repo");
+        return "/usr/local/bin/codex";
+      },
+      probeWslPartnerCommandFn: async (command, _versionArgs, { route }) => {
+        events.push(`version-${route.distro}-${command}`);
+        return "available";
+      },
     }
   );
   assert.deepEqual(events, [
@@ -689,8 +715,11 @@ test("partner runtime context pins the default distro before any availability pr
     "shell-Ubuntu",
     "probe-Ubuntu",
     "translate-Ubuntu",
+    "resolve-partner-Ubuntu",
+    "version-Ubuntu-/usr/local/bin/codex",
   ]);
   assert.equal(context.tmuxDistro, "Ubuntu");
+  assert.equal(context.partnerCommand, "/usr/local/bin/codex");
 });
 
 test("default WSL selection is resolved once and reused for wslpath", async () => {
@@ -837,7 +866,11 @@ test("WSL executable resolution rejects explicit relative partner paths before e
   }
 });
 
-test("the fixed WSL resolver rejects project PATH shims and symlink crossings", (t) => {
+test("the fixed WSL resolver rejects project PATH shims and symlink crossings", {
+  skip: process.platform === "win32"
+    ? "the resolver script requires a POSIX shell and is exercised inside WSL in production"
+    : false,
+}, (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-wsl-command-"));
   const project = path.join(root, "reviewed");
   const trusted = path.join(root, "trusted");
@@ -886,42 +919,58 @@ test("the fixed WSL resolver rejects project PATH shims and symlink crossings", 
   );
 });
 
-test("check_adapter pins only a safe absolute executable in the selected WSL distro", async (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-check-adapter-wsl-"));
-  const project = path.join(root, "reviewed");
-  const trusted = path.join(root, "trusted");
-  fs.mkdirSync(project);
-  fs.mkdirSync(trusted);
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-
-  const executable = (dir, name, body = "exit 0") => {
-    const filePath = path.join(dir, name);
-    fs.writeFileSync(filePath, `#!/bin/sh\n${body}\n`);
-    fs.chmodSync(filePath, 0o755);
-    return filePath;
+test("check_adapter pins only a safe absolute executable in the selected WSL distro", async () => {
+  const hostProject = "C:\\reviewed";
+  const project = "/work/reviewed";
+  const trusted = "/opt/dualog/trusted";
+  const projectClaude = `${project}/claude`;
+  const trustedClaude = `${trusted}/claude`;
+  const linkedToProject = `${trusted}/linked-claude`;
+  const canonicalByLexicalPath = new Map([
+    [projectClaude, projectClaude],
+    [trustedClaude, trustedClaude],
+    [linkedToProject, projectClaude],
+  ]);
+  const insideProject = (candidate) =>
+    candidate === project || candidate.startsWith(`${project}/`);
+  const simulateWslResolver = (command, searchPath) => {
+    let lexical = command;
+    if (!path.posix.isAbsolute(command)) {
+      lexical = null;
+      for (const rawDir of searchPath.split(":")) {
+        const dir = path.posix.isAbsolute(rawDir)
+          ? rawDir
+          : path.posix.resolve(project, rawDir || ".");
+        const candidate = path.posix.join(dir, command);
+        if (canonicalByLexicalPath.has(candidate)) {
+          lexical = candidate;
+          break;
+        }
+      }
+    }
+    if (!lexical || !canonicalByLexicalPath.has(lexical)) {
+      return { exitCode: 127, stdout: "", stderr: "" };
+    }
+    if (insideProject(lexical)) {
+      return { exitCode: 66, stdout: "", stderr: "" };
+    }
+    const canonical = canonicalByLexicalPath.get(lexical);
+    if (insideProject(canonical)) {
+      return { exitCode: 68, stdout: "", stderr: "" };
+    }
+    return { exitCode: 0, stdout: `\0${canonical}\0`, stderr: "" };
   };
-  const projectClaude = executable(project, "claude");
-  const trustedClaude = executable(trusted, "claude");
-  const linkedToProject = path.join(trusted, "linked-claude");
-  fs.symlinkSync(projectClaude, linkedToProject);
-  // The resolver deliberately uses an interactive-login argv shape. This
-  // hermetic stand-in preserves that shape without reading the test host's
-  // shell profile, which would make PATH-dependent planting cases nondeterministic.
-  const loginShell = executable(
-    trusted,
-    "bash",
-    '[ "$1" = "-lic" ] || exit 64\nshift\nexec /bin/sh -c "$@"'
-  );
 
   const resolveAsCheckAdapter = async (partnerCommand, searchPath) => {
     const probes = [];
+    const resolverExecutions = [];
     const contextPromise = resolvePartnerRuntimeContext(
       {
         partnerAgent: "claude",
         partnerCommand,
-        // check_adapter supplies process.cwd(); this fixture is its translated
-        // partner-visible equivalent inside the selected distribution.
-        projectPath: project,
+        // check_adapter supplies the native process.cwd(); the runtime context
+        // translates it once before the selected-distro executable resolver.
+        projectPath: hostProject,
         requestedEngine: "tmux-interactive",
       },
       {
@@ -933,7 +982,7 @@ test("check_adapter pins only a safe absolute executable in the selected WSL dis
         }),
         resolveWslLoginShellFn: async (route) => {
           assert.equal(route.distro, "Ubuntu-24.04");
-          return loginShell;
+          return "/bin/bash";
         },
         resolveTmuxProjectContextFn: async (hostProjectPath, { route }) => ({
           hostProjectPath,
@@ -948,19 +997,22 @@ test("check_adapter pins only a safe absolute executable in the selected WSL dis
         resolveWslPartnerExecutableFn: (command, options) =>
           resolveWslPartnerExecutable(command, {
             ...options,
-            resolveWslLoginShellFn: async () => loginShell,
-            runExecFileFn: async (_command, args) => {
-              const execAt = args.indexOf("--exec");
-              assert.ok(execAt >= 0, "the resolver must use fixed WSL --exec argv");
-              const child = spawnSync(args[execAt + 1], args.slice(execAt + 2), {
-                env: { ...process.env, PATH: searchPath },
-                encoding: "utf-8",
-              });
-              return {
-                exitCode: child.status ?? 127,
-                stdout: child.stdout ?? "",
-                stderr: child.stderr ?? child.error?.message ?? "",
-              };
+            resolveWslLoginShellFn: async () => "/bin/bash",
+            runExecFileFn: async (wslCommand, args) => {
+              assert.equal(wslCommand, "wsl.exe");
+              assert.deepEqual(args, [
+                "--distribution",
+                "Ubuntu-24.04",
+                "--exec",
+                "/bin/bash",
+                "-lic",
+                WSL_PARTNER_EXECUTABLE_RESOLVE_SCRIPT,
+                "dualog-wsl-resolve-partner",
+                command,
+                project,
+              ]);
+              resolverExecutions.push(command);
+              return simulateWslResolver(command, searchPath);
             },
           }),
         resolveRunnableEngineFn: async (adapter, options) => {
@@ -979,19 +1031,25 @@ test("check_adapter pins only a safe absolute executable in the selected WSL dis
         },
       }
     );
-    return { contextPromise, probes };
+    return { contextPromise, probes, resolverExecutions };
   };
 
   for (const [label, command, searchPath] of [
-    ["absolute project PATH entry", "claude", `${project}:/usr/bin:/bin`],
+    ["absolute project PATH entry", "claude", `${project}:${trusted}:/usr/bin:/bin`],
     ["relative PATH entry", "claude", `.:${trusted}:/usr/bin:/bin`],
     ["explicit relative command", "./claude", `${trusted}:/usr/bin:/bin`],
     ["explicit project command", projectClaude, `${trusted}:/usr/bin:/bin`],
     ["trusted symlink into project", linkedToProject, `${trusted}:/usr/bin:/bin`],
   ]) {
-    const { contextPromise, probes } = await resolveAsCheckAdapter(command, searchPath);
+    const { contextPromise, probes, resolverExecutions } =
+      await resolveAsCheckAdapter(command, searchPath);
     await assert.rejects(contextPromise, /inside the reviewed project|is relative/u, label);
     assert.deepEqual(probes, [], `${label} must fail before the version probe`);
+    assert.deepEqual(
+      resolverExecutions,
+      label === "explicit relative command" ? [] : [command],
+      `${label} must use only the selected-distro resolver`
+    );
   }
 
   const safe = await resolveAsCheckAdapter(
@@ -999,10 +1057,11 @@ test("check_adapter pins only a safe absolute executable in the selected WSL dis
     `${project}:${trusted}:/usr/bin:/bin`
   );
   const context = await safe.contextPromise;
-  const canonical = fs.realpathSync(trustedClaude);
+  const canonical = trustedClaude;
   assert.equal(context.partnerCommand, canonical);
   assert.equal(context.tmuxDistro, "Ubuntu-24.04");
   assert.deepEqual(safe.probes, [canonical]);
+  assert.deepEqual(safe.resolverExecutions, [trustedClaude]);
 });
 
 test("the WSL launch preparation converts Windows paths and carries its route", async () => {

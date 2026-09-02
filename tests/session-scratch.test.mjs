@@ -552,6 +552,48 @@ test("valid JSON of the wrong shape blocks rather than reading as 'no runner'", 
   }
 });
 
+test(
+  "native Windows retains an explicit-null breadcrumb after its wrapper vanishes",
+  { skip: process.platform !== "win32" },
+  (t) => {
+    // This is the failed-taskkill shape: the direct cmd.exe wrapper is gone,
+    // but headless.mjs deliberately retains the breadcrumb because taskkill did
+    // not prove its descendants died. Explicit `pgid: null` validates the
+    // native producer shape; it is not a whole-tree death proof.
+    const exited = spawnSync(process.execPath, ["-e", "process.exit(0)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    assert.ok(Number.isSafeInteger(exited.pid) && exited.pid > 0);
+
+    const root = tempRoot(t, "windows-null-pgid");
+    const sessionId = "dialog-1785600000039-000000af";
+    const dir = makeSession(root, sessionId, {
+      status: { runner_pid: null, runner_state: "exited" },
+      extra: {
+        "turns/1/headless-child.json": JSON.stringify({
+          pid: exited.pid,
+          pgid: null,
+          command: process.execPath,
+          reap_attempts: 1,
+        }),
+      },
+    });
+
+    const proof = proveSessionInactive(dir);
+    assert.equal(proof.inactive, false);
+    assert.match(proof.reason, /whole process-tree death is not proven/);
+
+    const receipt = sweepScratch({ apply: true, roots: [root] });
+    assert.equal(receipt.totals.removed_targets, 0);
+    assert.equal(
+      fs.existsSync(path.join(dir, "codex-home", "auth.json")),
+      true,
+      "failed tree termination must retain the credential home"
+    );
+  }
+);
+
 test("a session still starting its runner is never cleaned", (t) => {
   // The real product race, not a corrupt-file thought experiment.
   // start_dialog/start_code_review write `runner_state: "starting"` with no

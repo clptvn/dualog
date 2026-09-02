@@ -290,7 +290,27 @@ export function proveSessionInactive(sessionDir) {
     if (probe === "alive") return block(`headless child ${pid} is alive`);
     if (probe !== "absent") return block(`headless child pid ${pid} could not be probed (${probe})`);
 
-    if (process.platform !== "win32") {
+    if (process.platform === "win32") {
+      // Native Windows has no POSIX process group, but the producer records
+      // that fact explicitly as `pgid: null`. Distinguish that valid marker
+      // from an omitted field: `{ pid, command }` is a partial/older shape we
+      // cannot safely reinterpret as proof that no descendant exists.
+      if (!Object.hasOwn(record, "pgid") || pgid !== null) {
+        return block(
+          `a native Windows headless-child record has no usable pgid marker (${JSON.stringify(pgid)})`
+        );
+      }
+      // There is no native process-group probe equivalent to the POSIX check
+      // below. In particular, a failed taskkill may make the cmd.exe wrapper
+      // disappear while a Claude/Codex descendant survives; headless.mjs keeps
+      // this breadcrumb for exactly that reason. Normal completion or a proven
+      // successful whole-tree termination clears the record, so any record
+      // still present is unresolved evidence and must retain scratch data.
+      return block(
+        `native Windows headless-child record remains after wrapper ${pid} exited; ` +
+          "whole process-tree death is not proven"
+      );
+    } else {
       if (!Number.isSafeInteger(pgid) || pgid <= 0) {
         return block(`a headless-child record has no usable pgid (${JSON.stringify(pgid)})`);
       }

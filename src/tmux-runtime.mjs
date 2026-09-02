@@ -1142,15 +1142,18 @@ export function buildTmuxSessionName(sessionId, label) {
   return sanitized;
 }
 
-export async function startTmuxSession({
-  sessionName,
-  cwd,
-  command,
-  args,
-  env,
-  route = tmuxRoute(),
-  socketName = null,
-}) {
+export async function startTmuxSession(
+  {
+    sessionName,
+    cwd,
+    command,
+    args,
+    env,
+    route = tmuxRoute(),
+    socketName = null,
+  },
+  { runTmuxFn = runTmux } = {}
+) {
   const loginShell = await resolveWslLoginShell(route);
   const selectedRoute = {
     ...route,
@@ -1158,14 +1161,14 @@ export async function startTmuxSession({
     tmuxSocketName: socketName ?? route.tmuxSocketName ?? tmuxSocketName(),
   };
   const routeIdentity = tmuxRouteIdentity(selectedRoute);
-  await prepareTmuxServer(selectedRoute);
+  await prepareTmuxServer(selectedRoute, runTmuxFn);
   const payload = buildTmuxShellPayload(
     { command, args, env },
     loginShell,
     { interactiveLogin: selectedRoute.transport === "wsl" }
   );
   try {
-    await runTmux(["new-session", "-d", "-s", sessionName, "-c", cwd, payload], {
+    await runTmuxFn(["new-session", "-d", "-s", sessionName, "-c", cwd, payload], {
       route: selectedRoute,
     });
   } catch (err) {
@@ -1174,7 +1177,7 @@ export async function startTmuxSession({
     // so "new-session threw" does not mean no pane will exist. Killing the name
     // is the only way to make that true, and it is ordered after the create, so
     // the server applies them in that order.
-    await runTmux(["kill-session", "-t", `=${sessionName}`], {
+    await runTmuxFn(["kill-session", "-t", `=${sessionName}`], {
       allowFailure: true,
       route: selectedRoute,
     });
@@ -1204,7 +1207,7 @@ export async function startTmuxSession({
   let panePidUnavailable = false;
   try {
     const raw = (
-      await runTmux(["display-message", "-p", "-t", paneTarget, "#{pane_pid}"], {
+      await runTmuxFn(["display-message", "-p", "-t", paneTarget, "#{pane_pid}"], {
         route: selectedRoute,
       })
     ).stdout.trim();
@@ -1222,9 +1225,9 @@ export async function startTmuxSession({
   // the production incident with no descendant and no setsid() required.
 
   try {
-    await configureTmuxSession(sessionName, selectedRoute, loginShell);
+    await configureTmuxSession(sessionName, selectedRoute, loginShell, runTmuxFn);
     const paneId = (
-      await runTmux(["display-message", "-p", "-t", paneTarget, "#{pane_id}"], {
+      await runTmuxFn(["display-message", "-p", "-t", paneTarget, "#{pane_id}"], {
         route: selectedRoute,
       })
     ).stdout.trim();
@@ -1245,7 +1248,7 @@ export async function startTmuxSession({
       startedAt: new Date().toISOString(),
     };
   } catch (err) {
-    await runTmux(["kill-session", "-t", `=${sessionName}`], {
+    await runTmuxFn(["kill-session", "-t", `=${sessionName}`], {
       allowFailure: true,
       route: selectedRoute,
     });
@@ -1400,13 +1403,17 @@ export function classifyTmuxProbeFailure({ stdout = "", stderr = "" } = {}) {
  * a ten-second tmux timeout during a long turn became "the partner's pane
  * exited", aborting a turn that was running perfectly well.
  */
-export async function probeTmuxSession(sessionName, identity = null) {
+export async function probeTmuxSession(
+  sessionName,
+  identity = null,
+  { runTmuxFn = runTmux } = {}
+) {
   const target = tmuxSessionTarget(sessionName);
   if (!target) return "unknown";
   let result;
   try {
     const route = routeForIdentity(identity);
-    result = await runTmux(["has-session", "-t", target], {
+    result = await runTmuxFn(["has-session", "-t", target], {
       allowFailure: true,
       route,
     });
@@ -2065,20 +2072,25 @@ function buildTmuxArgs(args, { env = process.env, socketName = null } = {}) {
   return ["-f", "/dev/null", "-L", trimmedSocketName, ...args];
 }
 
-async function prepareTmuxServer(route) {
-  await runTmux(["start-server"], { allowFailure: true, route });
+async function prepareTmuxServer(route, runTmuxFn = runTmux) {
+  await runTmuxFn(["start-server"], { allowFailure: true, route });
 }
 
-async function configureTmuxSession(sessionName, route, loginShell) {
-  await runTmux(["set-option", "-t", sessionName, "default-shell", loginShell], {
+async function configureTmuxSession(
+  sessionName,
+  route,
+  loginShell,
+  runTmuxFn = runTmux
+) {
+  await runTmuxFn(["set-option", "-t", sessionName, "default-shell", loginShell], {
     allowFailure: true,
     route,
   });
-  await runTmux(["set-option", "-t", sessionName, "focus-events", "off"], {
+  await runTmuxFn(["set-option", "-t", sessionName, "focus-events", "off"], {
     allowFailure: true,
     route,
   });
-  await runTmux(["set-window-option", "-t", `${sessionName}:0`, "remain-on-exit", "off"], {
+  await runTmuxFn(["set-window-option", "-t", `${sessionName}:0`, "remain-on-exit", "off"], {
     allowFailure: true,
     route,
   });

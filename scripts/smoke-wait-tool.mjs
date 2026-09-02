@@ -82,6 +82,11 @@ const smokeEnv = {
   USERPROFILE: smokeHome,
   HOMEDRIVE: "",
   HOMEPATH: smokeHome,
+  // PowerShell/CIM may initialize per-user application-data directories even
+  // under -NoProfile. Keep those helper side effects inside the disposable
+  // smoke root rather than the caller's HOME/USERPROFILE.
+  APPDATA: path.join(smokeHome, "AppData", "Roaming"),
+  LOCALAPPDATA: path.join(smokeHome, "AppData", "Local"),
   XDG_CONFIG_HOME: path.join(smokeHome, ".config"),
   XDG_CONFIG_DIRS: "",
   CODEX_HOME: path.join(smokeHome, ".codex"),
@@ -176,7 +181,7 @@ function isPidAlive(pid) {
 // together prove that a live PID is still the process this smoke created.
 function probeRecordedRunner(record) {
   if (!isPidAlive(record.pid)) return "gone";
-  const commandLine = readProcessCommandLine(record.pid);
+  const commandLine = readProcessCommandLine(record.pid, { env: smokeEnv });
   if (!commandLine) return "unknown";
   const normalize = (value) =>
     process.platform === "win32" ? value.toLowerCase() : value;
