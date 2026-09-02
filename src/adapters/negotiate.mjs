@@ -52,7 +52,7 @@ export function findBinary(
     // the explicit-path branch.
     return null;
   }
-  const pathImpl = platform === "win32" ? path.win32 : path;
+  const pathImpl = platform === "win32" ? path.win32 : path.posix;
   const exclusionRoots = (Array.isArray(excludedRoots) ? excludedRoots : [])
     .filter((root) => typeof root === "string" && root.trim())
     .map((root) => pathImpl.resolve(root));
@@ -101,8 +101,8 @@ export function findBinary(
   };
   const isPath =
     platform === "win32"
-      ? path.win32.isAbsolute(command) || /[\\/]/u.test(command)
-      : command.includes(path.sep);
+      ? pathImpl.isAbsolute(command) || /[\\/]/u.test(command)
+      : command.includes(pathImpl.sep);
 
   if (isPath) {
     return usableCandidate(command);
@@ -128,7 +128,7 @@ export function findBinary(
         ? [""]
         : windowsExts
       : [""];
-  const delimiter = platform === "win32" ? path.win32.delimiter : path.delimiter;
+  const delimiter = pathImpl.delimiter;
   for (const rawDir of String(envValue("PATH") || "").split(delimiter).filter(Boolean)) {
     // Quoted PATH entries are common in hand-written Windows environments;
     // the quotes delimit the entry and are not part of the directory name.
@@ -146,7 +146,7 @@ export function findBinary(
     const absolutePathDirectory =
       platform === "win32"
         ? /^[A-Za-z]:[\\/]/u.test(dir) || /^\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/u.test(dir)
-        : path.isAbsolute(dir);
+        : pathImpl.isAbsolute(dir);
     if (!absolutePathDirectory) continue;
     for (const ext of exts) {
       const candidate = pathImpl.join(dir, command + ext);

@@ -19,7 +19,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { writeFakeCli, writeFakeAdapter } from "./helpers/fake-cli.mjs";
@@ -92,6 +92,33 @@ const DISOBEDIENT_BIN = writeFakeCli(BIN_DIR, "fake-disobedient.mjs", "sidecar-o
   reply: DISOBEDIENT_REPLY,
 });
 
+// Native Windows invokes package-style `.cmd` launchers through cmd.exe. The
+// headless engine keeps the bootstrap as one argv value there by flattening its
+// line breaks, so test partners must not depend solely on paths appearing on
+// their own lines. The protocol's JSON example preserves the result path in
+// both forms; the other two sidecars are fixed siblings of that file.
+const FAKE_COMPLETION_PATHS_SOURCE = `
+function completionPaths(bootstrap) {
+  const prefix = '{"status":"ok","result_path":';
+  const suffix = ',"summary":"completed","error":null}';
+  const start = bootstrap.indexOf(prefix);
+  const end = start < 0 ? -1 : bootstrap.indexOf(suffix, start + prefix.length);
+  let resultPath = null;
+  if (end >= 0) {
+    try {
+      resultPath = JSON.parse(bootstrap.slice(start, end + suffix.length)).result_path;
+    } catch {}
+  }
+  if (!resultPath) throw new Error("completion result path missing from bootstrap");
+  const turnDir = path.dirname(resultPath);
+  return {
+    resultPath,
+    donePath: path.join(turnDir, "done.json"),
+    promptPath: path.join(turnDir, "prompt.md"),
+  };
+}
+`;
+
 /**
  * A partner that fails ONE named aspect and answers normally for everything
  * else, by reading the aspect id out of the prompt it was handed.
@@ -105,6 +132,8 @@ function writeSelectiveFailureCli(name, failingAspect) {
     name,
     `
 import fs from "fs";
+import path from "path";
+${FAKE_COMPLETION_PATHS_SOURCE}
 const failing = ${JSON.stringify(failingAspect)};
 const reply = ${JSON.stringify(FAKE_REPLY)};
 function readPrompt() {
@@ -114,10 +143,8 @@ function readPrompt() {
   try { return fs.readFileSync(0, "utf-8"); } catch { return fromArgv ?? ""; }
 }
 const prompt = readPrompt();
-const resultPath = (prompt.match(/^(.*result\\.md)$/mu) || [])[1];
-const donePath = (prompt.match(/^(.*done\\.json)$/mu) || [])[1];
+const { resultPath, donePath, promptPath } = completionPaths(prompt);
 // The bootstrap names the per-turn prompt file; the aspect id lives in it.
-const promptPath = (prompt.match(/^(.*prompt\\.md)$/mu) || [])[1];
 let body = "";
 try { body = fs.readFileSync(promptPath, "utf-8"); } catch {}
 if (body.includes("ASPECT: " + failing)) {
@@ -139,6 +166,8 @@ const UNINDEXED_BIN = writeNodeCommand(
   "fake-unindexed",
   `
 import fs from "fs";
+import path from "path";
+${FAKE_COMPLETION_PATHS_SOURCE}
 function readPrompt() {
   const positional = process.argv.slice(2).filter((a) => !a.startsWith("-"));
   const fromArgv = positional[positional.length - 1];
@@ -146,9 +175,7 @@ function readPrompt() {
   try { return fs.readFileSync(0, "utf-8"); } catch { return fromArgv ?? ""; }
 }
 const bootstrap = readPrompt();
-const resultPath = (bootstrap.match(/^(.*result\\.md)$/mu) || [])[1];
-const donePath = (bootstrap.match(/^(.*done\\.json)$/mu) || [])[1];
-const promptPath = (bootstrap.match(/^(.*prompt\\.md)$/mu) || [])[1];
+const { resultPath, donePath, promptPath } = completionPaths(bootstrap);
 const taskPrompt = fs.readFileSync(promptPath, "utf-8");
 const reply = /^## Specialist Reports$/m.test(taskPrompt)
   ? "### Normalized Findings\\n(none)\\nREVIEW_VERDICT: APPROVE"
@@ -165,6 +192,8 @@ function writeProtocolReplyCli(name, specialistReply) {
     name,
     `
 import fs from "fs";
+import path from "path";
+${FAKE_COMPLETION_PATHS_SOURCE}
 function readPrompt() {
   const positional = process.argv.slice(2).filter((a) => !a.startsWith("-"));
   const fromArgv = positional[positional.length - 1];
@@ -172,9 +201,7 @@ function readPrompt() {
   try { return fs.readFileSync(0, "utf-8"); } catch { return fromArgv ?? ""; }
 }
 const bootstrap = readPrompt();
-const resultPath = (bootstrap.match(/^(.*result\\.md)$/mu) || [])[1];
-const donePath = (bootstrap.match(/^(.*done\\.json)$/mu) || [])[1];
-const promptPath = (bootstrap.match(/^(.*prompt\\.md)$/mu) || [])[1];
+const { resultPath, donePath, promptPath } = completionPaths(bootstrap);
 const taskPrompt = fs.readFileSync(promptPath, "utf-8");
 const reply = /^## Specialist Reports$/m.test(taskPrompt)
   ? "### Normalized Findings\\n(none)\\nREVIEW_VERDICT: APPROVE"
@@ -312,7 +339,13 @@ async function stopRunner(child, sessionDir) {
   try {
     fs.writeFileSync(path.join(sessionDir, "end_signal"), "");
   } catch {}
-  const exited = new Promise((resolve) => child.once("exit", resolve));
+  // Several failure paths finish before the test reaches cleanup. Registering
+  // an `exit` listener after that event used to force every such test through
+  // the full eight-second fallback despite there being nothing left to stop.
+  const exited =
+    child.exitCode !== null || child.signalCode !== null
+      ? Promise.resolve()
+      : new Promise((resolve) => child.once("exit", resolve));
   await Promise.race([exited, sleep(8000)]);
   if (child.exitCode === null && child.signalCode === null) {
     try {
@@ -329,6 +362,52 @@ function runnerLogTail(sessionDir) {
     return "(no runner log)";
   }
 }
+
+test("custom panel fixtures accept a flattened Windows bootstrap argument", () => {
+  const turnDir = path.join(ROOT, "flat bootstrap & metachar fixtures", String(Date.now()));
+  const promptPath = path.join(turnDir, "prompt.md");
+  const resultPath = path.join(turnDir, "result.md");
+  const donePath = path.join(turnDir, "done.json");
+  fs.mkdirSync(turnDir, { recursive: true });
+  fs.writeFileSync(promptPath, "ASPECT: code\n");
+
+  const bootstrap =
+    "Completion protocol is mandatory: " +
+    JSON.stringify({
+      status: "ok",
+      result_path: resultPath,
+      summary: "completed",
+      error: null,
+    });
+  execFileSync(
+    process.execPath,
+    [path.join(BIN_DIR, "fake-advisory.mjs"), "--run", bootstrap],
+    { stdio: "pipe" }
+  );
+
+  assert.match(fs.readFileSync(resultPath, "utf-8"), /SUGGESTION/u);
+  assert.deepEqual(JSON.parse(fs.readFileSync(donePath, "utf-8")), {
+    status: "ok",
+    result_path: resultPath,
+  });
+});
+
+test("runner cleanup does not wait on an exit event that already fired", async () => {
+  const sessionDir = path.join(ROOT, "already-exited-runner");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const child = {
+    exitCode: 1,
+    signalCode: null,
+    once() {
+      assert.fail("cleanup registered a listener after the child had exited");
+    },
+    kill() {
+      assert.fail("cleanup tried to kill an already-exited child");
+    },
+  };
+
+  await stopRunner(child, sessionDir);
+});
 
 async function waitForPartnerMessages(
   sessionDir,

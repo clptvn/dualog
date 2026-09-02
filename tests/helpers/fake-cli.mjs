@@ -25,6 +25,7 @@ export function writeFakeCli(dir, name, behavior, options = {}) {
 
   const script = `
 import fs from "fs";
+import path from "path";
 
 const behavior = ${JSON.stringify(behavior)};
 const reply = ${JSON.stringify(reply)};
@@ -44,8 +45,30 @@ function readPrompt() {
 
 const prompt = readPrompt();
 // The protocol states both sidecar paths on their own lines.
-const resultPath = (prompt.match(/^(.*result\\.md)$/mu) || [])[1];
-const donePath = (prompt.match(/^(.*done\\.json)$/mu) || [])[1];
+let resultPath = (prompt.match(/^(.*result\\.md)$/mu) || [])[1];
+let donePath = (prompt.match(/^(.*done\\.json)$/mu) || [])[1];
+
+// Native Windows batch shims cannot carry literal newlines in an argv value,
+// so the headless engine flattens this instruction envelope before launching
+// a .cmd partner. Recover the canonical sidecar path from the protocol JSON in
+// that form; real partners receive the same information without depending on
+// presentation-only line breaks.
+if (!resultPath) {
+  const protocolStart = prompt.indexOf('{"status":"ok","result_path":');
+  const protocolSuffix = ',"summary":"completed","error":null}';
+  const protocolEnd =
+    protocolStart >= 0 ? prompt.indexOf(protocolSuffix, protocolStart) : -1;
+  if (protocolEnd > protocolStart) {
+    try {
+      resultPath = JSON.parse(
+        prompt.slice(protocolStart, protocolEnd + protocolSuffix.length)
+      ).result_path;
+    } catch {}
+  }
+}
+if (!donePath && resultPath) {
+  donePath = path.join(path.dirname(resultPath), "done.json");
+}
 
 if (behavior === "hang") { setInterval(() => {}, 1000); }
 else if (behavior === "crash") {

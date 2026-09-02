@@ -47,6 +47,47 @@ export function spawnHeadlessPartner(
   );
 }
 
+/**
+ * cmd.exe treats literal newlines in one `/c` command as command separators,
+ * even when cross-spawn quoted the surrounding argument. The initial headless
+ * bootstrap is only a short instruction envelope whose real task lives in
+ * prompt.md, so flatten that envelope for batch shims while preserving every
+ * byte for direct executables, POSIX launchers, and stdin delivery.
+ */
+export function prepareHeadlessInitialPrompt(
+  bootstrap,
+  { command, delivery, platform = process.platform } = {}
+) {
+  if (
+    platform === "win32" &&
+    delivery === "argv" &&
+    typeof command === "string" &&
+    /\.(?:cmd|bat)$/iu.test(command)
+  ) {
+    return String(bootstrap).replace(/\r\n?|\n/gu, " ");
+  }
+  return bootstrap;
+}
+
+/** Deliver stdin without letting an early partner exit crash the runner. */
+export function deliverHeadlessPrompt(child, delivery, bootstrap, { log } = {}) {
+  const reportInputFailure = (err) => {
+    log?.(
+      `Headless partner closed stdin before prompt delivery completed` +
+        (err?.code || err?.message ? ` (${err.code || err.message})` : "")
+    );
+  };
+  child.stdin.on("error", reportInputFailure);
+  try {
+    child.stdin.end(delivery === "stdin" ? bootstrap : undefined);
+  } catch (err) {
+    // The child process exit and captured stderr remain the turn's terminal
+    // diagnosis. A synchronous stream failure is useful context, not a reason
+    // to tear down the runner before waitForExit can observe that diagnosis.
+    reportInputFailure(err);
+  }
+}
+
 export class HeadlessTurnError extends Error {
   constructor(message, outcome) {
     super(message);
@@ -457,6 +498,11 @@ async function runHeadlessTurnInner(
   // for why the state is an upper bound on what may have happened rather than a
   // report of what did.
   if (lease) transitionLease(lease, "projecting");
+  const delivery = adapter.promptDelivery.headless;
+  const initialPrompt = prepareHeadlessInitialPrompt(bootstrap, {
+    command: resolvedPartnerCommand,
+    delivery,
+  });
   const { command, args, env, notices } = buildInvocationFromAdapter(adapter, {
     engine: "headless",
     partnerCommand: resolvedPartnerCommand,
@@ -466,7 +512,7 @@ async function runHeadlessTurnInner(
     model,
     reasoningEffort,
     toolProfile,
-    initialPrompt: bootstrap,
+    initialPrompt,
     discoveredModels,
     applyOperatorDefault: true,
     allowUnknownModel,
@@ -490,7 +536,6 @@ async function runHeadlessTurnInner(
 
   if (lease) transitionLease(lease, "ready");
 
-  const delivery = adapter.promptDelivery.headless;
   log(
     `Invoking ${adapter.displayName} headlessly (prompt via ${delivery}, ${bootstrap.length} chars)`
   );
@@ -624,14 +669,9 @@ async function runHeadlessTurnInner(
   child.stdout.on("data", (chunk) => stdoutBuffer.push(chunk));
   child.stderr.on("data", (chunk) => stderrBuffer.push(chunk));
 
-  if (delivery === "stdin") {
-    child.stdin.write(bootstrap);
-    child.stdin.end();
-  } else {
-    // The prompt went in via argv; closing stdin tells CLIs that check for
-    // piped input that there is none, rather than leaving them waiting on it.
-    child.stdin.end();
-  }
+  // When the prompt went in via argv, closing stdin tells CLIs that check for
+  // piped input that there is none, rather than leaving them waiting on it.
+  deliverHeadlessPrompt(child, delivery, bootstrap, { log });
 
   const exit = await waitForExit(child, {
     timeoutMs,

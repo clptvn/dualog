@@ -56,13 +56,16 @@ const WSL_ROUTE = Object.freeze({
   tmuxBinary: "tmux",
   tmuxSocketName: "dualog",
 });
+const LOCAL_PARTNER_COMMAND = process.platform === "win32"
+  ? "C:\\Program Files\\Codex\\codex.cmd"
+  : "/usr/local/bin/codex";
 
 test("the preflight runtime decision round-trips exactly and legacy runners remain automatic", () => {
   const decisions = [
     {
       version: 2,
       engine: "headless",
-      partnerCommand: "/usr/local/bin/codex",
+      partnerCommand: LOCAL_PARTNER_COMMAND,
       tmuxTransport: null,
       tmuxDistro: null,
       tmuxLauncher: null,
@@ -72,7 +75,7 @@ test("the preflight runtime decision round-trips exactly and legacy runners rema
     {
       version: 2,
       engine: "tmux-interactive",
-      partnerCommand: "/usr/local/bin/codex",
+      partnerCommand: LOCAL_PARTNER_COMMAND,
       tmuxTransport: "local",
       tmuxDistro: null,
       tmuxLauncher: "tmux",

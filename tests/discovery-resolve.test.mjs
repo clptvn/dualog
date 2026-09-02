@@ -105,7 +105,7 @@ test("Windows binary lookup does not append PATHEXT to an existing exe or cmd su
   }
 });
 
-test("binary lookup ignores relative PATH entries while explicit paths become absolute", () => {
+test("POSIX binary lookup ignores relative PATH entries while explicit paths become absolute", () => {
   const posixAttempts = [];
   const resolved = findBinary(
     "claude",
@@ -126,7 +126,7 @@ test("binary lookup ignores relative PATH entries while explicit paths become ab
   const explicit = "./reviewed tools/claude";
   assert.equal(
     findBinary(explicit, {}, { platform: "linux", accessSync: () => {} }),
-    path.resolve(explicit),
+    path.posix.resolve(explicit),
     "an explicit relative path remains supported but cannot stay relative at spawn"
   );
 });

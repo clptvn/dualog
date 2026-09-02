@@ -251,6 +251,70 @@ async function startPanel(client, aspects = ["code"]) {
   });
 }
 
+async function waitForSuccessfulPanel(client, sessionId, label = "panel") {
+  const giveUpAt = Date.now() + 120000;
+  for (;;) {
+    const report = await callJson(client, "get_pr_review_report", {
+      session_id: sessionId,
+    });
+    // A failed specialist can never turn into the successful panel these tests
+    // require. Likewise, a runner proven dead cannot publish consolidation.
+    // Surface either terminal state immediately instead of polling a corpse for
+    // the full hosted-job timeout.
+    const failed = Array.isArray(report.aspects_failed) ? report.aspects_failed : [];
+    if (report.panel_complete && failed.length === 0) return report;
+    const runnerExited = report.runner_alive === false || report.runner_state === "exited";
+    if (failed.length > 0 || runnerExited || Date.now() >= giveUpAt) {
+      assert.fail(
+        `${label} did not complete successfully: ${JSON.stringify({
+          phase: report.phase,
+          reported: report.aspects_reported,
+          pending: report.aspects_pending,
+          failed,
+          runner_alive: report.runner_alive,
+          runner_state: report.runner_state,
+          runner_exit_reason: report.runner_exit_reason,
+          last_error: report.last_error,
+        })}`
+      );
+    }
+    await sleep(250);
+  }
+}
+
+test("successful-panel polling stops on the first terminal failure", async () => {
+  let calls = 0;
+  const client = {
+    async callTool() {
+      calls += 1;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              phase: "panel",
+              panel_complete: false,
+              aspects_reported: [],
+              aspects_pending: [],
+              aspects_failed: [{ aspect: "code", error: "fixture failed" }],
+              runner_alive: true,
+              runner_state: "running",
+              runner_exit_reason: null,
+              last_error: "fixture failed",
+            }),
+          },
+        ],
+      };
+    },
+  };
+
+  await assert.rejects(
+    waitForSuccessfulPanel(client, "review-terminal-fixture"),
+    /did not complete successfully.*fixture failed/u
+  );
+  assert.equal(calls, 1, "a terminally failed panel was polled again");
+});
+
 test("a live panel session is reachable through the tools its own docs name", async (t) => {
   await withServer(t, async (client) => {
     const started = await startPanel(client);
@@ -300,22 +364,7 @@ test("the panel's findings survive the round trip into get_pr_review_report", as
     const started = await startPanel(client);
 
     // Wait for the panel pass AND the consolidation that follows it.
-    let report;
-    const giveUpAt = Date.now() + 120000;
-    for (;;) {
-      report = await callJson(client, "get_pr_review_report", {
-        session_id: started.session_id,
-      });
-      if (report.panel_complete) break;
-      if (Date.now() >= giveUpAt) {
-        assert.fail(
-          `panel never completed: reported=${JSON.stringify(report.aspects_reported)} ` +
-            `pending=${JSON.stringify(report.aspects_pending)} ` +
-            `failed=${JSON.stringify(report.aspects_failed)}`
-        );
-      }
-      await sleep(1000);
-    }
+    const report = await waitForSuccessfulPanel(client, started.session_id);
 
     // Attribution is the coupling that used to live in three separate copies of
     // a regex. If the header and the parser ever drift apart again, findings
@@ -602,15 +651,7 @@ test("send_message is accepted once the panel has reported", async (t) => {
   await withServer(t, async (client) => {
     const started = await startPanel(client);
 
-    const giveUpAt = Date.now() + 120000;
-    for (;;) {
-      const report = await callJson(client, "get_pr_review_report", {
-        session_id: started.session_id,
-      });
-      if (report.panel_complete) break;
-      if (Date.now() >= giveUpAt) assert.fail("panel never completed");
-      await sleep(1000);
-    }
+    await waitForSuccessfulPanel(client, started.session_id);
 
     // The bug's most user-visible symptom: every follow-up message was refused
     // with "this session's runner is no longer running", making phase 3 of the
@@ -835,16 +876,7 @@ test("the live server safely resolves and refreshes a PR through gh", async (t) 
       assert.equal(status.branch, "feature/remote");
       assert.equal(status.base_branch, "main");
 
-      let report;
-      const giveUpAt = Date.now() + 120000;
-      for (;;) {
-        report = await callJson(client, "get_pr_review_report", {
-          session_id: started.session_id,
-        });
-        if (report.panel_complete) break;
-        if (Date.now() >= giveUpAt) assert.fail("remote PR panel never completed");
-        await sleep(1000);
-      }
+      await waitForSuccessfulPanel(client, started.session_id, "remote PR panel");
 
       assert.match(
         fs.readFileSync(path.join(started.review_dir, "diff.patch"), "utf-8"),

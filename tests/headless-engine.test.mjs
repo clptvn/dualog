@@ -10,7 +10,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { runHeadlessTurn, extractStdoutResult } from "../src/engines/headless.mjs";
+import {
+  deliverHeadlessPrompt,
+  extractStdoutResult,
+  prepareHeadlessInitialPrompt,
+  runHeadlessTurn,
+} from "../src/engines/headless.mjs";
 import { resolveEngine, resolveRunnableEngine } from "../src/engines/index.mjs";
 import { buildBootstrapPrompt } from "../src/engines/completion.mjs";
 import { loadRegistry, resetRegistry } from "../src/adapters/registry.mjs";
@@ -29,8 +34,10 @@ process.on("exit", () => {
 
 // One fake binary + adapter per behavior under test.
 const BEHAVIORS = ["sidecar-ok", "sidecar-error", "stdout-only", "silent", "crash", "hang"];
+const FAKE_BINARIES = new Map();
 for (const behavior of BEHAVIORS) {
   const bin = writeFakeCli(BIN_DIR, `fake-${behavior}.mjs`, behavior);
+  FAKE_BINARIES.set(behavior, bin);
   writeFakeAdapter(ADAPTER_DIR, `fake-${behavior}`, bin);
 }
 
@@ -38,7 +45,7 @@ for (const behavior of BEHAVIORS) {
 writeFakeAdapter(
   ADAPTER_DIR,
   "fake-stdout-trusted",
-  path.join(BIN_DIR, "fake-stdout-only.mjs"),
+  FAKE_BINARIES.get("stdout-only"),
   {
     completion: {
       sidecar: "fallback",
@@ -49,7 +56,7 @@ writeFakeAdapter(
 );
 
 // stdin delivery, to prove both prompt paths.
-writeFakeAdapter(ADAPTER_DIR, "fake-stdin", path.join(BIN_DIR, "fake-sidecar-ok.mjs"), {
+writeFakeAdapter(ADAPTER_DIR, "fake-stdin", FAKE_BINARIES.get("sidecar-ok"), {
   promptDelivery: { headless: "stdin" },
   argv: { headless: [{ args: ["--run"] }] },
 });
@@ -103,11 +110,16 @@ function setupTurn(name) {
 }
 
 async function run(adapterId, overrides = {}) {
-  const turn = setupTurn(adapterId);
+  const {
+    sessionName = adapterId,
+    bootstrapTransform = (value) => value,
+    ...turnOverrides
+  } = overrides;
+  const turn = setupTurn(sessionName);
   return runHeadlessTurn({
     adapter: registry.get(adapterId),
     partnerCommand: null,
-    bootstrap: turn.bootstrap,
+    bootstrap: bootstrapTransform(turn.bootstrap),
     projectPath: ROOT,
     sessionDir: turn.sessionDir,
     turnDir: turn.turnDir,
@@ -118,7 +130,7 @@ async function run(adapterId, overrides = {}) {
     toolProfile: "read",
     timeoutMs: 10000,
     log: () => {},
-    ...overrides,
+    ...turnOverrides,
   });
 }
 
@@ -181,6 +193,92 @@ test("sidecar:always does not accept a stdout result as a substitute", async () 
 
 test("sidecar:fallback accepts a stdout terminal event", async () => {
   assert.equal(await run("fake-stdout-trusted"), "FAKE PARTNER REPLY");
+});
+
+test("a flattened Windows bootstrap preserves braces inside its result path", async () => {
+  assert.equal(
+    await run("fake-sidecar-ok", {
+      sessionName: "brace-}-path",
+      bootstrapTransform(bootstrap) {
+        assert.match(bootstrap, /brace-\}-path/u);
+        const flattened = prepareHeadlessInitialPrompt(bootstrap, {
+          command: "C:\\Program Files\\Claude\\claude.cmd",
+          delivery: "argv",
+          platform: "win32",
+        });
+        assert.doesNotMatch(flattened, /[\r\n]/u);
+        return flattened;
+      },
+    }),
+    "FAKE PARTNER REPLY"
+  );
+});
+
+test("native Windows batch argv receives a single-line bootstrap envelope", () => {
+  const bootstrap = "Read prompt.md.\r\n\r\nWrite result.md.\nThen write done.json.";
+
+  assert.equal(
+    prepareHeadlessInitialPrompt(bootstrap, {
+      command: "C:\\Program Files\\Claude\\claude.cmd",
+      delivery: "argv",
+      platform: "win32",
+    }),
+    "Read prompt.md.  Write result.md. Then write done.json."
+  );
+  assert.equal(
+    prepareHeadlessInitialPrompt(bootstrap, {
+      command: "C:\\Program Files\\Claude\\claude.exe",
+      delivery: "argv",
+      platform: "win32",
+    }),
+    bootstrap,
+    "direct Windows executables do not pass through cmd.exe"
+  );
+  assert.equal(
+    prepareHeadlessInitialPrompt(bootstrap, {
+      command: "C:\\Program Files\\Claude\\claude.cmd",
+      delivery: "stdin",
+      platform: "win32",
+    }),
+    bootstrap,
+    "stdin delivery preserves the original bootstrap"
+  );
+  assert.equal(
+    prepareHeadlessInitialPrompt(bootstrap, {
+      command: "/tmp/claude.cmd",
+      delivery: "argv",
+      platform: "darwin",
+    }),
+    bootstrap,
+    "POSIX never applies Windows command-line normalization"
+  );
+});
+
+test("an early stdin close is logged without throwing from prompt delivery", () => {
+  let onError;
+  let delivered;
+  const messages = [];
+  const child = {
+    stdin: {
+      on(event, handler) {
+        assert.equal(event, "error");
+        onError = handler;
+      },
+      end(value) {
+        delivered = value;
+        const err = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+        onError(err);
+      },
+    },
+  };
+
+  assert.doesNotThrow(() =>
+    deliverHeadlessPrompt(child, "stdin", "bootstrap", {
+      log: (message) => messages.push(message),
+    })
+  );
+  assert.equal(delivered, "bootstrap");
+  assert.match(messages.join("\n"), /closed stdin.*EPIPE/u);
 });
 
 // --- stdout extraction ----------------------------------------------------
