@@ -236,6 +236,40 @@ function cleanupLeaseFamilyArtifacts(lease) {
   cleanupClaimArtifacts(lease);
 }
 
+/**
+ * Give namespace-generation tests a complete, isolated Linux process table.
+ *
+ * The full suite runs test files in parallel. On a hosted runner that means the
+ * real `/proc` contains unrelated same-UID Node workers whose cwd/fd entries may
+ * be ptrace-inaccessible or disappear mid-scan. Production must classify that
+ * ambient hole as `unknown`; it is not evidence that this test's lease is free.
+ * These tests are about the subsequent atomic rename boundary, so enumerate
+ * only this worker as though it were alone in its PID namespace. Its real
+ * kernel status, cwd, and fd entries are still scanned, and every filesystem
+ * rename/removal remains real. The dedicated directory-usage suite separately
+ * proves that hidden, permission-denied, malformed, and held entries retain.
+ */
+function installIsolatedLinuxProcFixture(t) {
+  if (process.platform !== "linux") return;
+
+  const originalReadFileSync = fs.readFileSync;
+  const originalReaddirSync = fs.readdirSync;
+  fs.readFileSync = (target, ...args) => {
+    if (String(target) === "/proc/self/mountinfo") {
+      return "148 146 0:72 / /proc rw,relatime - proc proc rw\n";
+    }
+    return originalReadFileSync(target, ...args);
+  };
+  fs.readdirSync = (target, ...args) => {
+    if (String(target) === "/proc") return [String(process.pid)];
+    return originalReaddirSync(target, ...args);
+  };
+  t.after(() => {
+    fs.readFileSync = originalReadFileSync;
+    fs.readdirSync = originalReaddirSync;
+  });
+}
+
 /** A process that is genuinely alive for the duration of one test. */
 function liveProcess(t) {
   const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
@@ -1493,6 +1527,7 @@ test("strict POSIX removal leaves canonical attribution for late recreation", (t
     t.skip("strict native Windows removal fails closed on unavailable handle evidence");
     return;
   }
+  installIsolatedLinuxProcFixture(t);
   const id = crypto.randomBytes(16).toString("hex");
   const dir = path.join(runtimeDir(), id);
   fs.mkdirSync(path.join(dir, "codex-home"), { recursive: true });
@@ -1508,6 +1543,10 @@ test("strict POSIX removal leaves canonical attribution for late recreation", (t
   assert.equal(marker.release_relaxation_eligible, false);
 
   fs.mkdirSync(path.join(dir, "codex-home"), { recursive: true });
+  // Recursive recreation would otherwise give the lease root the ambient
+  // umask mode (0755 on hosted Ubuntu), intentionally outside the runtime's
+  // current-user 0700 invariant and therefore unremovable on Linux.
+  fs.chmodSync(dir, 0o700);
   fs.writeFileSync(path.join(dir, "codex-home", "late.json"), "{}");
   const receipt = sweepLeases({ apply: true });
   assert.ok(receipt.removed.some((entry) => entry.dir === dir));
@@ -1880,6 +1919,7 @@ test("competing stale-claim reclaimers cannot move a fresh live claim", (t) => {
 });
 
 test("an atomic quarantine never removes a late canonical generation", (t) => {
+  installIsolatedLinuxProcFixture(t);
   const lease = newLease();
   transitionLease(lease, "projecting");
   const originalCredential = path.join(lease.dir, "codex-home", "auth.json");
@@ -1898,6 +1938,7 @@ test("an atomic quarantine never removes a late canonical generation", (t) => {
       // never be part of the recursive removal below.
       const late = path.join(lease.dir, "codex-home", "late.json");
       fs.mkdirSync(path.dirname(late), { recursive: true });
+      if (process.platform !== "win32") fs.chmodSync(lease.dir, 0o700);
       fs.writeFileSync(late, '{"generation":"late-canonical"}');
       // A second cleanup that scanned before this namespace switch must not be
       // able to consume the just-created canonical generation. The exclusive

@@ -1574,6 +1574,31 @@ test("PowerShell wrappers expose a scoped distro selector and host-only recursio
   }
 });
 
+test("native Windows installer smoke selects one absolute Node application", () => {
+  const source = fs.readFileSync(
+    path.join(REPO_ROOT, "scripts", "windows-installer-smoke.ps1"),
+    "utf-8"
+  );
+
+  assert.match(source, /function Resolve-NodeExecutable\s*\{/u);
+  assert.match(
+    source,
+    /Get-Command node\.exe -CommandType Application -All -ErrorAction Stop/u
+  );
+  assert.match(
+    source,
+    /\.CommandType -ne \[System\.Management\.Automation\.CommandTypes\]::Application/u
+  );
+  assert.match(source, /\$isDriveAbsolute = \$source -match/u);
+  assert.match(source, /\$isUncAbsolute = \$source -match/u);
+  assert.match(source, /Test-Path -LiteralPath \$fullPath -PathType Leaf/u);
+  assert.match(source, /return \$fullPath/u);
+  assert.match(source, /\$nodeExecutable = Resolve-NodeExecutable/u);
+  assert.match(source, /\$nodeHome = & \$nodeExecutable @nodeHomeArguments/u);
+  assert.doesNotMatch(source, /& \$nodeCommand\.Source/u);
+  assert.doesNotMatch(source, /-CommandType (?:Alias|Function)/u);
+});
+
 test("installer and uninstaller retain the PR review command and skill", () => {
   for (const file of ["scripts/install.mjs", "scripts/uninstall.mjs"]) {
     const source = fs.readFileSync(path.join(REPO_ROOT, file), "utf-8");

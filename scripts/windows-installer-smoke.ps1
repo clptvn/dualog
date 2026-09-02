@@ -79,6 +79,52 @@ function Read-Json {
     return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json)
 }
 
+function Resolve-NodeExecutable {
+    # `Get-Command node.exe` can return every matching PATH application under
+    # Windows PowerShell 5.1. Keep its resolution order so the setup-node path
+    # prepended by the runner wins, but return one validated executable string
+    # instead of allowing multiple .Source values to collapse into one command.
+    $nodeCandidates = @(
+        Get-Command node.exe -CommandType Application -All -ErrorAction Stop
+    )
+    foreach ($candidate in $nodeCandidates) {
+        if ($candidate.CommandType -ne [System.Management.Automation.CommandTypes]::Application) {
+            continue
+        }
+        $source = [string]$candidate.Source
+        if ([string]::IsNullOrWhiteSpace($source)) {
+            continue
+        }
+
+        # Path.IsPathRooted accepts drive-relative `C:node.exe`, so require an
+        # ordinary drive-absolute or fully rooted UNC spelling explicitly.
+        $isDriveAbsolute = $source -match '^[A-Za-z]:[\\/]'
+        $isUncAbsolute = $source -match '^[\\/]{2}[^\\/]+[\\/][^\\/]+[\\/]'
+        if (-not ($isDriveAbsolute -or $isUncAbsolute)) {
+            continue
+        }
+
+        try {
+            $fullPath = [System.IO.Path]::GetFullPath($source)
+        } catch {
+            continue
+        }
+        if (-not [string]::Equals(
+            [System.IO.Path]::GetFileName($fullPath),
+            "node.exe",
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+            continue
+        }
+        return $fullPath
+    }
+
+    throw "No absolute Node.js application executable was found on PATH."
+}
+
 function Invoke-DualogPowerShellScript {
     param(
         [string]$PowerShellExecutable,
@@ -108,7 +154,7 @@ if ($env:OS -ne "Windows_NT") {
 $powerShellExecutable = Join-Path $PSHOME "powershell.exe"
 Assert-PathExists -Path $powerShellExecutable `
     -Message "Windows PowerShell executable is unavailable under PSHOME"
-$nodeCommand = Get-Command node.exe -CommandType Application -ErrorAction Stop
+$nodeExecutable = Resolve-NodeExecutable
 $environmentNames = @(
     "USERPROFILE",
     "HOME",
@@ -162,7 +208,11 @@ try {
 
     # Prove Node will resolve os.homedir() into the sandbox before invoking an
     # installer that writes user-scoped files.
-    $nodeHome = & $nodeCommand.Source -e "process.stdout.write(require('node:os').homedir())"
+    $nodeHomeArguments = @(
+        "-e",
+        "process.stdout.write(require('node:os').homedir())"
+    )
+    $nodeHome = & $nodeExecutable @nodeHomeArguments
     Assert-True -Condition ($LASTEXITCODE -eq 0) -Message "Node home probe failed"
     Assert-SamePath -Actual ([string]$nodeHome) -Expected $isolatedProfile `
         -Message "Node did not resolve the isolated USERPROFILE"
@@ -241,7 +291,7 @@ args = ["--keep"]
     $claudeRegistration = $claudeConfig.mcpServers.dualog
     Assert-PathExists -Path ([string]$claudeRegistration.command) `
         -Message "Claude MCP registration does not point at an existing Node executable"
-    Assert-SamePath -Actual ([string]$claudeRegistration.command) -Expected $nodeCommand.Source `
+    Assert-SamePath -Actual ([string]$claudeRegistration.command) -Expected $nodeExecutable `
         -Message "Claude MCP registration does not point at the expected Node executable"
     $claudeArguments = @($claudeRegistration.args)
     Assert-True -Condition ($claudeArguments.Count -eq 1) `
@@ -271,7 +321,7 @@ args = ["--keep"]
         -Message "Codex MCP registration has no valid server argument"
     $codexCommand = $codexCommandMatch.Groups['value'].Value | ConvertFrom-Json
     $codexServerArgument = $codexArgumentMatch.Groups['value'].Value | ConvertFrom-Json
-    Assert-SamePath -Actual ([string]$codexCommand) -Expected $nodeCommand.Source `
+    Assert-SamePath -Actual ([string]$codexCommand) -Expected $nodeExecutable `
         -Message "Codex MCP registration does not point at the expected Node executable"
     Assert-SamePath -Actual ([string]$codexServerArgument) -Expected $expectedServerPath `
         -Message "Codex MCP registration does not point at the expected Dualog server"

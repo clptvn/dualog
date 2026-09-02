@@ -330,16 +330,38 @@ function runnerLogTail(sessionDir) {
   }
 }
 
-async function waitForPartnerMessages(sessionDir, count, child, deadlineMs = 90000) {
+async function waitForPartnerMessages(
+  sessionDir,
+  count,
+  child,
+  { deadlineMs = 90000, panelFinished = false } = {}
+) {
   const giveUpAt = Date.now() + deadlineMs;
   for (;;) {
     const messages = readConversation(sessionDir);
     const partner = messages.filter((m) => m.from === "fake-panel");
-    if (partner.length >= count) return messages;
+    let panel = null;
+    if (panelFinished) {
+      try {
+        panel = JSON.parse(
+          fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8")
+        );
+      } catch {}
+    }
+    const durablePanelFinished =
+      !panelFinished ||
+      (panel?.phase === "follow_up" &&
+        Array.isArray(panel?.pending) &&
+        panel.pending.length === 0 &&
+        typeof panel?.panel_finished_at === "string");
+    if (partner.length >= count && durablePanelFinished) return messages;
     const exited = child.exitCode !== null || child.signalCode !== null;
     if (exited || Date.now() >= giveUpAt) {
       assert.fail(
         `expected ${count} partner message(s), saw ${partner.length}` +
+          (panelFinished && !durablePanelFinished
+            ? `; durable panel completion was not published (phase ${panel?.phase ?? "missing"}, pending ${JSON.stringify(panel?.pending ?? null)})`
+            : "") +
           `${exited ? ` before runner exit (${child.exitCode ?? child.signalCode})` : ""}.` +
           `\nrunner.log tail:\n${runnerLogTail(sessionDir)}`
       );
@@ -660,7 +682,13 @@ test("an advisory-only specialist is complete without entering the blocking ledg
   const child = startRunner(sessionDir, 2, ADVISORY_BIN);
 
   try {
-    const messages = await waitForPartnerMessages(sessionDir, 2, child);
+    // The consolidation message and panel_state.json are separate atomic
+    // artifacts. Seeing the message does not mean the runner has published the
+    // matching aggregate completion and final phase yet, so approval is only
+    // meaningful after the durable panel-finished marker lands.
+    const messages = await waitForPartnerMessages(sessionDir, 2, child, {
+      panelFinished: true,
+    });
     const panel = JSON.parse(
       fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8")
     );
