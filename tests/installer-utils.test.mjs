@@ -1547,9 +1547,10 @@ test("installer default WSL route is exact while custom and POSIX routes are pre
 });
 
 test("PowerShell wrappers expose a scoped distro selector and host-only recursion guard", () => {
-  for (const [file, argsName] of [
-    ["install.ps1", "InstallArgs"],
-    ["uninstall.ps1", "UninstallArgs"],
+  const nodeResolverBodies = [];
+  for (const [file, argsName, entrypoint] of [
+    ["install.ps1", "InstallArgs", "scripts/install.mjs"],
+    ["uninstall.ps1", "UninstallArgs", "scripts/uninstall.mjs"],
   ]) {
     const source = fs.readFileSync(path.join(REPO_ROOT, file), "utf-8");
     assert.match(source, /\[string\]\$Distro/);
@@ -1569,9 +1570,42 @@ test("PowerShell wrappers expose a scoped distro selector and host-only recursio
       source,
       new RegExp(`\\$${argsName} \\+= @\\("--wsl-binary", \\$WslBinary\\)`)
     );
-    assert.match(source, /Get-Command node/);
-    assert.match(source, /& \$NodeCommand\.Source/);
+    assert.match(source, /function Resolve-NodeExecutable\s*\{/u);
+    assert.match(
+      source,
+      /Get-Command node\.exe -CommandType Application -All -ErrorAction SilentlyContinue/u
+    );
+    assert.match(
+      source,
+      /\.CommandType -ne \[System\.Management\.Automation\.CommandTypes\]::Application/u
+    );
+    assert.match(source, /\$isDriveAbsolute = \$source -match/u);
+    assert.match(source, /\$isUncAbsolute = \$source -match/u);
+    assert.match(source, /Test-Path -LiteralPath \$fullPath -PathType Leaf/u);
+    assert.match(source, /return \$fullPath/u);
+    assert.match(source, /\$NodeExecutable = Resolve-NodeExecutable/u);
+    assert.ok(
+      source.includes(
+        `$NodeArguments = @((Join-Path $ScriptDir "${entrypoint}")) + $${argsName}`
+      )
+    );
+    assert.match(source, /& \$NodeExecutable @NodeArguments/u);
+    assert.match(source, /\$ExitCode = \$LASTEXITCODE/u);
+    assert.match(source, /exit \$ExitCode/u);
+    assert.match(
+      source,
+      /Node\.js >= 18 is required\. Install Node\.js and rerun this script\./u
+    );
+    assert.doesNotMatch(source, /& \$NodeCommand\.Source/u);
+    assert.doesNotMatch(source, /-CommandType (?:Alias|Function)/u);
+
+    const resolverStart = source.indexOf("function Resolve-NodeExecutable {");
+    const resolverEnd = source.indexOf("\n$ScriptDir", resolverStart);
+    assert.notEqual(resolverStart, -1);
+    assert.notEqual(resolverEnd, -1);
+    nodeResolverBodies.push(source.slice(resolverStart, resolverEnd).trim());
   }
+  assert.equal(nodeResolverBodies[0], nodeResolverBodies[1]);
 });
 
 test("native Windows installer smoke selects one absolute Node application", () => {
