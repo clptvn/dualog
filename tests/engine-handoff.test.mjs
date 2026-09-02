@@ -16,7 +16,10 @@ import {
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const source = (name) =>
-  fs.readFileSync(path.join(REPO_ROOT, "src", name), "utf-8");
+  // Git may materialize source files with CRLF on a native Windows checkout.
+  // These assertions inspect JavaScript structure using LF-delimited source
+  // snippets, so normalize the representation without weakening the checks.
+  fs.readFileSync(path.join(REPO_ROOT, "src", name), "utf-8").replace(/\r\n?/gu, "\n");
 
 const SERVER_SOURCE = source("dialog-server.mjs");
 const INVOCATION_SOURCE = source("partner-invocation.mjs");
@@ -57,8 +60,9 @@ const WSL_ROUTE = Object.freeze({
 test("the preflight runtime decision round-trips exactly and legacy runners remain automatic", () => {
   const decisions = [
     {
-      version: 1,
+      version: 2,
       engine: "headless",
+      partnerCommand: "/usr/local/bin/codex",
       tmuxTransport: null,
       tmuxDistro: null,
       tmuxLauncher: null,
@@ -66,8 +70,9 @@ test("the preflight runtime decision round-trips exactly and legacy runners rema
       tmuxSocketName: null,
     },
     {
-      version: 1,
+      version: 2,
       engine: "tmux-interactive",
+      partnerCommand: "/usr/local/bin/codex",
       tmuxTransport: "local",
       tmuxDistro: null,
       tmuxLauncher: "tmux",
@@ -75,8 +80,9 @@ test("the preflight runtime decision round-trips exactly and legacy runners rema
       tmuxSocketName: "dualog",
     },
     {
-      version: 1,
+      version: 2,
       engine: "tmux-interactive",
+      partnerCommand: "/usr/local/bin/codex",
       tmuxTransport: "wsl",
       tmuxDistro: "Ubuntu 24.04",
       tmuxLauncher: "wsl.exe",
@@ -115,8 +121,9 @@ test("the preflight runtime decision round-trips exactly and legacy runners rema
   assert.throws(
     () =>
       buildRunnerRuntimeArg({
-        version: 1,
+        version: 2,
         engine: "automatic",
+        partnerCommand: "/usr/local/bin/codex",
         tmuxTransport: null,
         tmuxDistro: null,
       }),
@@ -125,13 +132,42 @@ test("the preflight runtime decision round-trips exactly and legacy runners rema
   assert.throws(
     () =>
       buildRunnerRuntimeArg({
-        version: 1,
+        version: 2,
         engine: "tmux-interactive",
+        partnerCommand: "codex",
         tmuxTransport: "wsl",
         tmuxDistro: null,
       }),
     /must pin a distribution/u
   );
+  assert.throws(
+    () =>
+      buildRunnerRuntimeArg({
+        version: 2,
+        engine: "tmux-interactive",
+        partnerCommand: "codex",
+        tmuxTransport: "wsl",
+        tmuxDistro: "Ubuntu",
+        tmuxLauncher: "wsl.exe",
+        tmuxControlBinary: "tmux",
+        tmuxSocketName: "dualog",
+      }),
+    /absolute Linux partner command/u
+  );
+  for (const unsafeCommand of ["codex", "\\tools\\codex.cmd"]) {
+    assert.throws(
+      () =>
+        buildRunnerRuntimeArg({
+          version: 2,
+          engine: "headless",
+          partnerCommand: unsafeCommand,
+          tmuxTransport: null,
+          tmuxDistro: null,
+        }),
+      /absolute partner command/u,
+      "local and headless runners require a fully-qualified command"
+    );
+  }
   assert.throws(
     () =>
       readRunnerRuntimeDecision([
@@ -212,15 +248,16 @@ test("an automatic Windows fallback becomes the actual pinned runner engine", as
     "dialog-runner.mjs",
     buildRunnerTokenArg("real"),
     buildRunnerRuntimeArg({
-      version: 1,
+      version: 2,
       engine: preflightEngine,
+      partnerCommand: "C:\\Trusted\\Codex\\codex.cmd",
       tmuxTransport: null,
       tmuxDistro: null,
     }),
   ]);
   const runtimeContext = await resolvePartnerRuntimeContext({
     partnerAgent: "codex",
-    partnerCommand: "codex",
+    partnerCommand: runnerDecision.partnerCommand,
     projectPath: "C:\\work\\dualog",
     requestedEngine: runnerDecision.engine,
     pinnedTmuxTransport: runnerDecision.tmuxTransport,
@@ -322,8 +359,15 @@ test("an inferred WSL UNC distro is pinned across preflight and runner route dri
   const preflight = await resolvePartnerRuntimeContext(
     { partnerAgent: "codex", partnerCommand: "codex", projectPath },
     {
+      platform: "win32",
       tmuxRouteFn: () => ({ ...WSL_ROUTE }),
       resolveWslLoginShellFn: async () => "/bin/bash",
+      resolveWslPartnerExecutableFn: async (command, { projectPath, route }) => {
+        assert.equal(command, "codex");
+        assert.equal(projectPath, "/home/test/dualog");
+        assert.equal(route.distro, "Ubuntu");
+        return "/usr/local/bin/codex";
+      },
       resolveRunnableEngineFn: async (_adapter, options) => {
         assert.equal(options.tmuxRouteFn().distro, "Ubuntu");
         return "tmux-interactive";
@@ -332,8 +376,9 @@ test("an inferred WSL UNC distro is pinned across preflight and runner route dri
     }
   );
   const decision = {
-    version: 1,
+    version: 2,
     engine: preflight.engine,
+    partnerCommand: preflight.partnerCommand,
     tmuxTransport: preflight.tmuxTransport,
     tmuxDistro: preflight.tmuxDistro,
     tmuxLauncher: preflight.tmuxLauncher,
@@ -341,8 +386,9 @@ test("an inferred WSL UNC distro is pinned across preflight and runner route dri
     tmuxSocketName: preflight.tmuxSocketName,
   };
   assert.deepEqual(decision, {
-    version: 1,
+    version: 2,
     engine: "tmux-interactive",
+    partnerCommand: "/usr/local/bin/codex",
     tmuxTransport: "wsl",
     tmuxDistro: "Ubuntu",
     tmuxLauncher: "wsl.exe",
@@ -359,7 +405,7 @@ test("an inferred WSL UNC distro is pinned across preflight and runner route dri
   const runner = await resolvePartnerRuntimeContext(
     {
       partnerAgent: "codex",
-      partnerCommand: "codex",
+      partnerCommand: runnerDecision.partnerCommand,
       projectPath,
       requestedEngine: runnerDecision.engine,
       pinnedTmuxTransport: runnerDecision.tmuxTransport,
@@ -369,12 +415,19 @@ test("an inferred WSL UNC distro is pinned across preflight and runner route dri
       pinnedTmuxSocketName: runnerDecision.tmuxSocketName,
     },
     {
+      platform: "win32",
       // Simulate the default WSL distro changing after the start response. The
       // preflight namespace pin must win before path and availability checks.
       tmuxRouteFn: () => ({ ...WSL_ROUTE, distro: "Debian" }),
       resolveWslLoginShellFn: async (route) => {
         assert.equal(route.distro, "Ubuntu");
         return "/bin/bash";
+      },
+      resolveWslPartnerExecutableFn: async (command, { projectPath, route }) => {
+        assert.equal(command, "/usr/local/bin/codex");
+        assert.equal(projectPath, "/home/test/dualog");
+        assert.equal(route.distro, "Ubuntu");
+        return command;
       },
       resolveRunnableEngineFn: async (_adapter, options) => {
         assert.equal(options.requested, "tmux-interactive");
@@ -390,6 +443,11 @@ test("an inferred WSL UNC distro is pinned across preflight and runner route dri
   assert.equal(runner.tmuxLauncher, decision.tmuxLauncher);
   assert.equal(runner.tmuxControlBinary, decision.tmuxControlBinary);
   assert.equal(runner.tmuxSocketName, decision.tmuxSocketName);
+  assert.equal(
+    runner.partnerCommand,
+    "/usr/local/bin/codex",
+    "WSL keeps the exact executable pinned in the selected Linux namespace"
+  );
 
   await assert.rejects(
     resolvePartnerRuntimeContext(
@@ -455,6 +513,28 @@ test("all three start tools persist, report, and pass one engine selection", () 
   assert.match(preflightRegion, /resolvePartnerRuntimeContext\(\{/u);
   assert.match(preflightRegion, /projectPath: projectPath \|\| process\.cwd\(\),/u);
   assert.match(preflightRegion, /tmuxRoute: runtimeContext\.tmuxRoute,/u);
+  assert.match(preflightRegion, /partnerCommand: preflightPartnerCommand,/u);
+  assert.ok(
+    preflightRegion.indexOf("findBinary(requestedPartnerCommand, process.env") <
+      preflightRegion.indexOf("resolveDiscoveryForValidation"),
+    "the local executable must be pinned before process-backed discovery"
+  );
+  assert.match(
+    preflightRegion,
+    /excludedRoots: \[projectPath \|\| process\.cwd\(\)\]/u,
+    "preflight must not resolve a partner executable from the reviewed project"
+  );
+
+  assert.match(
+    INVOCATION_SOURCE,
+    /findBinary\(partnerCommand, process\.env, \{\s*excludedRoots: \[projectPath\]/u,
+    "the runtime fallback must not re-resolve a partner executable from the reviewed project"
+  );
+  assert.match(
+    source("engines/headless.mjs"),
+    /findBinary\(\s*partnerCommand \|\| adapter\?\.binary\?\.default,\s*process\.env,\s*\{ excludedRoots: \[projectPath\] \}/u,
+    "the headless fallback must not re-resolve a partner executable from the reviewed project"
+  );
 
   const startRegions = {
     dialog: between(SERVER_SOURCE, 'server.tool(\n  "start_dialog"', "// ── Code Review Tools"),
@@ -463,6 +543,11 @@ test("all three start tools persist, report, and pass one engine selection", () 
   };
 
   for (const [name, region] of Object.entries(startRegions)) {
+    assert.equal(
+      (region.match(/partnerCommand = preflight\.partnerCommand;/gu) ?? []).length,
+      1,
+      `${name} must replace the requested name with the preflight-pinned command`
+    );
     assert.equal(
       (region.match(/buildRunnerRuntimeArg\(preflight\.runtimeDecision\)/gu) ?? []).length,
       1,
@@ -493,6 +578,11 @@ test("all three start tools persist, report, and pass one engine selection", () 
       /const PREFLIGHT_RUNTIME = readRunnerRuntimeDecision\(\);/u,
       `${name} reads the runtime pin`
     );
+    assert.match(
+      runnerSource,
+      /PREFLIGHT_RUNTIME\?\.partnerCommand \?\? positionalPartnerCommand/u,
+      `${name} must execute the frozen partner command`
+    );
     const contexts = objectCallBlocks(runnerSource, "resolvePartnerRuntimeContext");
     assert.equal(contexts.length, 1, `${name} must make one runtime decision`);
     assert.match(contexts[0], /requestedEngine: PREFLIGHT_ENGINE,/u);
@@ -518,5 +608,48 @@ test("all three start tools persist, report, and pass one engine selection", () 
     INVOCATION_SOURCE,
     /buildInvocationFromAdapter\(adapter,\s*\{\s*engine: selectedRuntimeContext\.engine,/u,
     "the interactive turn must select argv with its pinned engine"
+  );
+});
+
+test("check_adapter uses the project-aware runtime decision and its pinned WSL command", () => {
+  const checkRegion = between(
+    SERVER_SOURCE,
+    'server.tool(\n  "check_adapter"',
+    'server.tool(\n  "list_sessions"'
+  );
+
+  assert.doesNotMatch(
+    checkRegion,
+    /resolveRunnableEngine\(/u,
+    "check_adapter must not run the engine's bare WSL partner probe"
+  );
+  assert.match(checkRegion, /const projectPath = process\.cwd\(\);/u);
+  assert.match(
+    checkRegion,
+    /runtimeContext = await resolvePartnerRuntimeContext\(\{[\s\S]*?partnerCommand: requestedPartnerCommand,[\s\S]*?projectPath,[\s\S]*?requestedEngine: engine \?\? null,/u
+  );
+  assert.match(
+    checkRegion,
+    /resolvedEngine === "tmux-interactive" && runtimeContext\.tmuxTransport === "wsl"/u,
+    "binary validation must use the frozen namespace decision"
+  );
+  assert.match(
+    checkRegion,
+    /partnerCommand: resolvedPartnerCommand,[\s\S]*?tmuxRoute: runtimeContext\.tmuxRoute,/u,
+    "discovery must receive the exact command and distribution already validated"
+  );
+  assert.match(
+    checkRegion,
+    /negotiate\(adapter, \{[\s\S]*?partnerCommand: resolvedPartnerCommand,[\s\S]*?requireBinary,/u
+  );
+  assert.match(
+    checkRegion,
+    /describeAdapter\(adapter, \{[\s\S]*?projectPath,[\s\S]*?tmuxRouteFn: \(\) => runtimeContext\.tmuxRoute/u,
+    "the status probe must stay in the selected WSL distribution"
+  );
+  assert.match(
+    checkRegion,
+    /pinnedWslRuntime: \{[\s\S]*?partnerCommand: runtimeContext\.partnerCommand,[\s\S]*?tmuxDistro: runtimeContext\.tmuxDistro,[\s\S]*?tmuxRoute: runtimeContext\.tmuxRoute,/u,
+    "status must report the exact frozen WSL executable instead of a coexisting native CLI"
   );
 });

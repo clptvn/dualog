@@ -18,11 +18,34 @@ import { releaseLease, transitionLease } from "../runtime-lease.mjs";
 import { processStartTime } from "../process-probe.mjs";
 import { readCompletion } from "./completion.mjs";
 import { resolveDiscoveryForValidation } from "../adapters/resolve-for-validation.mjs";
+import { findBinary } from "../adapters/negotiate.mjs";
 import { isProcessAlive } from "../shared.mjs";
 import { readProcessCommandLine } from "../runner-lifecycle.mjs";
-import { terminateWindowsProcessTree } from "../windows-process-tree.mjs";
+import {
+  spawnWithTrustedWindowsComSpec,
+  terminateWindowsProcessTree,
+} from "../windows-process-tree.mjs";
 
 export { terminateWindowsProcessTree } from "../windows-process-tree.mjs";
+
+export function spawnHeadlessPartner(
+  command,
+  args,
+  options,
+  {
+    platform = process.platform,
+    spawnImpl = crossSpawn,
+    systemEnv = process.env,
+  } = {}
+) {
+  return spawnWithTrustedWindowsComSpec(
+    spawnImpl,
+    command,
+    args,
+    options,
+    { platform, env: systemEnv }
+  );
+}
 
 export class HeadlessTurnError extends Error {
   constructor(message, outcome) {
@@ -396,6 +419,18 @@ async function runHeadlessTurnInner(
   },
   lifecycle
 ) {
+  const resolvedPartnerCommand = findBinary(
+    partnerCommand || adapter?.binary?.default,
+    process.env,
+    { excludedRoots: [projectPath] }
+  );
+  if (!resolvedPartnerCommand) {
+    throw new HeadlessTurnError(
+      `Partner command ${JSON.stringify(partnerCommand || adapter?.binary?.default)} is not an executable absolute path or on an absolute PATH entry`,
+      "died"
+    );
+  }
+
   // Self-heal before adding another child. A record still on disk belongs to a
   // turn that never finished, and by definition it is over now -- a session runs
   // one partner turn at a time. This is what closes the SIGKILL gap in practice:
@@ -414,6 +449,7 @@ async function runHeadlessTurnInner(
     model,
     projectPath,
     engine: "headless",
+    partnerCommand: resolvedPartnerCommand,
     log,
   });
 
@@ -423,7 +459,7 @@ async function runHeadlessTurnInner(
   if (lease) transitionLease(lease, "projecting");
   const { command, args, env, notices } = buildInvocationFromAdapter(adapter, {
     engine: "headless",
-    partnerCommand,
+    partnerCommand: resolvedPartnerCommand,
     projectPath,
     sessionDir,
     scratchDir: lease?.dir ?? null,
@@ -486,11 +522,18 @@ async function runHeadlessTurnInner(
     }
     throw err;
   }
+
+  // Persist the child's provisional identity first, then capture its OS-owned
+  // birth identity exactly once and atomically enrich that breadcrumb. On
+  // native Windows the capture is a synchronous CIM query: a SIGKILL during it
+  // must leave pid/command evidence rather than no durable handle at all.
+  const childStartTime = persistHeadlessChildRecord(turnDir, child, command);
+
   function spawnPartner() {
     // cross-spawn preserves child_process.spawn semantics on POSIX while also
     // resolving npm-installed .cmd shims on native Windows. Using Node's raw
     // spawn() there makes a valid `claude.cmd` or `codex.cmd` look missing.
-    return crossSpawn(command, args, {
+    return spawnHeadlessPartner(command, args, {
       cwd: projectPath,
       env: { ...process.env, ...env },
       stdio: ["pipe", "pipe", "pipe"],
@@ -512,7 +555,7 @@ async function runHeadlessTurnInner(
         kind: "headless",
         pid: child.pid,
         pgid: process.platform === "win32" ? null : child.pid,
-        started_at: child.pid ? processStartTime(child.pid) : null,
+        started_at: childStartTime,
         // Persist a conservative baseline before any cancellation is possible.
         // If a later `pending`/`failed` write itself fails, this older record
         // still retains once the wrapper disappears rather than authorizing a
@@ -574,10 +617,6 @@ async function runHeadlessTurnInner(
     // only thing that could still find them.
     clearChildRecordIfGroupGone(turnDir, child);
   });
-  // Leave a breadcrumb a later sweep can act on: SIGKILL gives this process no
-  // chance to clean up, and without a persisted identity the child is invisible.
-  writeChildRecord(turnDir, child, command);
-
   const stdoutBuffer = createBoundedOutput();
   const stderrBuffer = createBoundedOutput();
   child.stdout.setEncoding("utf-8");
@@ -828,68 +867,81 @@ function kill(
   return null;
 }
 
-function writeChildRecord(turnDir, child, command) {
+export function persistHeadlessChildRecord(
+  turnDir,
+  child,
+  command,
+  {
+    platform = process.platform,
+    processStartTimeFn = processStartTime,
+    nowFn = () => new Date().toISOString(),
+  } = {}
+) {
+  const recordPath = path.join(turnDir, "headless-child.json");
+  let provisionalRecord = null;
+  let provisionalWritten = false;
+
   try {
-    fs.writeFileSync(
-      path.join(turnDir, "headless-child.json"),
-      JSON.stringify(
-        {
-          pid: child.pid,
-          // Detached children lead a group of the same id; recorded explicitly
-          // so a sweeper does not have to infer the convention.
-          pgid: process.platform === "win32" ? null : child.pid,
-          // The executable, kept for diagnostics and as a weak cross-check.
-          // NOT sufficient on its own to authorize a kill: matching "node" or
-          // "opencode" proves only that the recycled PID is running the same
-          // program, not that it is this turn's process.
-          command,
-          // What distinguishes one PID N from the next -- imperfectly, and the
-          // imperfection is worth naming.
-          //
-          // This is `ps -o lstart=`, which formats to SECONDS. Two processes
-          // spawned milliseconds apart report identical values (verified), so a
-          // (pid, start time) pair is not mathematically unique and the earlier
-          // comment claiming it was overstated the data. What the pair rules out
-          // is a stale record colliding with an arbitrary future process:
-          // because lstart carries the full date, the old leader must die AND
-          // PID N be reassigned to a new leader BEFORE the original birth second
-          // elapses. Once the clock ticks over, no later reuse can compare equal.
-          //
-          // The residual is that one-second window. macOS exposes microseconds
-          // only through proc_pidinfo(PROC_PIDTBSDINFO); no unprivileged stock
-          // command prints them (`launchctl procinfo` needs root, `lsappinfo`
-          // covers LaunchServices apps only), so closing it means a native addon
-          // or FFI -- not worth the packaging surface for best-effort local
-          // orphan cleanup.
-          start_time: readProcessStartTime(child.pid),
-          started_at: new Date().toISOString(),
-        },
-        null,
-        2
-      )
-    );
+    provisionalRecord = {
+      pid: child.pid,
+      // Detached children lead a group of the same id; recorded explicitly so
+      // a sweeper does not have to infer the convention.
+      pgid: platform === "win32" ? null : child.pid,
+      // Diagnostic and negative cross-check only. Without start_time this can
+      // never authorize a kill, because a recycled pid may run the same command.
+      command,
+      started_at: nowFn(),
+    };
+    writeHeadlessChildRecordAtomic(recordPath, provisionalRecord);
+    provisionalWritten = true;
   } catch {
     // Best-effort breadcrumb; a turn must not fail because it could not be left.
   }
+
+  let startTime = null;
+  if (Number.isSafeInteger(child?.pid) && child.pid > 0) {
+    try {
+      const captured = processStartTimeFn(child.pid);
+      startTime = typeof captured === "string" && captured ? captured : null;
+    } catch {
+      // An unreadable identity remains null and therefore cannot authorize a
+      // later kill. Still persist the breadcrumb so a sweep retains evidence.
+    }
+  }
+
+  if (startTime && provisionalWritten) {
+    try {
+      // What distinguishes one PID N from the next -- imperfectly on POSIX,
+      // where `ps -o lstart=` formats to seconds, but precisely on native
+      // Windows where CIM CreationDate is invariant UTC .NET ticks. Replace the
+      // complete provisional JSON atomically so a crash sees either safe form,
+      // never a truncated identity that could authorize the wrong process.
+      writeHeadlessChildRecordAtomic(recordPath, {
+        ...provisionalRecord,
+        start_time: startTime,
+      });
+    } catch {
+      // Retain the provisional record. It cannot authorize a kill, but it keeps
+      // the child visible for later diagnosis/reconciliation.
+    }
+  }
+  return startTime;
 }
 
-/**
- * The OS's start timestamp for a PID, as an opaque string, or null.
- *
- * Opaque on purpose: it is only ever compared for equality against a value read
- * the same way on the same machine, so its format does not need parsing.
- */
-function readProcessStartTime(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+let headlessChildRecordWriteSequence = 0;
+
+function writeHeadlessChildRecordAtomic(recordPath, record) {
+  const tmpPath =
+    `${recordPath}.${process.pid}.${Date.now()}.` +
+    `${headlessChildRecordWriteSequence++}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(record, null, 2), { flag: "wx" });
   try {
-    if (process.platform === "win32") return null;
-    const out = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
-      encoding: "utf-8",
-      timeout: 5000,
-    });
-    return out.trim() || null;
-  } catch {
-    return null;
+    fs.renameSync(tmpPath, recordPath);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {}
+    throw err;
   }
 }
 
@@ -914,8 +966,8 @@ function identifyRecordedLeader(record) {
 
   // Strongest available signal: PID plus OS start time.
   if (record.start_time) {
-    const current = readProcessStartTime(pid);
-    if (!current) return "unknown"; // ps unavailable or denied
+    const current = processStartTime(pid);
+    if (!current) return "unknown"; // the OS identity probe is unavailable or denied
     if (current !== record.start_time) return "not-ours";
 
     // A start-time match is the authorization. The command line is consulted
@@ -1086,7 +1138,7 @@ function identifyRecordedProcess(record) {
 /**
  * Terminate any headless partner process this session recorded and never reaped.
  *
- * A record only survives a turn that did not finish: writeChildRecord() is
+ * A record only survives a turn that did not finish: persistHeadlessChildRecord() is
  * cleared on every normal exit, and the runner's signal handlers call
  * terminateActiveHeadlessTurnsAndWait() on SIGTERM/SIGINT. What is left is the SIGKILL
  * case -- no handler runs, and the child is left with no handle anywhere -- plus

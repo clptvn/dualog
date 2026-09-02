@@ -440,6 +440,6 @@ test("an unreadable cache is a miss, not a crash", async () => {
 
 test("the cache lives in the app's own directory, not a session's", () => {
   const cachePath = catalogCachePath("/Users/fixture");
-  assert.equal(cachePath, "/Users/fixture/.dualog/cache/models-dev.json");
+  assert.equal(cachePath, path.join("/Users/fixture", ".dualog", "cache", "models-dev.json"));
   assert.ok(!cachePath.includes("sessions"), "the catalog is global, not per-session");
 });

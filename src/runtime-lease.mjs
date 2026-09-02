@@ -53,9 +53,16 @@ import {
   runtimeDir,
   sleepSync,
 } from "./platform.mjs";
-import { probeGroup, probeProcess, probeRecordedProcess } from "./process-probe.mjs";
-import { probeDirectoryInUse } from "./directory-usage.mjs";
+import {
+  isValidDotNetTicks,
+  processStartTime,
+  probeGroup,
+  probeProcess,
+  probeRecordedProcess,
+} from "./process-probe.mjs";
+import { probeDirectoryUsageEvidence } from "./directory-usage.mjs";
 import { probeTmuxSessionSync, probeWslPaneProcess } from "./tmux-runtime.mjs";
+import { resolveWindowsSystem32Executable } from "./windows-process-tree.mjs";
 
 const LEASE_SCHEMA_VERSION = 1;
 /**
@@ -121,6 +128,21 @@ export const LEASE_STATES = [
  */
 const IMPRECISE_BOOT_TOLERANCE_SECONDS = 3600;
 
+// Native Windows does not expose Linux's boot UUID, but CIM does expose the
+// operating system's kernel-recorded LastBootUpTime. Keep the executable and
+// argv fixed: this is deletion authority, so no lease/user value may ever be
+// interpolated into the PowerShell program. The result stays a string because
+// .NET ticks exceed JavaScript's safe integer range.
+const WINDOWS_BOOT_TIME_SCRIPT = [
+  "$PSModuleAutoloadingPreference = 'None';",
+  "$cimModule = [IO.Path]::Combine($PSHOME, 'Modules', 'CimCmdlets', 'CimCmdlets.psd1');",
+  "Microsoft.PowerShell.Core\\Import-Module -Name $cimModule -Force -ErrorAction Stop;",
+  "$os = CimCmdlets\\Get-CimInstance -ClassName Win32_OperatingSystem -Property LastBootUpTime -ErrorAction Stop;",
+  "$boot = $os.LastBootUpTime;",
+  "if ($null -eq $boot) { exit 1 };",
+  "[Console]::Out.Write($boot.ToUniversalTime().Ticks.ToString([Globalization.CultureInfo]::InvariantCulture))",
+].join(" ");
+
 /**
  * How long to let a killed tmux client's queued work land before believing
  * "no pane exists". The tmux server is a separate process from the client we
@@ -162,24 +184,64 @@ function computeBootIdentity() {
     }
   } catch {}
 
-  // Linux: a real per-boot UUID, exact by construction.
-  try {
-    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf-8").trim();
-    if (bootId) return { host, id: bootId, bootedAtEpoch, source: "boot-id", precise: true };
-  } catch {}
-
-  // macOS/BSD: the kernel's own boot timestamp, to the microsecond.
-  try {
-    const out = execFileSync("sysctl", ["-n", "kern.boottime"], {
-      encoding: "utf-8",
-      timeout: 2000,
-      stdio: ["ignore", "pipe", "ignore"],
+  if (process.platform === "linux") {
+    // Linux: a real per-boot UUID, exact by construction.
+    try {
+      const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf-8").trim();
+      if (bootId) return { host, id: bootId, bootedAtEpoch, source: "boot-id", precise: true };
+    } catch {}
+  } else if (["darwin", "freebsd", "openbsd", "netbsd"].includes(process.platform)) {
+    // macOS/BSD: the kernel's own boot timestamp, to the microsecond.
+    try {
+      const out = execFileSync("sysctl", ["-n", "kern.boottime"], {
+        encoding: "utf-8",
+        timeout: 2000,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const sec = /sec\s*=\s*(\d+)/.exec(out);
+      if (sec) {
+        return {
+          host,
+          id: `kern.boottime:${sec[1]}`,
+          bootedAtEpoch,
+          source: "kern.boottime",
+          precise: true,
+        };
+      }
+    } catch {}
+  } else if (process.platform === "win32") {
+    // Windows PowerShell is present on the supported desktop Windows releases.
+    // Resolve it under SystemRoot instead of PATH so a working-directory/PATH
+    // shim cannot manufacture the identity that authorizes cleanup.
+    const powershell = resolveWindowsSystem32Executable("powershell.exe", {
+      subdirectories: ["WindowsPowerShell", "v1.0"],
     });
-    const sec = /sec\s*=\s*(\d+)/.exec(out);
-    if (sec) {
-      return { host, id: `kern.boottime:${sec[1]}`, bootedAtEpoch, source: "kern.boottime", precise: true };
+    if (powershell) {
+      try {
+        const out = execFileSync(
+          powershell,
+          ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_BOOT_TIME_SCRIPT],
+          {
+            encoding: "utf-8",
+            timeout: 5000,
+            maxBuffer: 4096,
+            shell: false,
+            windowsHide: true,
+            stdio: ["ignore", "pipe", "ignore"],
+          }
+        );
+        if (isValidDotNetTicks(out)) {
+          return {
+            host,
+            id: `win32.last-boot-up-time:${out}`,
+            bootedAtEpoch,
+            source: "win32.last-boot-up-time",
+            precise: true,
+          };
+        }
+      } catch {}
     }
-  } catch {}
+  }
 
   // Fallback: derived from the wall clock, so NOT precise. Both calls can THROW
   // rather than return something unusable -- a restricted host raises
@@ -489,6 +551,11 @@ export function proveLeaseReleasable(meta, { now = Date.now(), dir = null } = {}
   // boot identity cannot be established. Falling through fixes that.
   const consumer = hasUsableIdentity(meta.consumer) ? meta.consumer : null;
   if (consumer) {
+    // A precise previous boot supersedes every PID/session observation. Nothing
+    // from that boot survived; an `alive` PID or same-named session now belongs
+    // to a different process generation. The final directory boundary remains
+    // strict on POSIX and requires the durable Windows lifecycle capability.
+    if (isSameBoot(meta.boot) === false) return releasable();
     const verdict = probeConsumer(consumer);
     if (verdict === "alive") return keep("the lease's consumer is still running");
     if (verdict !== "absent") {
@@ -588,10 +655,121 @@ function hasUsableIdentity(consumer) {
   return false;
 }
 
+/**
+ * Is an `absent` consumer verdict strong enough to relax ONLY the classified
+ * incomplete directory evidence under the documented lifecycle contract?
+ *
+ * A legacy tmux record with only a session name is deliberately excluded: pane
+ * absence never proved the CLI process exited. The tmux probe must have checked
+ * an exact persisted route and an actual pane PID; a POSIX headless probe must
+ * have checked both its recorded PID and process group. Native Windows cannot
+ * enumerate handles portably, so it additionally requires an explicit observed
+ * wrapper exit or successful taskkill tree result. The caller still has to
+ * obtain `absent` from probeConsumer immediately before using this shape check.
+ */
+function consumerSupportsRelaxedAbsence(consumer, platform = process.platform) {
+  if (!consumer || typeof consumer !== "object") return false;
+  if (consumer.kind === "tmux") {
+    return Number.isSafeInteger(consumer.pane_pid) && consumer.pane_pid > 0;
+  }
+  if (consumer.kind === "headless" && platform === "win32") {
+    return (
+      Number.isSafeInteger(consumer.pid) &&
+      consumer.pid > 0 &&
+      ["succeeded", "wrapper-exit-observed"].includes(consumer.windows_tree_termination)
+    );
+  }
+  if (consumer.kind === "headless") {
+    return (
+      Number.isSafeInteger(consumer.pid) &&
+      consumer.pid > 0 &&
+      Number.isSafeInteger(consumer.pgid) &&
+      consumer.pgid > 0
+    );
+  }
+  return false;
+}
+
+function metadataAfterLifecycleProof(meta) {
+  if (["allocated", "projecting", "ready"].includes(meta?.state)) {
+    return { ...meta, consumer_never_created: true };
+  }
+  return meta;
+}
+
+function releasedFromPreviousBoot(meta) {
+  return (
+    ["spawning", "active"].includes(meta?.released_from_state) &&
+    isSameBoot(meta.boot) === false
+  );
+}
+
+function currentStateFromPreviousBoot(meta) {
+  return ["spawning", "active"].includes(meta?.state) && isSameBoot(meta.boot) === false;
+}
+
+function recordMayAuthorizeRelaxation(dir, record) {
+  const resolved = path.resolve(dir);
+  return (
+    record?.state === "valid" &&
+    record.metaPath === metaPathFor(resolved) &&
+    record.value?.schema_version === LEASE_SCHEMA_VERSION &&
+    record.value?.lease_id === path.basename(resolved)
+  );
+}
+
+/**
+ * Non-mutating counterpart of the durable released-tombstone authorization.
+ * Used by sweep dry-run so it reports the same lifecycle and directory verdict
+ * that apply will persist and independently reproduce before deletion.
+ */
+function prospectiveLeaseRemovalVerdict(dir, record) {
+  const meta = record?.value;
+  const lifecycle = proveLeaseReleasable(meta);
+  if (!lifecycle.removable) return lifecycle;
+
+  const releaseMeta = metadataAfterLifecycleProof(meta);
+  // The lifecycle proof above has just established absence. Its shape decides
+  // only whether the classified same-UID permission hole may be ignored; it is
+  // never a substitute for the final directory scan below. Previous-boot and
+  // other conservative lifecycle proofs remain useful when that scan is
+  // strictly `free`, even though they cannot relax an ambiguity.
+  const allowSameUidPermissionOnly =
+    recordMayAuthorizeRelaxation(dir, record) &&
+    releaseMeta?.release_relaxation_eligible !== false &&
+    isSameBoot(releaseMeta?.boot) !== false &&
+    (releaseMeta?.consumer_never_created === true ||
+      consumerSupportsRelaxedAbsence(releaseMeta?.consumer));
+
+  // Windows has no portable handle scan. It may interpret that platform-level
+  // unknown only from a current-schema sibling record for this exact lease and
+  // one of the same durable lifecycle proofs above (or a precise reboot). The
+  // strict public removal function never receives this capability.
+  const allowWindowsLifecycleProof =
+    process.platform === "win32" &&
+    recordMayAuthorizeRelaxation(dir, record) &&
+    releaseMeta?.release_relaxation_eligible !== false &&
+    (currentStateFromPreviousBoot(releaseMeta) ||
+      releaseMeta?.consumer_never_created === true ||
+      consumerSupportsRelaxedAbsence(releaseMeta?.consumer));
+
+  const usage = directoryReleaseVerdict(dir, {
+    allowSameUidPermissionOnly,
+    allowWindowsLifecycleProof,
+  });
+  return usage.ok
+    ? { removable: true, reason: null, releaseMeta }
+    : { removable: false, reason: usage.reason };
+}
+
 function probeOwner(meta) {
+  // A process from a precise previous boot cannot still be alive. If its PID is
+  // occupied now, that is a different generation and must not retain the lease
+  // forever merely because older owner records had no start-time field.
+  if (isSameBoot(meta.boot) === false) return "absent";
   if (meta.runner_pid == null) {
     // No owner recorded. If it belongs to a previous boot nothing of it survives.
-    return isSameBoot(meta.boot) === false ? "absent" : "unknown";
+    return "unknown";
   }
   const verdict = probeProcess(meta.runner_pid);
   if (verdict === "invalid") return "unknown";
@@ -750,16 +928,542 @@ function probeConsumer(consumer) {
  * failed-spawn shortcut, the released-tombstone branch). Reproduced before it
  * was fixed. `free` is now required everywhere.
  */
-function directoryReleaseVerdict(dir) {
-  const usage = probeDirectoryInUse(dir);
-  if (usage === "free") return { ok: true, reason: null };
-  if (usage === "in-use") return { ok: false, reason: "a process still has this directory open" };
-  // Windows cannot enumerate handles without native code, but it enforces this
-  // in the platform: removing a directory any process has open FAILS there, and
-  // the rmSync below does not force past that. Everywhere else, unanswerable
-  // means retained.
-  if (process.platform === "win32") return { ok: true, reason: null };
+function directoryReleaseVerdict(
+  dir,
+  { allowSameUidPermissionOnly = false, allowWindowsLifecycleProof = false } = {}
+) {
+  const evidence = probeDirectoryUsageEvidence(dir);
+  if (evidence.verdict === "free") return { ok: true, reason: null };
+  if (evidence.verdict === "in-use") {
+    return { ok: false, reason: "a process still has this directory open" };
+  }
+  if (
+    allowSameUidPermissionOnly &&
+    evidence.verdict === "unknown" &&
+    evidence.ambiguity === "same-uid-permission-only"
+  ) {
+    return { ok: true, reason: null };
+  }
+  if (
+    allowWindowsLifecycleProof &&
+    process.platform === "win32" &&
+    evidence.verdict === "unknown"
+  ) {
+    return { ok: true, reason: null };
+  }
   return { ok: false, reason: "whether this directory is in use could not be determined" };
+}
+
+/**
+ * Re-read a durable released tombstone and independently reproduce the proof
+ * that authorizes the narrow Linux ambiguity. Nothing supplied by an earlier
+ * caller survives this boundary as authority.
+ */
+function releasedLeaseRemovalVerdict(dir) {
+  const record = readLeaseRecord(dir);
+  if (record.state !== "valid") {
+    return {
+      ok: false,
+      reason: record.reason ?? `lease metadata is ${record.state}`,
+    };
+  }
+  const meta = record.value;
+  if (meta.state !== "released") {
+    return { ok: false, reason: "the lease has no durable released tombstone" };
+  }
+
+  // A strict-only quarantine is the recoverable form of the public deletion
+  // path. It carries no lifecycle capability at all: it may advance only when
+  // the ordinary platform usage probe says `free`. Keeping this case in the
+  // same sibling-record boundary makes a crash after the namespace rename
+  // recoverable without upgrading an untrusted caller into durable authority.
+  if (meta.strict_usage_only === true || meta.quarantine_strict_usage_only === true) {
+    const exactRecord = recordMayAuthorizeRelaxation(dir, record);
+    const validCanonicalMarker =
+      meta.strict_canonical_generation === true && meta.release_generation === meta.lease_id;
+    const validQuarantineMarker =
+      meta.quarantine_generation === true &&
+      isValidLeaseId(meta.quarantined_from) &&
+      isValidLeaseId(meta.release_generation);
+    if (!exactRecord || (!validCanonicalMarker && !validQuarantineMarker)) {
+      return { ok: false, reason: "the strict generation record is not attributable" };
+    }
+    return directoryReleaseVerdict(dir);
+  }
+
+  // This is the independent deletion-boundary re-proof. A tombstone preserves
+  // the state it was released from because `released` alone otherwise erases the
+  // previous-boot fact that authorized an identity-less spawning record or an
+  // unprobeable Windows process tree. That alternate never relaxes directory
+  // evidence; it only permits the strict platform check below to decide.
+  const lifecycle = proveLeaseReleasable(meta);
+  const previousBootLifecycle = releasedFromPreviousBoot(meta);
+  if (!lifecycle.removable && !previousBootLifecycle) {
+    return { ok: false, reason: lifecycle.reason };
+  }
+
+  // Only a current-schema sibling whose id names this exact directory can grant
+  // the narrow relaxation. A legacy in-directory record or mismatched record can
+  // still be removed on a strict `free` scan, but never on incomplete evidence.
+  const trustedForRelaxation = recordMayAuthorizeRelaxation(dir, record);
+  const allowSameUidPermissionOnly =
+    trustedForRelaxation &&
+    meta.release_relaxation_eligible !== false &&
+    lifecycle.removable &&
+    isSameBoot(meta.boot) !== false &&
+    (meta.consumer_never_created === true || consumerSupportsRelaxedAbsence(meta.consumer));
+
+  const allowWindowsLifecycleProof =
+    process.platform === "win32" &&
+    trustedForRelaxation &&
+    meta.release_relaxation_eligible !== false &&
+    (previousBootLifecycle ||
+      (lifecycle.removable &&
+        (meta.consumer_never_created === true || consumerSupportsRelaxedAbsence(meta.consumer))));
+
+  return directoryReleaseVerdict(dir, {
+    allowSameUidPermissionOnly,
+    allowWindowsLifecycleProof,
+  });
+}
+
+function quarantineRetentionError(quarantineDir, reason) {
+  const error = new Error(
+    `removeLeaseDirectory: retained the attributable generation at ${quarantineDir}: ${reason}`
+  );
+  error.code = "DUALOG_QUARANTINE_RETAINED";
+  error.quarantineDir = quarantineDir;
+  return error;
+}
+
+function cleanupClaimPathFor(dir) {
+  return `${dir}.cleanup.claim`;
+}
+
+const CLEANUP_CLAIM_FILE = "claim.json";
+const CLEANUP_CLAIM_SCHEMA_VERSION = 1;
+const CLEANUP_CLAIM_ARTIFACT_RE =
+  /^([0-9a-f]{32})\.cleanup\.claim\.(stage|retired|stale)-([0-9a-f]{32})$/u;
+
+function readCleanupClaimAtPath(dir, claimPath) {
+  let stat;
+  try {
+    stat = fs.lstatSync(claimPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { state: "missing", claimPath };
+    return { state: "invalid", claimPath, reason: error.code || error.message };
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    return { state: "invalid", claimPath, reason: "the cleanup claim is not a plain directory" };
+  }
+
+  const record = readJson(path.join(claimPath, CLEANUP_CLAIM_FILE));
+  if (record.state !== "valid") {
+    return {
+      state: "invalid",
+      claimPath,
+      reason: record.reason ?? `cleanup claim metadata is ${record.state}`,
+    };
+  }
+  const value = record.value;
+  if (
+    value.claim_schema_version !== CLEANUP_CLAIM_SCHEMA_VERSION ||
+    value.lease_id !== path.basename(dir) ||
+    !isValidLeaseId(value.token) ||
+    !Number.isSafeInteger(value.owner_pid) ||
+    value.owner_pid <= 0 ||
+    !(value.owner_start_time === null ||
+      (typeof value.owner_start_time === "string" &&
+        value.owner_start_time.length > 0 &&
+        value.owner_start_time.length <= 256)) ||
+    !(value.boot === null || (typeof value.boot === "object" && !Array.isArray(value.boot)))
+  ) {
+    return { state: "invalid", claimPath, reason: "the cleanup claim record is malformed" };
+  }
+  return { state: "valid", claimPath, value };
+}
+
+function readCleanupClaim(dir) {
+  return readCleanupClaimAtPath(dir, cleanupClaimPathFor(dir));
+}
+
+function cleanupClaimTakeoverVerdict(claim) {
+  if (claim?.state !== "valid") {
+    return { takeover: false, reason: claim?.reason ?? "the cleanup claim is unreadable" };
+  }
+  const sameBoot = isSameBoot(claim.value.boot);
+  if (sameBoot === false) {
+    return { takeover: true, reason: "the cleanup owner belongs to a previous boot" };
+  }
+  if (sameBoot !== true) {
+    return { takeover: false, reason: "the cleanup owner's boot cannot be established" };
+  }
+  if (!claim.value.owner_start_time) {
+    return { takeover: false, reason: "the cleanup owner's process generation is unavailable" };
+  }
+  const owner = probeRecordedProcess(claim.value.owner_pid, claim.value.owner_start_time);
+  if (owner === "absent") {
+    return { takeover: true, reason: "the cleanup owner process is absent or was reused" };
+  }
+  if (owner === "alive") {
+    return { takeover: false, reason: "the cleanup owner process is still alive" };
+  }
+  return { takeover: false, reason: `the cleanup owner process could not be probed (${owner})` };
+}
+
+function stageCleanupClaim(dir) {
+  const claimPath = cleanupClaimPathFor(dir);
+  const token = crypto.randomBytes(16).toString("hex");
+  const stagedPath = `${claimPath}.stage-${token}`;
+  fs.mkdirSync(stagedPath, { mode: 0o700 });
+  try {
+    fs.chmodSync(stagedPath, 0o700);
+    writeJsonExclusive(path.join(stagedPath, CLEANUP_CLAIM_FILE), {
+      claim_schema_version: CLEANUP_CLAIM_SCHEMA_VERSION,
+      lease_id: path.basename(dir),
+      token,
+      owner_pid: process.pid,
+      owner_start_time: processStartTime(process.pid),
+      boot: bootIdentity(),
+      claimed_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    // An incomplete STAGED claim is never canonical authority. Keep it for the
+    // artifact sweep to classify; malformed artifacts retain fail-closed.
+    throw error;
+  }
+  return { claimPath, stagedPath, token };
+}
+
+function publishCleanupClaim(dir) {
+  const staged = stageCleanupClaim(dir);
+  try {
+    fs.renameSync(staged.stagedPath, staged.claimPath);
+  } catch (error) {
+    error.cleanupClaimStage = staged;
+    throw error;
+  }
+  return { claimPath: staged.claimPath, token: staged.token };
+}
+
+/**
+ * Serialize the pre-scan -> rename linearization for one canonical pathname.
+ *
+ * Without this claim, two sweepers may both scan generation A, the first moves
+ * A, a late writer creates generation B, and the second then moves/removes B on
+ * its stale scan. The claim records both PID and process generation. A dead or
+ * reused owner may be taken over, while live, unknown, and malformed claims
+ * retain. A precise previous boot also settles ownership.
+ *
+ * TAKEOVER IS AN ATOMIC GENERATION SWITCH. The stale claim directory is renamed
+ * to a permanent destination containing its unguessable token. Because that
+ * destination is non-empty, a competing stale reclaimer cannot later rename a
+ * newly acquired live claim over it: POSIX rename refuses to replace a non-empty
+ * directory. One contender archives the exact stale token; everyone else must
+ * re-read whatever claim now occupies the canonical pathname.
+ */
+function acquireCleanupClaim(dir) {
+  const claimPath = cleanupClaimPathFor(dir);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const existing = readCleanupClaim(dir);
+    if (existing.state === "missing") {
+      try {
+        return publishCleanupClaim(dir);
+      } catch (error) {
+        // Cross-platform rename errors for an occupied destination differ. The
+        // filesystem state, not the errno spelling, tells us whether another
+        // complete canonical claim won publication. A failed unique stage stays
+        // attributable and is later swept only on its recorded owner proof.
+        if (readCleanupClaim(dir).state !== "missing") continue;
+        throw error;
+      }
+    }
+    const takeover = cleanupClaimTakeoverVerdict(existing);
+    if (!takeover.takeover) {
+      throw new Error(
+        `removeLeaseDirectory: another cleanup owns the canonical generation (${claimPath}): ${takeover.reason}`
+      );
+    }
+
+    const archivedPath = `${claimPath}.stale-${existing.value.token}`;
+    try {
+      fs.renameSync(claimPath, archivedPath);
+    } catch (error) {
+      // ENOENT means another contender already moved the stale claim. A
+      // non-empty destination means it moved THIS exact token and now protects
+      // any fresh canonical claim from our stale rename attempt. Re-read.
+      if (["ENOENT", "EEXIST", "ENOTEMPTY"].includes(error?.code)) continue;
+      throw error;
+    }
+  }
+  throw new Error(
+    `removeLeaseDirectory: cleanup claim contention did not settle (${claimPath})`
+  );
+}
+
+function releaseCleanupClaim(claim) {
+  const current = readCleanupClaim(
+    claim.claimPath.slice(0, -".cleanup.claim".length)
+  );
+  if (current.state === "missing") return;
+  if (current.state !== "valid" || current.value.token !== claim.token) {
+    throw new Error("removeLeaseDirectory: refusing to release a cleanup claim owned by another generation");
+  }
+  const retiredPath = `${claim.claimPath}.retired-${claim.token}`;
+  try {
+    fs.renameSync(claim.claimPath, retiredPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  try {
+    fs.rmSync(retiredPath, { recursive: true, force: false });
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+function cleanupClaimArtifact(entryName) {
+  const match = CLEANUP_CLAIM_ARTIFACT_RE.exec(entryName);
+  if (!match) return null;
+  return { leaseId: match[1], kind: match[2], token: match[3] };
+}
+
+/**
+ * Classify and, when authorized, reap an off-canonical claim artifact.
+ *
+ * A staged claim was never authority and a retired claim has already been
+ * atomically removed from the authority pathname. Even so, neither is removed
+ * until its precise boot/process generation proves that its publisher cannot
+ * still publish or finish retirement. Malformed, live, and unprobeable records
+ * retain. Stale takeover archives are permanent synchronization markers: their
+ * non-empty token-specific destinations stop delayed reclaimers from moving a
+ * fresh canonical claim.
+ */
+function sweepCleanupClaimArtifact(root, entry, artifact, { apply }) {
+  const artifactPath = path.join(root, entry.name);
+  if (!entry.isDirectory() || entry.isSymbolicLink()) {
+    return { disposition: "retained", dir: artifactPath, reason: "not a plain directory" };
+  }
+  if (artifact.kind === "stale") {
+    return {
+      disposition: "retained",
+      dir: artifactPath,
+      reason: "permanent stale cleanup-claim generation marker",
+    };
+  }
+
+  const ownerDir = path.join(root, artifact.leaseId);
+  const claim = readCleanupClaimAtPath(ownerDir, artifactPath);
+  if (claim.state !== "valid") {
+    return {
+      disposition: "retained",
+      dir: artifactPath,
+      reason: claim.reason ?? `cleanup claim artifact is ${claim.state}`,
+    };
+  }
+  if (claim.value.token !== artifact.token) {
+    return {
+      disposition: "retained",
+      dir: artifactPath,
+      reason: "the cleanup claim artifact token is mismatched",
+    };
+  }
+  const takeover = cleanupClaimTakeoverVerdict(claim);
+  if (!takeover.takeover) {
+    return { disposition: "retained", dir: artifactPath, reason: takeover.reason };
+  }
+  const reason = `orphaned ${artifact.kind} cleanup-claim artifact`;
+  if (!apply) {
+    return { disposition: "removed", dir: artifactPath, applied: false, reason };
+  }
+  try {
+    // This is already a unique, non-canonical namespace generation. A second
+    // sweeper may win the same dead-owner proof; ENOENT is equivalent success.
+    fs.rmSync(artifactPath, { recursive: true, force: false });
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      return { disposition: "error", path: artifactPath, error: error.message };
+    }
+  }
+  return { disposition: "removed", dir: artifactPath, applied: true, reason };
+}
+
+/**
+ * Give the strict public path a permanent canonical marker before rename.
+ * Production lifecycle cleanup already has its released tombstone. A direct
+ * caller may name an otherwise recordless valid-id directory, so without this
+ * step a writer arriving after the namespace switch would recreate a canonical
+ * path with no sibling attribution at all.
+ */
+function ensureStrictCanonicalAttribution(dir) {
+  const siblingPath = metaPathFor(dir);
+  const existing = readJson(siblingPath);
+  if (existing.state === "valid") {
+    if (
+      existing.value?.schema_version === LEASE_SCHEMA_VERSION &&
+      existing.value?.lease_id === path.basename(dir)
+    ) {
+      return;
+    }
+    throw new Error("removeLeaseDirectory: the canonical lease record is mismatched");
+  }
+  if (existing.state !== "missing") {
+    throw new Error("removeLeaseDirectory: the canonical lease record is unreadable");
+  }
+
+  const id = path.basename(dir);
+  const at = new Date().toISOString();
+  try {
+    writeJsonExclusive(siblingPath, {
+      schema_version: LEASE_SCHEMA_VERSION,
+      lease_id: id,
+      state: "released",
+      released_from_state: "strict-removal",
+      release_generation: id,
+      release_relaxation_eligible: false,
+      strict_usage_only: true,
+      strict_canonical_generation: true,
+      released_at: at,
+      updated_at: at,
+      consumer: null,
+    });
+  } catch (error) {
+    // An exact record that won the exclusive-create race is equally useful.
+    const raced = readJson(siblingPath);
+    if (
+      error?.code === "EEXIST" &&
+      raced.state === "valid" &&
+      raced.value?.schema_version === LEASE_SCHEMA_VERSION &&
+      raced.value?.lease_id === id
+    ) {
+      return;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Reserve a sibling record for one namespace generation before moving it.
+ *
+ * The random id is both an unguessable target name and an exclusive claim: the
+ * record is created with `wx`, before the directory rename. A crash before the
+ * rename costs one small permanent marker. A crash after it leaves the moved
+ * directory fully attributable and sweepable. That conservative leak is much
+ * cheaper than ever producing an unattributable credential directory.
+ */
+function reserveQuarantineGeneration(dir, { durableConsumerProof }) {
+  const sourceId = path.basename(dir);
+  const sourceRecord = durableConsumerProof ? readLeaseRecord(dir) : null;
+  if (
+    durableConsumerProof &&
+    (sourceRecord.state !== "valid" || sourceRecord.value?.state !== "released")
+  ) {
+    throw new Error("removeLeaseDirectory: the released generation changed before quarantine");
+  }
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const quarantineId = crypto.randomBytes(16).toString("hex");
+    const quarantineDir = path.join(path.dirname(dir), quarantineId);
+    const quarantineMetaPath = metaPathFor(quarantineDir);
+    const at = new Date().toISOString();
+    const sourceMeta = durableConsumerProof ? sourceRecord.value : null;
+    const sourceCanKeepRelaxation =
+      sourceMeta != null &&
+      sourceMeta.release_relaxation_eligible !== false &&
+      recordMayAuthorizeRelaxation(dir, sourceRecord);
+    const record = sourceMeta
+      ? {
+          ...sourceMeta,
+          lease_id: quarantineId,
+          state: "released",
+          release_generation: sourceMeta.release_generation ?? sourceId,
+          // Moving a legacy or mismatched source beside a fresh, matching name
+          // must never upgrade it into the private ambiguity capability.
+          release_relaxation_eligible: sourceCanKeepRelaxation,
+          quarantined_from: sourceId,
+          quarantine_generation: true,
+          quarantined_at: at,
+          updated_at: at,
+        }
+      : {
+          schema_version: LEASE_SCHEMA_VERSION,
+          lease_id: quarantineId,
+          state: "released",
+          released_from_state: "strict-removal",
+          release_generation: sourceId,
+          release_relaxation_eligible: false,
+          quarantine_generation: true,
+          strict_usage_only: true,
+          quarantine_strict_usage_only: true,
+          quarantined_from: sourceId,
+          quarantined_at: at,
+          released_at: at,
+          updated_at: at,
+          consumer: null,
+        };
+    try {
+      writeJsonExclusive(quarantineMetaPath, record);
+      return { dir: quarantineDir, metaPath: quarantineMetaPath };
+    } catch (error) {
+      if (error?.code === "EEXIST") continue;
+      throw error;
+    }
+  }
+  throw new Error("removeLeaseDirectory: could not reserve an attributable quarantine generation");
+}
+
+/**
+ * Atomically detach the checked generation from its canonical pathname.
+ *
+ * A writer that opens the canonical path before rename follows the moved inode
+ * and is visible to the post-rename scan. A writer that arrives afterwards can
+ * only create a new canonical generation, which this operation never removes
+ * and the original tombstone still attributes. The moved generation is removed
+ * only after the SAME strict/durable usage rule succeeds against its new path.
+ */
+function removeLeaseGeneration(dir, { durableConsumerProof }) {
+  if (!durableConsumerProof) ensureStrictCanonicalAttribution(dir);
+  const quarantine = reserveQuarantineGeneration(dir, { durableConsumerProof });
+  try {
+    fs.renameSync(dir, quarantine.dir);
+  } catch (error) {
+    // The reserved marker remains. Removing it would recreate the same
+    // absence-to-unlink race that permanent tombstones are designed to close.
+    throw new Error(
+      `removeLeaseDirectory: could not atomically quarantine ${dir} (${error.code || error.message})`
+    );
+  }
+
+  const usage = durableConsumerProof
+    ? releasedLeaseRemovalVerdict(quarantine.dir)
+    : directoryReleaseVerdict(quarantine.dir);
+  if (!usage.ok) throw quarantineRetentionError(quarantine.dir, usage.reason);
+
+  let stat;
+  try {
+    stat = fs.lstatSync(quarantine.dir);
+  } catch (error) {
+    throw quarantineRetentionError(
+      quarantine.dir,
+      `the quarantined generation could not be inspected (${error.code || error.message})`
+    );
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw quarantineRetentionError(
+      quarantine.dir,
+      "the quarantined generation is not a plain directory"
+    );
+  }
+
+  try {
+    fs.rmSync(quarantine.dir, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
+  } catch (error) {
+    throw quarantineRetentionError(
+      quarantine.dir,
+      `the quarantined generation could not be removed (${error.code || error.message})`
+    );
+  }
 }
 
 /**
@@ -769,7 +1473,7 @@ function directoryReleaseVerdict(dir) {
  * lives for the length of a turn, and the thing being deleted is a directory
  * tree in the user's home.
  */
-export function removeLeaseDirectory(dir) {
+function removeLeaseDirectoryChecked(dir, { durableConsumerProof = false } = {}) {
   const resolved = path.resolve(dir);
   const id = path.basename(resolved);
   if (path.dirname(resolved) !== path.resolve(runtimeDir())) {
@@ -788,24 +1492,51 @@ export function removeLeaseDirectory(dir) {
   if (!isValidLeaseId(id)) {
     throw new Error(`removeLeaseDirectory: ${JSON.stringify(id)} is not a lease id`);
   }
-  // THE LAST GUARD, at the one place every deletion goes through. Callers check
-  // this too, for a legible receipt; this is what makes it unskippable.
-  const usage = directoryReleaseVerdict(resolved);
-  if (!usage.ok) {
-    throw new Error(`removeLeaseDirectory: refusing to remove ${resolved}: ${usage.reason}`);
+  const claim = acquireCleanupClaim(resolved);
+  try {
+    // THE LAST GUARD, at the one place every deletion goes through. Callers check
+    // this too, for a legible receipt; this is what makes it unskippable.
+    const usage = durableConsumerProof
+      ? releasedLeaseRemovalVerdict(resolved)
+      : directoryReleaseVerdict(resolved);
+    if (!usage.ok) {
+      throw new Error(`removeLeaseDirectory: refusing to remove ${resolved}: ${usage.reason}`);
+    }
+    const stat = fs.lstatSync(resolved);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`removeLeaseDirectory: ${resolved} is a symbolic link, not a lease`);
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(`removeLeaseDirectory: ${resolved} is not a directory`);
+    }
+    // Every platform first atomically detaches this exact checked generation.
+    // On Windows, an open handle may make the rename itself fail; that retains
+    // both the canonical payload and its reserved attribution marker. A late
+    // canonical writer after a successful rename creates a different generation
+    // and can never be reached by the recursive removal below.
+    removeLeaseGeneration(resolved, { durableConsumerProof });
+  } finally {
+    releaseCleanupClaim(claim);
   }
-  const stat = fs.lstatSync(resolved);
-  if (stat.isSymbolicLink()) {
-    throw new Error(`removeLeaseDirectory: ${resolved} is a symbolic link, not a lease`);
-  }
-  if (!stat.isDirectory()) {
-    throw new Error(`removeLeaseDirectory: ${resolved} is not a directory`);
-  }
-  // `force` suppresses "does not exist", not "is busy". On Windows the platform
-  // refuses to remove a directory any process has open, and that refusal is the
-  // whole safety story there -- so the error propagates rather than being
-  // retried into submission.
-  fs.rmSync(resolved, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
+}
+
+/**
+ * Strict public choke point. Callers without the runtime lifecycle proof may
+ * not relax a same-UID visibility hole into permission to delete.
+ */
+export function removeLeaseDirectory(dir) {
+  return removeLeaseDirectoryChecked(dir);
+}
+
+/**
+ * Private capability used only after the recorded owner/consumer/group has
+ * already been proven absent. The supplemental scan still rejects readable
+ * POSIX holders and every system-wide procfs ambiguity; it relaxes only the
+ * classified same-UID Linux hole or Windows' platform-level unknown under the
+ * documented foreground-consumer lifecycle contract.
+ */
+function removeLeaseDirectoryAfterConsumerProof(dir) {
+  return removeLeaseDirectoryChecked(dir, { durableConsumerProof: true });
 }
 
 /**
@@ -882,23 +1613,39 @@ export function releaseLease(lease, { consumerAbsent = null } = {}) {
       record.value.state === "spawning" &&
       spawnConsumer.kind === "tmux" &&
       Number.isSafeInteger(spawnConsumer.pane_pid) &&
+      spawnConsumer.pane_pid > 0 &&
       probeConsumer(spawnConsumer) === "absent" &&
       (sleepSync(SPAWN_SETTLE_MS), probeConsumer(spawnConsumer) === "absent");
-    if (preSpawn || failedSpawn || observedSpawnFailure) {
-      // The owner watched: nothing was started, or the spawn it watched failed.
+    if (preSpawn || observedSpawnFailure) {
+      // The owner watched: no process-creating call ran, or headless spawn()
+      // itself threw before returning a process identity.
       return finishRelease(dir, metaPath, { ...record.value, consumer_never_created: true });
+    }
+    if (failedSpawn) {
+      // A tmux pane PID means a consumer may have existed even when both settled
+      // probes now read absent. Preserve that identity in the tombstone so the
+      // deletion choke point can independently re-probe it; never rewrite this
+      // case as "consumer never created".
+      return finishRelease(dir, metaPath, record.value);
     }
   }
 
   // A caller that has just PROVEN the consumer absent -- the turn loop watching
   // its own tmux pane die -- knows something the metadata cannot express yet.
-  if (consumerAbsent === true && record.state === "valid") {
-    return finishRelease(dir, metaPath, record.value);
+  if (
+    consumerAbsent === true &&
+    record.value.runner_pid === process.pid &&
+    ["allocated", "projecting", "ready"].includes(record.value.state)
+  ) {
+    return finishRelease(dir, metaPath, { ...record.value, consumer_never_created: true });
   }
 
-  const verdict = proveLeaseReleasable(record.value, { dir });
+  // First prove lifecycle only. finishRelease persists that result as a durable
+  // tombstone, then the private choke point re-reads it and combines a fresh
+  // lifecycle proof with final directory-usage evidence.
+  const verdict = proveLeaseReleasable(record.value);
   if (!verdict.removable) return { released: false, reason: verdict.reason };
-  return finishRelease(dir, metaPath, record.value);
+  return finishRelease(dir, metaPath, metadataAfterLifecycleProof(record.value));
 }
 
 /**
@@ -925,10 +1672,26 @@ function finishRelease(dir, metaPath, meta) {
   // before the removal leaves a `released` record WITH its directory, which is
   // the state the sweep already handles -- it re-probes the recorded consumer
   // and reclaims only if that consumer is gone.
+  const sourceMayAuthorizeRelaxation = recordMayAuthorizeRelaxation(dir, {
+    state: "valid",
+    metaPath,
+    value: meta,
+  });
+  // Once a legacy source has been marked ineligible, rewriting its new sibling
+  // tombstone must not upgrade it on the next release attempt merely because the
+  // record now happens to live at the current path.
+  const releaseRelaxationEligible =
+    meta.release_relaxation_eligible === false ? false : sourceMayAuthorizeRelaxation;
   try {
     writeJsonAtomic(metaPathFor(dir), {
       ...meta,
       state: "released",
+      released_from_state: meta.released_from_state ?? meta.state,
+      // Stable for the life of this lease id, including concurrent release
+      // attempts. Quarantine records copy it so a moved directory can always be
+      // tied back to the exact canonical generation whose lifecycle was proved.
+      release_generation: meta.release_generation ?? path.basename(dir),
+      release_relaxation_eligible: releaseRelaxationEligible,
       consumer: meta.consumer ?? null,
       released_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
@@ -943,13 +1706,20 @@ function finishRelease(dir, metaPath, meta) {
       reason: `the release record could not be persisted (${err.code || err.message}), so the directory was kept`,
     };
   }
-  removeLeaseDirectory(dir);
-  // A legacy in-directory record went with the directory; nothing to clean.
-  if (metaPath !== metaPathFor(dir)) {
-    try {
-      fs.unlinkSync(metaPath);
-    } catch {}
+  try {
+    removeLeaseDirectoryAfterConsumerProof(dir);
+  } catch (err) {
+    // The tombstone deliberately remains: a usage race or visibility hole is a
+    // conservative release failure, and the next sweep can retry from durable
+    // evidence without losing attribution.
+    return {
+      released: false,
+      reason: err.message,
+    };
   }
+  // A legacy in-directory record moved with the checked generation and was
+  // removed there. Never unlink its OLD canonical pathname here: a late writer
+  // may already have created a new generation at that name.
   return { released: true, reason: null };
 }
 
@@ -977,68 +1747,7 @@ export function readTurnLease(turnDir) {
  * unknown directory under the runtime root, malformed metadata, or a consumer
  * that cannot be probed are all left in place and named in the receipt.
  */
-/**
- * How old an unattributable directory must be before the sweep may remove it.
- *
- * Deliberately far longer than any turn's setup: metadata is written
- * immediately after the mkdir, so a directory without it is not a lease being
- * allocated right now, and a day of margin means no ordinary operation can be
- * mistaken for an abandoned one.
- */
-const UNATTRIBUTABLE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-
-/**
- * How long since ANYTHING in this directory changed, or null if unknowable.
- *
- * Deliberately the newest mtime in the tree rather than the directory's own
- * birth time. Age-since-creation says nothing about whether something is still
- * using the directory -- and the case this exists for is precisely a partner
- * that outlived its pane and is writing into a home it recreated. A live writer
- * keeps this number small, which retains; only a tree nothing has touched for
- * the full window is reclaimed.
- *
- * Bounded so a pathological tree cannot stall the sweep. Hitting the bound
- * returns null, which retains -- the conservative direction.
- */
-const ACTIVITY_SCAN_MAX_ENTRIES = 2000;
-
-function msSinceLastActivity(dir, now) {
-  let newest = 0;
-  let budget = ACTIVITY_SCAN_MAX_ENTRIES;
-
-  const visit = (target) => {
-    if (budget-- <= 0) return false;
-    let stat;
-    try {
-      stat = fs.lstatSync(target);
-    } catch {
-      return true; // vanished mid-scan; it contributes nothing
-    }
-    if (stat.mtimeMs > newest) newest = stat.mtimeMs;
-    if (stat.birthtimeMs > newest) newest = stat.birthtimeMs;
-    if (!stat.isDirectory() || stat.isSymbolicLink()) return true;
-    let entries;
-    try {
-      entries = fs.readdirSync(target);
-    } catch {
-      return true;
-    }
-    for (const entry of entries) {
-      if (!visit(path.join(target, entry))) return false;
-    }
-    return true;
-  };
-
-  if (!visit(dir)) return null;
-  if (!Number.isFinite(newest) || newest <= 0) return null;
-  return Math.max(0, now - newest);
-}
-
-export function sweepLeases({
-  apply = false,
-  now = Date.now(),
-  unattributableMaxAgeMs = UNATTRIBUTABLE_MAX_AGE_MS,
-} = {}) {
+export function sweepLeases({ apply = false } = {}) {
   const root = runtimeDir();
   const receipt = { root, removed: [], retained: [], errors: [] };
 
@@ -1059,45 +1768,41 @@ export function sweepLeases({
     return receipt;
   }
 
+  // This snapshot is used only to avoid reporting a sibling record separately
+  // from the directory entry the same sweep will handle. It is NEVER deletion
+  // authority: a directory can appear immediately after enumeration, which is
+  // exactly why the record itself is permanent.
+  const enumeratedDirectories = new Set(
+    entries.filter((entry) => entry.isDirectory() && !entry.isSymbolicLink()).map((entry) => entry.name)
+  );
+
   for (const entry of entries) {
     const dir = path.join(root, entry.name);
     if (entry.isFile() && entry.name.endsWith(".lease.json")) {
-      // A record, not a lease. Reap it once the directory it described is gone
-      // and it has been released long enough that no recreation is coming --
-      // this is file housekeeping, so age is the right measure here, unlike for
-      // anything holding credentials.
-      const owner = path.join(root, entry.name.slice(0, -".lease.json".length));
-      if (fs.existsSync(owner)) continue;
+      const ownerName = entry.name.slice(0, -".lease.json".length);
+      if (enumeratedDirectories.has(ownerName)) continue;
       const held = readJson(path.join(root, entry.name));
-      const releasedAt = held.state === "valid" ? Date.parse(held.value.released_at ?? "") : NaN;
-      if (!Number.isFinite(releasedAt) || now - releasedAt < unattributableMaxAgeMs) continue;
-      // AGE IS NOT ABSENCE. A tombstone is the only thing that can attribute a
-      // directory a late consumer recreates, so discarding one on elapsed time
-      // alone re-opens the hole the sibling record closed: the consumer keeps a
-      // token, touches nothing for a day, then recreates the home, and what it
-      // leaves is unattributable forever. The record may only go once the
-      // consumer it names is proven gone -- and a record naming nothing
-      // probeable is kept, because it can never earn that proof.
-      const consumer = held.value.consumer;
-      // The safe no-consumer case, honoured here as it is everywhere else.
-      // Without this, a marker record -- written when the owner PROVED nothing
-      // was ever started -- had no probeable consumer, failed the check below,
-      // and could never be reaped. Every projection failure and every
-      // missing-binary turn then left a permanent metadata file behind: the
-      // credentials went, the bookkeeping accumulated forever.
-      if (held.value.consumer_never_created !== true) {
-        if (!hasUsableIdentity(consumer)) continue;
-        if (probeConsumer(consumer) !== "absent") continue;
-      }
-      if (!apply) {
-        receipt.removed.push({ dir, applied: false, reason: "spent lease record" });
-        continue;
-      }
-      try {
-        fs.unlinkSync(path.join(root, entry.name));
-        receipt.removed.push({ dir, applied: true, reason: "spent lease record" });
-      } catch (err) {
-        receipt.errors.push({ path: dir, error: err.message });
+      const reason =
+        held.state === "valid" && held.value?.state === "released"
+          ? "permanent released lease marker"
+          : held.reason ?? `metadata is ${held.state}`;
+      // There is no atomic filesystem operation that says both "the directory
+      // is absent" and "unlink this sibling only if it stays absent". Deleting
+      // this last marker after any age/probe check lets a late absolute-path
+      // writer recreate the credential home after the check and before (or
+      // after) unlink, making it permanently unattributable. Keep the marker.
+      receipt.retained.push({ dir: path.join(root, ownerName), reason });
+      continue;
+    }
+    const claimArtifact = cleanupClaimArtifact(entry.name);
+    if (claimArtifact) {
+      const result = sweepCleanupClaimArtifact(root, entry, claimArtifact, { apply });
+      if (result.disposition === "removed") {
+        receipt.removed.push({ dir: result.dir, applied: result.applied, reason: result.reason });
+      } else if (result.disposition === "retained") {
+        receipt.retained.push({ dir: result.dir, reason: result.reason });
+      } else {
+        receipt.errors.push({ path: result.path, error: result.error });
       }
       continue;
     }
@@ -1136,20 +1841,9 @@ export function sweepLeases({
       // the server -- the pane is alive and this directory is its home. The
       // tombstone identifies what to check; it does not by itself authorize
       // deletion.
-      const consumer = record.value.consumer;
-      if (hasUsableIdentity(consumer)) {
-        const verdict = probeConsumer(consumer);
-        if (verdict !== "absent") {
-          receipt.retained.push({
-            dir,
-            reason: `released, but its recorded consumer is ${verdict === "alive" ? "running again" : `unprobeable (${verdict})`}`,
-          });
-          continue;
-        }
-      } else if (record.value.consumer_never_created !== true) {
-        // Same rule as proveLeaseReleasable: without a probeable consumer, only
-        // an owner-proven "nothing was ever started" authorizes reclaiming.
-        receipt.retained.push({ dir, reason: "released, but records no probeable consumer" });
+      const removal = releasedLeaseRemovalVerdict(dir);
+      if (!removal.ok) {
+        receipt.retained.push({ dir, reason: removal.reason });
         continue;
       }
       if (!apply) {
@@ -1157,14 +1851,20 @@ export function sweepLeases({
         continue;
       }
       try {
-        removeLeaseDirectory(dir);
+        removeLeaseDirectoryAfterConsumerProof(dir);
         receipt.removed.push({ dir, applied: true, reason: "recreated after the lease was released" });
       } catch (err) {
-        receipt.errors.push({ path: dir, error: err.message });
+        if (err?.code === "DUALOG_QUARANTINE_RETAINED") {
+          receipt.retained.push({ dir: err.quarantineDir, reason: err.message });
+        } else {
+          receipt.errors.push({ path: dir, error: err.message });
+        }
       }
       continue;
     }
-    const verdict = proveLeaseReleasable(record.value, { dir });
+    // Dry-run receives the same prospective lifecycle + directory decision that
+    // apply will persist and independently reproduce at the deletion boundary.
+    const verdict = prospectiveLeaseRemovalVerdict(dir, record);
     if (!verdict.removable) {
       receipt.retained.push({ dir, reason: verdict.reason });
       continue;
@@ -1173,11 +1873,11 @@ export function sweepLeases({
       receipt.removed.push({ dir, applied: false });
       continue;
     }
-    try {
-      removeLeaseDirectory(dir);
+    const released = finishRelease(dir, record.metaPath, verdict.releaseMeta);
+    if (released.released) {
       receipt.removed.push({ dir, applied: true });
-    } catch (err) {
-      receipt.errors.push({ path: dir, error: err.message });
+    } else {
+      receipt.retained.push({ dir, reason: released.reason });
     }
   }
   return receipt;

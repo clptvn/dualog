@@ -28,10 +28,12 @@ import {
   removeMcpServerSections,
   replaceMcpServerSection,
   resolveCodexPaths,
+  resolveWslRoute,
   runInstallProbe,
   validateExplicitWslSelection,
   writeJsonConfig,
 } from "../scripts/install-utils.mjs";
+import { InstallTransaction } from "../scripts/install-transaction.mjs";
 import {
   assertSafeWslLauncher,
   normalizeWslLoginShell,
@@ -39,6 +41,15 @@ import {
 } from "../src/wsl-shell.mjs";
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const HISTORICAL_PLATFORM_HELPER_HEADER = [
+  'import fs from "fs";',
+  'import os from "os";',
+  'import path from "path";',
+  "",
+  "// claude-codex-dialog platform helpers. Keep this file dependency-light because",
+  "// Claude hook scripts import it from the user-level hooks directory.",
+  "",
+].join("\n");
 
 function tempDir(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-installer-"));
@@ -171,7 +182,7 @@ test("config prevalidation rejects directories and non-regular files without rea
   fs.writeFileSync(fileParent, "not a directory");
   assert.throws(
     () => assertSafeConfigWriteTarget(path.join(fileParent, "config.json")),
-    /parent component is not a directory/
+    /parent (?:component is not a directory|.+ does not resolve to a directory)/
   );
 
   if (process.platform !== "win32") {
@@ -758,7 +769,7 @@ function windowsProbeStub(calls) {
     if (command === "claude") return { status: 1 };
     if (command === "codex") return { status: 0 };
     if (command === "tmux") return { status: 1 };
-    if (command !== "custom-wsl.exe") {
+    if (command !== "C:\\tools\\custom-wsl.exe") {
       return { status: null, error: Object.assign(new Error("missing"), { code: "ENOENT" }) };
     }
     if (args[0] === "--status") return { status: 0 };
@@ -791,7 +802,7 @@ test("Windows probe separates host and WSL availability and pins the selected di
   const calls = [];
   const status = await probeInstallEnvironment(windowsProbeStub(calls), {
     platform: "win32",
-    env: { DUALOG_WSL_BINARY: "custom-wsl.exe" },
+    env: { DUALOG_WSL_BINARY: "C:\\tools\\custom-wsl.exe" },
     cwd: "C:\\repo",
   });
 
@@ -809,7 +820,7 @@ test("Windows probe separates host and WSL availability and pins the selected di
       codex: status.wsl.codex,
     },
     {
-      binary: "custom-wsl.exe",
+      binary: "C:\\tools\\custom-wsl.exe",
       distro: "Ubuntu-24.04",
       binaryAvailable: true,
       distroAvailable: true,
@@ -825,7 +836,7 @@ test("Windows probe separates host and WSL availability and pins the selected di
   );
   assert.ok(
     postDetection
-      .filter(([command]) => command === "custom-wsl.exe")
+      .filter(([command]) => command === "C:\\tools\\custom-wsl.exe")
       .every(([, args]) => args.includes("Ubuntu-24.04")),
     "every runtime probe after default discovery must use the exact distro"
   );
@@ -1053,7 +1064,10 @@ test("documented WSL environment overrides are explicit hard constraints", async
         { wslBinary: null, wslDistro: null },
         {
           platform: "win32",
-          env: { DUALOG_WSL_DISTRO: "Missing-From-Env" },
+          env: {
+            SystemRoot: "C:\\Windows",
+            DUALOG_WSL_DISTRO: "Missing-From-Env",
+          },
           runProbe: (command, args) =>
             args.includes("--distribution")
               ? { status: 1 }
@@ -1066,20 +1080,34 @@ test("documented WSL environment overrides are explicit hard constraints", async
 
 test("installer validates explicit WSL selection before native registration", () => {
   const source = fs.readFileSync(path.join(REPO_ROOT, "scripts", "install.mjs"), "utf-8");
+  const transaction = source.lastIndexOf("const transaction = new InstallTransaction({");
   const preflight = source.indexOf("preflightExplicitWslSelection(mode");
-  const configPreflight = source.lastIndexOf("prevalidateConfigTargets();");
-  const migration = source.indexOf("removeLegacyInstall();");
+  const configPreflight = source.lastIndexOf("prevalidateConfigTargets(mode);");
+  const migration = source.lastIndexOf("stageLegacyInstall(transaction, mode);");
   const dependencies = source.indexOf("ensureDependencies();");
-  const claudeRegistration = source.lastIndexOf("registerClaudeMcp(cliStatus, logStep)");
-  const codexRegistration = source.lastIndexOf("registerCodexMcp(cliStatus, logStep)");
+  const claudeArtifacts = source.lastIndexOf("stageClaudeCommandsAndHooks(transaction, logStep)");
+  const codexArtifacts = source.lastIndexOf("stageCodexSkills(transaction, logStep)");
+  const claudeRegistration = source.lastIndexOf(
+    "stageClaudeRegistrations(transaction, cliStatus, logStep)"
+  );
+  const codexRegistration = source.lastIndexOf(
+    "stageCodexRegistration(transaction, cliStatus, logStep)"
+  );
+  const commit = source.lastIndexOf("transaction.commit();");
   assert.ok(preflight >= 0, "installer must preflight an explicit WSL route");
+  assert.ok(transaction >= 0, "installer must acquire its transaction lock");
+  assert.ok(transaction < preflight, "the lock must precede every fallible setup step");
   assert.ok(configPreflight >= 0, "installer must prevalidate every config write target");
-  assert.ok(preflight < migration);
-  assert.ok(configPreflight < migration);
   assert.ok(configPreflight < dependencies);
   assert.ok(preflight < dependencies);
   assert.ok(preflight < claudeRegistration);
   assert.ok(preflight < codexRegistration);
+  assert.ok(claudeArtifacts < claudeRegistration);
+  assert.ok(codexArtifacts < codexRegistration);
+  assert.ok(migration < claudeRegistration);
+  assert.ok(migration < codexRegistration);
+  assert.ok(claudeRegistration < commit);
+  assert.ok(codexRegistration < commit);
 });
 
 test("explicit WSL preflight fails before callers can mutate user files", async () => {
@@ -1251,9 +1279,9 @@ test("a custom WSL binary is persisted only after its distro route succeeds", ()
   assert.deepEqual(
     persistedWslEnv(
       { wsl: { ...verified.wsl, binary: "wsl.exe" } },
-      { platform: "win32" }
+      { platform: "win32", env: { SystemRoot: "D:\\WinNT" } }
     ),
-    {}
+    { DUALOG_WSL_BINARY: "D:\\WinNT\\System32\\wsl.exe" }
   );
   assert.deepEqual(persistedWslEnv(verified, { platform: "darwin" }), {});
 });
@@ -1270,7 +1298,11 @@ test("timed-out Windows installer probes terminate while the wrapper is live", a
   const result = await runInstallProbe(
     "claude.cmd",
     ["--version"],
-    { timeout: 5, stdio: ["ignore", "pipe", "pipe"] },
+    {
+      timeout: 5,
+      env: { SystemRoot: "C:\\Windows", ComSpec: "C:\\attacker\\cmd.exe" },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
     {
       platform: "win32",
       spawnFn: () => child,
@@ -1294,14 +1326,106 @@ test("pre-bootstrap CLI .cmd probes stay escaped while WSL .cmd launchers fail c
   const direct = prepareWindowsCommandInvocation(
     "C:\\Tools & Stuff\\claude.cmd",
     ["--version", "value & echo PWNED"],
-    { env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" } },
+    {
+      env: {
+        SystemRoot: "C:\\Windows",
+        ComSpec: "C:\\attacker\\cmd.exe",
+      },
+    },
     { platform: "win32" }
   );
   assert.equal(direct.command, "C:\\Windows\\System32\\cmd.exe");
   assert.deepEqual(direct.args.slice(0, 3), ["/d", "/s", "/c"]);
   assert.equal(direct.options.windowsVerbatimArguments, true);
+  assert.equal(direct.options.env.ComSpec, "C:\\Windows\\System32\\cmd.exe");
+  assert.equal(
+    Object.keys(direct.options.env).filter(
+      (key) => key.toLocaleLowerCase("en-US") === "comspec"
+    ).length,
+    1
+  );
   assert.match(direct.args[3], /\^&/u);
   assert.doesNotMatch(direct.args[3], /(?<!\^)&/u);
+
+  let invalidRootLaunches = 0;
+  const invalidRoot = runInstallProbe(
+    "claude.cmd",
+    ["--version"],
+    { env: { SystemRoot: "C:\\Users\\test\\Windows" } },
+    {
+      platform: "win32",
+      spawnFn: () => {
+        invalidRootLaunches += 1;
+        throw new Error("must not execute");
+      },
+    }
+  );
+  assert.match((await invalidRoot).error.message, /trusted top-level Windows System32/u);
+  assert.equal(invalidRootLaunches, 0);
+
+  const posixOptions = { env: { ComSpec: "keep-me" } };
+  assert.deepEqual(
+    prepareWindowsCommandInvocation(
+      "/opt/tools/claude.cmd",
+      ["--version"],
+      posixOptions,
+      { platform: "darwin" }
+    ),
+    { command: "/opt/tools/claude.cmd", args: ["--version"], options: posixOptions }
+  );
+
+  const extensionlessLaunches = [];
+  const ambientComSpecBefore = Object.entries(process.env).filter(
+    ([key]) => key.toLocaleLowerCase("en-US") === "comspec"
+  );
+  const extensionlessResult = runInstallProbe(
+    "claude",
+    ["--version"],
+    {
+      env: {
+        SystemRoot: "C:\\Windows",
+        COMSPEC: "C:\\attacker\\cmd.exe",
+        comspec: "C:\\other-attacker\\cmd.exe",
+      },
+    },
+    {
+      platform: "win32",
+      spawnFn: (command, args, options) => {
+        assert.equal(
+          process.env.comspec,
+          "C:\\Windows\\System32\\cmd.exe",
+          "cross-spawn's synchronous parser must not see ambient ComSpec"
+        );
+        extensionlessLaunches.push({ command, args, options });
+        const child = new EventEmitter();
+        child.pid = 9123;
+        child.stdout = null;
+        child.stderr = null;
+        setImmediate(() => child.emit("close", 0, null));
+        return child;
+      },
+    }
+  );
+  assert.equal((await extensionlessResult).status, 0);
+  assert.equal(extensionlessLaunches.length, 1);
+  assert.equal(
+    extensionlessLaunches[0].options.env.ComSpec,
+    "C:\\Windows\\System32\\cmd.exe"
+  );
+  assert.equal(
+    Object.keys(extensionlessLaunches[0].options.env).filter(
+      (key) => key.toLocaleLowerCase("en-US") === "comspec"
+    ).length,
+    1,
+    "cross-spawn must see one trusted command processor regardless of env casing"
+  );
+  assert.deepEqual(
+    Object.entries(process.env).filter(
+      ([key]) => key.toLocaleLowerCase("en-US") === "comspec"
+    ),
+    ambientComSpecBefore,
+    "the temporary parser guard must restore the parent environment exactly"
+  );
 
   const launches = [];
   let nextPid = 8100;
@@ -1341,8 +1465,14 @@ test("selected WSL lifecycle completes before native mutation and never uses syn
     "await configureWslHosts(spawn, mode, cliStatus, logStep)"
   );
   assert.ok(lifecycle >= 0);
-  assert.ok(lifecycle < installSource.lastIndexOf("registerClaudeMcp(cliStatus, logStep)"));
-  assert.ok(lifecycle < installSource.lastIndexOf("registerCodexMcp(cliStatus, logStep)"));
+  assert.ok(
+    lifecycle <
+      installSource.lastIndexOf("stageClaudeRegistrations(transaction, cliStatus, logStep)")
+  );
+  assert.ok(
+    lifecycle <
+      installSource.lastIndexOf("stageCodexRegistration(transaction, cliStatus, logStep)")
+  );
   assert.doesNotMatch(installSource, /spawn\.sync\(/u);
   assert.doesNotMatch(uninstallSource, /spawnSync\(/u);
   assert.ok(
@@ -1373,11 +1503,47 @@ test("an old or unreported WSL Node version is not treated as installable", asyn
   };
   const status = await probeInstallEnvironment(runSync, {
     platform: "win32",
-    env: {},
+    env: { SystemRoot: "C:\\Windows" },
     cwd: "C:\\repo",
   });
   assert.equal(status.wsl.node, false);
   assert.equal(status.wsl.nodeVersion, "v16.20.2");
+});
+
+test("installer default WSL route is exact while custom and POSIX routes are preserved", () => {
+  assert.deepEqual(
+    resolveWslRoute({
+      platform: "win32",
+      env: { SystemRoot: "D:\\WinNT", PATH: "C:\\attacker" },
+    }),
+    { binary: "D:\\WinNT\\System32\\wsl.exe", distro: null }
+  );
+  assert.deepEqual(
+    resolveWslRoute({
+      platform: "win32",
+      env: {
+        SystemRoot: "C:\\Windows",
+        DUALOG_WSL_BINARY: "C:\\vendor\\wsl.exe",
+        DUALOG_WSL_DISTRO: "Ubuntu",
+      },
+    }),
+    { binary: "C:\\vendor\\wsl.exe", distro: "Ubuntu" }
+  );
+  assert.deepEqual(
+    resolveWslRoute({
+      platform: "darwin",
+      env: { DUALOG_WSL_BINARY: "/opt/wsl-test", DUALOG_WSL_DISTRO: "ignored" },
+    }),
+    { binary: "/opt/wsl-test", distro: "ignored" }
+  );
+  assert.throws(
+    () =>
+      resolveWslRoute({
+        platform: "win32",
+        env: { SystemRoot: "C:\\Temp\\Windows" },
+      }),
+    /trusted top-level Windows System32/u
+  );
 });
 
 test("PowerShell wrappers expose a scoped distro selector and host-only recursion guard", () => {
@@ -1415,6 +1581,701 @@ test("installer and uninstaller retain the PR review command and skill", () => {
     assert.match(source, /CODEX_SKILLS[\s\S]*"dualog-review-pr"/);
     assert.doesNotMatch(source, /claude_desktop_config\.json/);
   }
+});
+
+test("installer migrates the oldest Claude layout through exact owned fields", (t) => {
+  const home = tempDir(t);
+  const codexHome = path.join(home, "codex-home");
+  const claudeDir = path.join(home, ".claude");
+  const hooksRoot = path.join(claudeDir, "hooks");
+  const legacyHookDir = path.join(hooksRoot, "codex-dialog");
+  const currentHookDir = path.join(hooksRoot, "dualog");
+  const legacyEnforce = path.join(legacyHookDir, "enforce-investigation.sh");
+  const legacyClear = path.join(legacyHookDir, "clear-investigation.sh");
+  const legacyMark = path.join(legacyHookDir, "mark-needs-investigation.mjs");
+  const currentClear = path.join(currentHookDir, "clear-investigation.mjs");
+  const unrelatedClear = path.join(home, "custom-hooks", "clear-investigation.mjs");
+  const legacyPlatform = path.join(hooksRoot, "codex-dialog-platform.mjs");
+  const genericPlatform = path.join(hooksRoot, "platform.mjs");
+  const settingsPath = path.join(claudeDir, "settings.json");
+  const claudeConfigPath = path.join(home, ".claude.json");
+  const unrelatedHook = "/usr/local/bin/team-dualog-hook --keep";
+  const unrelatedPlatformContent = [
+    'export const description = "dualog platform helpers";',
+    'export const oldPath = "hooks/codex-dialog/clear-investigation.sh";',
+    "",
+  ].join("\n");
+
+  fs.mkdirSync(legacyHookDir, { recursive: true });
+  fs.mkdirSync(path.dirname(unrelatedClear), { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(legacyEnforce, "#!/usr/bin/env bash\n");
+  fs.writeFileSync(legacyClear, "#!/usr/bin/env bash\n");
+  fs.writeFileSync(legacyMark, "// historical Node hook\n");
+  fs.writeFileSync(legacyPlatform, HISTORICAL_PLATFORM_HELPER_HEADER);
+  fs.writeFileSync(genericPlatform, unrelatedPlatformContent);
+  fs.writeFileSync(unrelatedClear, "// unrelated\n");
+  fs.writeFileSync(
+    claudeConfigPath,
+    `${JSON.stringify(
+      {
+        mcpServers: {
+          dualog: null,
+          "codex-dialog": null,
+          unrelated: { command: "keep-current-config" },
+        },
+      },
+      null,
+      2
+    )}\n`
+  );
+  fs.writeFileSync(
+    settingsPath,
+    `${JSON.stringify(
+      {
+        note: "mcp__codex-dialog__send_message hooks/codex-dialog/ platform helper",
+        mcpServers: {
+          dualog: null,
+          "codex-dialog": null,
+          unrelated: { command: "keep-historical-config" },
+        },
+        hooks: {
+          PreToolUse: [
+            {
+              matcher: "mcp__codex-dialog__send_message",
+              hooks: [
+                { type: "command", command: `bash ${legacyEnforce}` },
+                { type: "command", command: unrelatedHook },
+              ],
+            },
+          ],
+          PostToolUse: [
+            { matcher: "CustomEmpty", hooks: [] },
+            { matcher: "CustomMetadata", note: "no hooks by design" },
+            {
+              matcher: "mcp__codex-dialog__wait_for_partner_response",
+              hooks: [
+                { type: "command", command: `node ${legacyMark}` },
+                { type: "command", command: unrelatedHook },
+              ],
+            },
+            {
+              matcher: "Grep",
+              hooks: [
+                { type: "command", command: `node "${currentClear}"` },
+                { type: "command", command: `node "${unrelatedClear}"` },
+              ],
+            },
+            {
+              matcher: "Glob",
+              hooks: [{ type: "command", command: `bash ${legacyClear}` }],
+            },
+            {
+              matcher: "Read",
+              hooks: [{ type: "command", command: `node "${unrelatedClear}"` }],
+            },
+          ],
+        },
+      },
+      null,
+      2
+    )}\n`
+  );
+  fs.writeFileSync(path.join(codexHome, "config.toml"), "");
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "scripts", "install.mjs"), "--both", "--host-only"],
+    {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        CODEX_HOME: codexHome,
+        DUALOG_INSTALL_HOST_ONLY: "1",
+      },
+      encoding: "utf-8",
+      timeout: 30000,
+    }
+  );
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+
+  const claudeConfig = JSON.parse(fs.readFileSync(claudeConfigPath, "utf-8"));
+  assert.equal(Object.hasOwn(claudeConfig.mcpServers, "codex-dialog"), false);
+  assert.equal(claudeConfig.mcpServers.unrelated.command, "keep-current-config");
+  assert.equal(claudeConfig.mcpServers.dualog.command, process.execPath);
+
+  const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+  assert.deepEqual(settings.mcpServers, {
+    unrelated: { command: "keep-historical-config" },
+  });
+  assert.equal(
+    settings.note,
+    "mcp__codex-dialog__send_message hooks/codex-dialog/ platform helper"
+  );
+  assert.equal(
+    settings.hooks.PreToolUse.some(
+      (entry) => entry.matcher === "mcp__dualog__send_message"
+    ),
+    true
+  );
+  const allCommands = Object.values(settings.hooks)
+    .flat()
+    .flatMap((entry) => entry.hooks ?? [])
+    .map((hook) => hook.command);
+  assert.equal(allCommands.includes(unrelatedHook), true);
+  assert.equal(allCommands.includes(`node "${unrelatedClear}"`), true);
+  assert.equal(allCommands.some((command) => command?.includes(legacyHookDir)), false);
+  assert.equal(
+    Object.values(settings.hooks)
+      .flat()
+      .some((entry) => entry.matcher?.startsWith("mcp__codex-dialog__")),
+    false
+  );
+  assert.equal(
+    settings.hooks.PostToolUse.some(
+      (entry) =>
+        ["Grep", "Glob"].includes(entry.matcher) &&
+        entry.hooks?.some((hook) => hook.command === `node "${currentClear}"`)
+    ),
+    false
+  );
+  assert.equal(fs.existsSync(legacyHookDir), false);
+  assert.equal(fs.existsSync(legacyPlatform), false);
+  assert.equal(fs.readFileSync(genericPlatform, "utf-8"), unrelatedPlatformContent);
+});
+
+test("Codex-only upgrade leaves current and unrelated Claude config byte-for-byte unchanged", (t) => {
+  const home = tempDir(t);
+  const codexHome = path.join(home, "codex-home");
+  const claudeDir = path.join(home, ".claude");
+  const claudeConfigPath = path.join(home, ".claude.json");
+  const settingsPath = path.join(claudeDir, "settings.json");
+  const legacyCommand = path.join(claudeDir, "commands", "codex-review-code.md");
+  const legacyHookDir = path.join(claudeDir, "hooks", "codex-dialog");
+  const legacyPlatform = path.join(claudeDir, "hooks", "codex-dialog-platform.mjs");
+  const legacySkill = path.join(codexHome, "skills", "claude-review-code", "SKILL.md");
+  const codexConfigPath = path.join(codexHome, "config.toml");
+  const claudeConfig =
+    '{ "mcpServers": { "dualog": { "command": "keep-current" }, "codex-dialog": null, "team-dualog": null } }\n';
+  const settings =
+    `{\n  "mcpServers": { "dualog": { "command": "keep-historical-current" }, "codex-dialog": null, "team-dualog": null },\n  "hooks": { "PreToolUse": [{ "matcher": "mcp__codex-dialog__send_message", "hooks": [{ "type": "command", "command": "node ${path.join(legacyHookDir, "enforce-investigation.mjs").replaceAll("\\", "\\\\")}" }] }] },\n  "note": "mcp__codex-dialog__substring and hooks/codex-dialog/example must stay"\n}\n`;
+  fs.mkdirSync(path.dirname(legacyCommand), { recursive: true });
+  fs.mkdirSync(legacyHookDir, { recursive: true });
+  fs.mkdirSync(path.dirname(legacySkill), { recursive: true });
+  fs.writeFileSync(claudeConfigPath, claudeConfig);
+  fs.writeFileSync(settingsPath, settings);
+  fs.writeFileSync(legacyCommand, "legacy Claude command\n");
+  fs.writeFileSync(
+    path.join(legacyHookDir, "enforce-investigation.mjs"),
+    "// legacy Claude hook\n"
+  );
+  fs.writeFileSync(legacyPlatform, HISTORICAL_PLATFORM_HELPER_HEADER);
+  fs.writeFileSync(legacySkill, "legacy Codex skill\n");
+  fs.writeFileSync(
+    codexConfigPath,
+    [
+      "[mcp_servers.codex-dialog]",
+      'command = "legacy"',
+      "",
+      "[mcp_servers.dualog]",
+      'command = "old-current"',
+      "",
+      "[mcp_servers.unrelated]",
+      'command = "keep"',
+      "",
+    ].join("\n")
+  );
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "scripts", "install.mjs"), "--codex", "--host-only"],
+    {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        CODEX_HOME: codexHome,
+        DUALOG_INSTALL_HOST_ONLY: "1",
+      },
+      encoding: "utf-8",
+      timeout: 30000,
+    }
+  );
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.equal(fs.readFileSync(claudeConfigPath, "utf-8"), claudeConfig);
+  assert.equal(fs.readFileSync(settingsPath, "utf-8"), settings);
+  assert.equal(fs.readFileSync(legacyCommand, "utf-8"), "legacy Claude command\n");
+  assert.equal(fs.existsSync(legacyHookDir), true);
+  assert.equal(fs.existsSync(legacyPlatform), true);
+  assert.equal(fs.existsSync(path.dirname(legacySkill)), false);
+  const codexConfig = fs.readFileSync(codexConfigPath, "utf-8");
+  assert.match(codexConfig, /\[mcp_servers\.dualog\]/u);
+  assert.match(codexConfig, /\[mcp_servers\.unrelated\]/u);
+  assert.doesNotMatch(codexConfig, /codex-dialog/u);
+});
+
+test("Claude-only upgrade leaves current and legacy Codex artifacts byte-for-byte unchanged", (t) => {
+  const home = tempDir(t);
+  const codexHome = path.join(home, "codex-home");
+  const claudeDir = path.join(home, ".claude");
+  const claudeConfigPath = path.join(home, ".claude.json");
+  const settingsPath = path.join(claudeDir, "settings.json");
+  const legacyCommand = path.join(claudeDir, "commands", "codex-review-code.md");
+  const legacyHookDir = path.join(claudeDir, "hooks", "codex-dialog");
+  const legacyHook = path.join(legacyHookDir, "enforce-investigation.sh");
+  const legacySkill = path.join(codexHome, "skills", "claude-review-code", "SKILL.md");
+  const codexConfigPath = path.join(codexHome, "config.toml");
+  const codexConfig = [
+    "[mcp_servers.codex-dialog]",
+    'command = "keep-legacy"',
+    "",
+    "[mcp_servers.dualog]",
+    'command = "keep-current"',
+    "",
+    "[mcp_servers.unrelated]",
+    'command = "keep-unrelated"',
+    "",
+  ].join("\n");
+
+  fs.mkdirSync(path.dirname(legacyCommand), { recursive: true });
+  fs.mkdirSync(legacyHookDir, { recursive: true });
+  fs.mkdirSync(path.dirname(legacySkill), { recursive: true });
+  fs.writeFileSync(legacyCommand, "legacy Claude command\n");
+  fs.writeFileSync(legacyHook, "#!/usr/bin/env bash\n");
+  fs.writeFileSync(legacySkill, "legacy Codex skill\n");
+  fs.writeFileSync(codexConfigPath, codexConfig);
+  fs.writeFileSync(
+    claudeConfigPath,
+    `${JSON.stringify({
+      mcpServers: {
+        dualog: { command: "old-current" },
+        "codex-dialog": null,
+        unrelated: { command: "keep" },
+      },
+    })}\n`
+  );
+  fs.writeFileSync(
+    settingsPath,
+    `${JSON.stringify({
+      mcpServers: {
+        dualog: null,
+        "codex-dialog": null,
+        unrelated: { command: "keep-settings" },
+      },
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: "mcp__codex-dialog__send_message",
+            hooks: [{ type: "command", command: `bash ${legacyHook}` }],
+          },
+        ],
+      },
+    })}\n`
+  );
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "scripts", "install.mjs"), "--claude", "--host-only"],
+    {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        CODEX_HOME: codexHome,
+        DUALOG_INSTALL_HOST_ONLY: "1",
+      },
+      encoding: "utf-8",
+      timeout: 30000,
+    }
+  );
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.equal(fs.readFileSync(codexConfigPath, "utf-8"), codexConfig);
+  assert.equal(fs.readFileSync(legacySkill, "utf-8"), "legacy Codex skill\n");
+  assert.equal(fs.existsSync(legacyCommand), false);
+  assert.equal(fs.existsSync(legacyHookDir), false);
+  const claudeConfig = JSON.parse(fs.readFileSync(claudeConfigPath, "utf-8"));
+  assert.equal(Object.hasOwn(claudeConfig.mcpServers, "codex-dialog"), false);
+  assert.equal(claudeConfig.mcpServers.dualog.command, process.execPath);
+  assert.equal(claudeConfig.mcpServers.unrelated.command, "keep");
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf-8")).mcpServers, {
+    unrelated: { command: "keep-settings" },
+  });
+});
+
+test("active install transaction blocks mutation and preserves live and historical registrations", (t) => {
+  const home = tempDir(t);
+  const claudeDir = path.join(home, ".claude");
+  const hooksRoot = path.join(claudeDir, "hooks");
+  const blockedCurrentHooks = path.join(hooksRoot, "dualog");
+  const legacyHookDir = path.join(hooksRoot, "codex-dialog");
+  const legacyHook = path.join(legacyHookDir, "enforce-investigation.sh");
+  const legacyCommand = path.join(claudeDir, "commands", "codex-review-code.md");
+  const claudeConfigPath = path.join(home, ".claude.json");
+  const settingsPath = path.join(claudeDir, "settings.json");
+  const claudeConfig =
+    '{ "mcpServers": { "dualog": { "command": "working-current" }, "codex-dialog": { "command": "working-legacy" }, "unrelated": null } }\n';
+  const settings = `${JSON.stringify({
+    mcpServers: {
+      dualog: { command: "working-historical-current" },
+      "codex-dialog": { command: "working-historical-legacy" },
+    },
+    hooks: {
+      PreToolUse: [
+        {
+          matcher: "mcp__codex-dialog__send_message",
+          hooks: [{ type: "command", command: `bash ${legacyHook}` }],
+        },
+      ],
+    },
+  })}\n`;
+
+  fs.mkdirSync(legacyHookDir, { recursive: true });
+  fs.mkdirSync(path.dirname(legacyCommand), { recursive: true });
+  fs.writeFileSync(legacyHook, "#!/usr/bin/env bash\n");
+  fs.writeFileSync(legacyCommand, "legacy command\n");
+  fs.writeFileSync(blockedCurrentHooks, "not a directory\n");
+  fs.writeFileSync(claudeConfigPath, claudeConfig);
+  fs.writeFileSync(settingsPath, settings);
+  const activeTransaction = new InstallTransaction({
+    home,
+    allowedLogicalPaths: new Set(),
+  });
+  t.after(() => activeTransaction.abort());
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "scripts", "install.mjs"), "--claude", "--host-only"],
+    {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        DUALOG_INSTALL_HOST_ONLY: "1",
+      },
+      encoding: "utf-8",
+      timeout: 30000,
+    }
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Another Dualog installer is still active/u);
+  assert.equal(fs.readFileSync(claudeConfigPath, "utf-8"), claudeConfig);
+  assert.equal(fs.readFileSync(settingsPath, "utf-8"), settings);
+  assert.equal(fs.readFileSync(legacyCommand, "utf-8"), "legacy command\n");
+  assert.equal(fs.readFileSync(legacyHook, "utf-8"), "#!/usr/bin/env bash\n");
+  assert.equal(fs.readFileSync(blockedCurrentHooks, "utf-8"), "not a directory\n");
+});
+
+test("Codex-only install ignores malformed unselected Claude configs", (t) => {
+  const home = tempDir(t);
+  const codexHome = path.join(home, "codex-home");
+  const claudeDir = path.join(home, ".claude");
+  const claudeConfigPath = path.join(home, ".claude.json");
+  const settingsPath = path.join(claudeDir, "settings.json");
+  const legacyCommand = path.join(claudeDir, "commands", "codex-review-code.md");
+  const malformedClaude = '{"mcpServers":{"codex-dialog":';
+  const malformedSettings = '{"hooks":{"PreToolUse":';
+  fs.mkdirSync(path.dirname(legacyCommand), { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(claudeConfigPath, malformedClaude);
+  fs.writeFileSync(settingsPath, malformedSettings);
+  fs.writeFileSync(legacyCommand, "keep legacy Claude command\n");
+  fs.writeFileSync(path.join(codexHome, "config.toml"), "");
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "scripts", "install.mjs"), "--codex", "--host-only"],
+    {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        CODEX_HOME: codexHome,
+        DUALOG_INSTALL_HOST_ONLY: "1",
+      },
+      encoding: "utf-8",
+      timeout: 30000,
+    }
+  );
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.equal(fs.readFileSync(claudeConfigPath, "utf-8"), malformedClaude);
+  assert.equal(fs.readFileSync(settingsPath, "utf-8"), malformedSettings);
+  assert.equal(fs.readFileSync(legacyCommand, "utf-8"), "keep legacy Claude command\n");
+});
+
+test("Claude-only install ignores an invalid unselected Codex config target", (t) => {
+  const home = tempDir(t);
+  const codexHome = path.join(home, "codex-home");
+  const codexConfigPath = path.join(codexHome, "config.toml");
+  const legacySkill = path.join(codexHome, "skills", "claude-review-code", "SKILL.md");
+  fs.mkdirSync(codexConfigPath, { recursive: true });
+  fs.mkdirSync(path.dirname(legacySkill), { recursive: true });
+  fs.writeFileSync(legacySkill, "keep legacy Codex skill\n");
+  fs.writeFileSync(path.join(home, ".claude.json"), "{}\n");
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "scripts", "install.mjs"), "--claude", "--host-only"],
+    {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        CODEX_HOME: codexHome,
+        DUALOG_INSTALL_HOST_ONLY: "1",
+      },
+      encoding: "utf-8",
+      timeout: 30000,
+    }
+  );
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.equal(fs.statSync(codexConfigPath).isDirectory(), true);
+  assert.equal(fs.readFileSync(legacySkill, "utf-8"), "keep legacy Codex skill\n");
+});
+
+test("uninstaller removes only exact Dualog hook commands", (t) => {
+  const root = tempDir(t);
+  const home = path.join(root, "home with spaces");
+  fs.mkdirSync(home, { recursive: true });
+  const claudeDir = path.join(home, ".claude");
+  const hooksRoot = path.join(claudeDir, "hooks");
+  const currentHook = path.join(
+    hooksRoot,
+    "dualog",
+    "enforce-investigation.mjs"
+  );
+  const legacyHook = path.join(
+    hooksRoot,
+    "codex-dialog",
+    "mark-needs-investigation.mjs"
+  );
+  const legacyShellHook = path.join(
+    hooksRoot,
+    "codex-dialog",
+    "enforce-investigation.sh"
+  );
+  const unrelatedHooks = [
+    '"/usr/local/bin/team-dualog-lint" --check',
+    `node "${path.join(home, "other-dualog", "enforce-investigation.mjs")}"`,
+    `node "${currentHook}" --extra`,
+    `bash "${currentHook}"`,
+    `node "${legacyShellHook}"`,
+    `node "${legacyHook}.backup"`,
+  ];
+  const settingsPath = path.join(claudeDir, "settings.json");
+  fs.mkdirSync(path.dirname(currentHook), { recursive: true });
+  fs.mkdirSync(path.dirname(legacyHook), { recursive: true });
+  fs.writeFileSync(currentHook, "// owned current hook\n");
+  fs.writeFileSync(legacyHook, "// owned legacy hook\n");
+  fs.writeFileSync(legacyShellHook, "# owned historical shell hook\n");
+  fs.writeFileSync(path.join(home, ".claude.json"), "{}\n");
+  fs.writeFileSync(
+    settingsPath,
+    `${JSON.stringify(
+      {
+        hooks: {
+          PostToolUse: [
+            { matcher: "CustomEmpty", hooks: [] },
+            { matcher: "CustomMetadata", note: "no hooks by design" },
+            {
+              matcher: "Write",
+              hooks: [
+                { type: "command", command: `node "${currentHook}"` },
+                { type: "command", command: `node ${legacyHook}` },
+                { type: "command", command: `bash ${legacyShellHook}` },
+                ...unrelatedHooks.map((command) => ({ type: "command", command })),
+              ],
+            },
+          ],
+        },
+      },
+      null,
+      2
+    )}\n`
+  );
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "scripts", "uninstall.mjs"), "--claude", "--host-only"],
+    {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        DUALOG_UNINSTALL_HOST_ONLY: "1",
+      },
+      encoding: "utf-8",
+      timeout: 30000,
+    }
+  );
+  assert.equal(
+    result.status,
+    0,
+    `uninstaller stderr:\n${result.stderr}\nstdout:\n${result.stdout}`
+  );
+  const updated = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+  const writeEntry = updated.hooks.PostToolUse.find((entry) => entry.matcher === "Write");
+  assert.deepEqual(
+    writeEntry.hooks.map((hook) => hook.command),
+    unrelatedHooks
+  );
+  assert.deepEqual(updated.hooks.PostToolUse.slice(0, 2), [
+    { matcher: "CustomEmpty", hooks: [] },
+    { matcher: "CustomMetadata", note: "no hooks by design" },
+  ]);
+  assert.equal(fs.existsSync(path.join(hooksRoot, "dualog")), false);
+  assert.equal(fs.existsSync(path.join(hooksRoot, "codex-dialog")), false);
+});
+
+test("uninstaller leaves unrelated Claude hook settings byte-for-byte unchanged", (t) => {
+  const home = tempDir(t);
+  const settingsPath = path.join(home, ".claude", "settings.json");
+  const claudeConfigPath = path.join(home, ".claude.json");
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  const originalClaudeConfig = '{ "mcpServers": { "team-dualog": null } }\n';
+  fs.writeFileSync(claudeConfigPath, originalClaudeConfig);
+  const original = '{\n  "hooks": {\n    "PreToolUse": [{"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/team-dualog-lint"}]}]\n  }\n}\n';
+  fs.writeFileSync(settingsPath, original);
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "scripts", "uninstall.mjs"), "--claude", "--host-only"],
+    {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        DUALOG_UNINSTALL_HOST_ONLY: "1",
+      },
+      encoding: "utf-8",
+      timeout: 30000,
+    }
+  );
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.equal(fs.readFileSync(settingsPath, "utf-8"), original);
+  assert.equal(fs.readFileSync(claudeConfigPath, "utf-8"), originalClaudeConfig);
+});
+
+test("uninstaller removes the authentic pre-rename install and preserves unrelated config", (t) => {
+  const home = tempDir(t);
+  const codexHome = path.join(home, "codex-home");
+  const claudeDir = path.join(home, ".claude");
+  const legacyCommand = path.join(claudeDir, "commands", "codex-review-code.md");
+  const legacyHookDir = path.join(claudeDir, "hooks", "codex-dialog");
+  const legacyHook = path.join(legacyHookDir, "enforce-investigation.sh");
+  const legacyPlatform = path.join(claudeDir, "hooks", "codex-dialog-platform.mjs");
+  const unrelatedGenericPlatform = path.join(claudeDir, "hooks", "platform.mjs");
+  const legacySkill = path.join(codexHome, "skills", "claude-review-code", "SKILL.md");
+  const settingsPath = path.join(claudeDir, "settings.json");
+  const claudeConfigPath = path.join(home, ".claude.json");
+  const codexConfigPath = path.join(codexHome, "config.toml");
+  fs.mkdirSync(path.dirname(legacyCommand), { recursive: true });
+  fs.mkdirSync(legacyHookDir, { recursive: true });
+  fs.mkdirSync(path.dirname(legacySkill), { recursive: true });
+  fs.writeFileSync(legacyCommand, "legacy command\n");
+  fs.writeFileSync(legacyHook, "legacy hook\n");
+  fs.writeFileSync(legacyPlatform, HISTORICAL_PLATFORM_HELPER_HEADER);
+  const unrelatedPlatformContent =
+    'export const description = "mentions dualog platform helpers but is not owned";\n';
+  fs.writeFileSync(unrelatedGenericPlatform, unrelatedPlatformContent);
+  fs.writeFileSync(legacySkill, "legacy skill\n");
+  fs.writeFileSync(
+    claudeConfigPath,
+    `${JSON.stringify(
+      {
+        mcpServers: {
+          "codex-dialog": null,
+          dualog: null,
+          unrelated: { command: "keep" },
+        },
+      },
+      null,
+      2
+    )}\n`
+  );
+  const unrelatedHook = "/usr/local/bin/unrelated-hook --keep";
+  fs.writeFileSync(
+    settingsPath,
+    `${JSON.stringify(
+      {
+        mcpServers: {
+          "codex-dialog": null,
+          dualog: null,
+          unrelatedSettings: { command: "keep-settings" },
+        },
+        hooks: {
+          PreToolUse: [
+            {
+              matcher: "mcp__codex-dialog__send_message",
+              hooks: [
+                { type: "command", command: `bash ${legacyHook}` },
+                { type: "command", command: unrelatedHook },
+              ],
+            },
+          ],
+        },
+      },
+      null,
+      2
+    )}\n`
+  );
+  fs.writeFileSync(
+    codexConfigPath,
+    [
+      "[mcp_servers.codex-dialog]",
+      'command = "node"',
+      'args = ["/old/dialog-server.mjs"]',
+      "",
+      "[mcp_servers.unrelated]",
+      'command = "keep"',
+      "",
+    ].join("\n")
+  );
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "scripts", "uninstall.mjs"), "--both", "--host-only"],
+    {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        CODEX_HOME: codexHome,
+        DUALOG_UNINSTALL_HOST_ONLY: "1",
+      },
+      encoding: "utf-8",
+      timeout: 30000,
+    }
+  );
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.equal(fs.existsSync(legacyCommand), false);
+  assert.equal(fs.existsSync(legacyHookDir), false);
+  assert.equal(fs.existsSync(legacyPlatform), false);
+  assert.equal(fs.readFileSync(unrelatedGenericPlatform, "utf-8"), unrelatedPlatformContent);
+  assert.equal(fs.existsSync(path.dirname(legacySkill)), false);
+  const claudeConfig = JSON.parse(fs.readFileSync(claudeConfigPath, "utf-8"));
+  assert.deepEqual(claudeConfig.mcpServers, { unrelated: { command: "keep" } });
+  const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+  assert.deepEqual(settings.mcpServers, {
+    unrelatedSettings: { command: "keep-settings" },
+  });
+  assert.deepEqual(settings.hooks.PreToolUse[0].hooks, [
+    { type: "command", command: unrelatedHook },
+  ]);
+  const codexConfig = fs.readFileSync(codexConfigPath, "utf-8");
+  assert.doesNotMatch(codexConfig, /codex-dialog/u);
+  assert.match(codexConfig, /mcp_servers\.unrelated/u);
 });
 
 test("unsafe legacy WSL launchers are skipped while native registrations are removed", (t) => {
@@ -1496,7 +2357,10 @@ test("unsafe legacy WSL launchers are skipped while native registrations are rem
 });
 
 test("macOS entrypoints preserve valid final config symlinks", (t) => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") {
+    t.skip("this test exercises POSIX final-component symlink semantics");
+    return;
+  }
   const home = tempDir(t);
   const codexHome = path.join(home, "codex-home");
   const targets = path.join(home, "real-configs");
@@ -1565,8 +2429,7 @@ test("macOS entrypoints preserve valid final config symlinks", (t) => {
   assert.doesNotMatch(fs.readFileSync(real.codex, "utf-8"), /mcp_servers\.dualog/);
 });
 
-test("macOS/Linux entrypoints install and uninstall entirely inside isolated homes", (t) => {
-  if (process.platform === "win32") return;
+test("entrypoints install and uninstall entirely inside isolated homes", (t) => {
   const home = tempDir(t);
   const codexHome = path.join(home, "custom-codex-home");
   const env = {
@@ -1623,7 +2486,6 @@ test("macOS/Linux entrypoints install and uninstall entirely inside isolated hom
 });
 
 test("entrypoint prevalidation leaves legacy files untouched when JSON is malformed", (t) => {
-  if (process.platform === "win32") return;
   const home = tempDir(t);
   const codexHome = path.join(home, "custom-codex-home");
   const legacyCommand = path.join(
@@ -1669,7 +2531,10 @@ test("entrypoint prevalidation leaves legacy files untouched when JSON is malfor
 });
 
 test("dangling Codex config prevalidation fails before legacy migration", (t) => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") {
+    t.skip("this test exercises POSIX dangling-symlink semantics");
+    return;
+  }
   const home = tempDir(t);
   const codexHome = path.join(home, "codex-home");
   const legacyCommand = path.join(
@@ -1715,7 +2580,10 @@ test("dangling Codex config prevalidation fails before legacy migration", (t) =>
 });
 
 test("dangling config parent prevalidation fails before legacy migration", (t) => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") {
+    t.skip("this test exercises POSIX dangling-directory-symlink semantics");
+    return;
+  }
   const home = tempDir(t);
   const codexHome = path.join(home, "dangling-codex-home");
   const legacyCommand = path.join(

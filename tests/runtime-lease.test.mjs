@@ -14,10 +14,12 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
+import crossSpawn from "cross-spawn";
 
 import { managedSession } from "./helpers/session.mjs";
 
@@ -37,6 +39,78 @@ const {
   transitionLease,
 } = await import("../src/runtime-lease.mjs");
 const { assertManagedLeasePath, runtimeDir } = await import("../src/platform.mjs");
+const { processStartTime } = await import("../src/process-probe.mjs");
+
+// Most lease-state tests need one deterministic fact from tmux: the synthetic
+// session name is absent. They still exercise the real exact-route boundary --
+// launcher, transport, distro, control binary, and socket must all match before
+// this process call is reached -- but do not require native Windows to provide
+// a tmux binary it cannot have. The dedicated lifecycle test below restores the
+// operator/default binary and drives a real POSIX tmux server.
+const ORIGINAL_TMUX_BINARY = process.env.DUALOG_TMUX_BINARY;
+const FIXTURE_TMUX_BINARY = path.join(
+  ROOT,
+  process.platform === "win32" ? "tmux-fixture.exe" : "tmux-fixture"
+);
+const ORIGINAL_CROSS_SPAWN_SYNC = crossSpawn.sync;
+process.env.DUALOG_TMUX_BINARY = FIXTURE_TMUX_BINARY;
+crossSpawn.sync = (command, args, options) => {
+  if (
+    command === FIXTURE_TMUX_BINARY &&
+    Array.isArray(args) &&
+    args.includes("has-session")
+  ) {
+    const target = args[args.indexOf("-t") + 1] || "=fixture";
+    return {
+      pid: 0,
+      output: [null, "", `can't find session: ${target}`],
+      stdout: "",
+      stderr: `can't find session: ${target}`,
+      status: 1,
+      signal: null,
+    };
+  }
+  return ORIGINAL_CROSS_SPAWN_SYNC(command, args, options);
+};
+
+const UNKNOWN_DIRECTORY_USAGE = /whether this directory is in use could not be determined/u;
+
+function releaseAllowingUnknownDirectory(lease) {
+  try {
+    return releaseLease(lease);
+  } catch (error) {
+    if (!UNKNOWN_DIRECTORY_USAGE.test(String(error?.message || error))) throw error;
+    assert.equal(
+      fs.existsSync(lease.dir),
+      true,
+      "an unanswerable directory-usage probe must fail before deletion"
+    );
+    return { released: false, reason: String(error.message) };
+  }
+}
+
+function releasedOrRetainedUnknown(t, lease, result, successOnlyDescription) {
+  if (result.released === true) return true;
+  assert.match(result.reason, UNKNOWN_DIRECTORY_USAGE);
+  assert.equal(fs.existsSync(lease.dir), true, "unknown directory usage must retain the lease");
+  t.diagnostic(`${successOnlyDescription} requires a host that can prove the lease is free`);
+  return false;
+}
+
+function sweepRemovedOrRetainedUnknown(t, lease, receipt, successOnlyDescription) {
+  const removed = receipt.removed.find((entry) => entry.dir === lease.dir);
+  const retained = receipt.retained.find((entry) => entry.dir === lease.dir);
+  assert.notEqual(
+    Boolean(removed),
+    Boolean(retained),
+    "a sweep must report the lease exactly once as removed or retained"
+  );
+  if (removed) return removed;
+  assert.match(retained.reason, UNKNOWN_DIRECTORY_USAGE);
+  assert.equal(fs.existsSync(lease.dir), true, "unknown directory usage must retain the lease");
+  t.diagnostic(`${successOnlyDescription} requires a host that can prove the lease is free`);
+  return null;
+}
 
 let turnCounter = 0;
 function freshTurnDir() {
@@ -104,6 +178,62 @@ function requirePreciseBoot(t) {
   const boot = previousBoot();
   if (!boot) t.skip("this host has no precise boot identity, so nothing can heal");
   return boot;
+}
+
+function installCleanupClaim(
+  lease,
+  {
+    ownerPid,
+    ownerStartTime,
+    boot = bootIdentity(),
+    token = crypto.randomBytes(16).toString("hex"),
+    value = {},
+  }
+) {
+  const claimPath = `${lease.dir}.cleanup.claim`;
+  fs.mkdirSync(claimPath, { mode: 0o700 });
+  fs.chmodSync(claimPath, 0o700);
+  fs.writeFileSync(
+    path.join(claimPath, "claim.json"),
+    JSON.stringify({
+      claim_schema_version: 1,
+      lease_id: lease.id,
+      token,
+      owner_pid: ownerPid,
+      owner_start_time: ownerStartTime,
+      boot,
+      claimed_at: new Date().toISOString(),
+      ...value,
+    }),
+    { mode: 0o600 }
+  );
+  return { claimPath, token, archivedPath: `${claimPath}.stale-${token}` };
+}
+
+function cleanupClaimArtifacts(lease) {
+  const prefix = `${path.basename(lease.dir)}.cleanup.claim`;
+  for (const entry of fs.readdirSync(runtimeDir())) {
+    if (entry === prefix || entry.startsWith(`${prefix}.`)) {
+      fs.rmSync(path.join(runtimeDir(), entry), { recursive: true, force: true });
+    }
+  }
+}
+
+function cleanupLeaseFamilyArtifacts(lease) {
+  for (const entry of fs.readdirSync(runtimeDir())) {
+    if (!entry.endsWith(".lease.json")) continue;
+    const target = path.join(runtimeDir(), entry);
+    try {
+      const value = JSON.parse(fs.readFileSync(target, "utf-8"));
+      if (value.lease_id !== lease.id && value.release_generation !== lease.id) continue;
+      const owner = path.join(runtimeDir(), entry.slice(0, -".lease.json".length));
+      fs.rmSync(owner, { recursive: true, force: true });
+      fs.rmSync(target, { force: true });
+    } catch {}
+  }
+  fs.rmSync(lease.dir, { recursive: true, force: true });
+  fs.rmSync(lease.metaPath, { force: true });
+  cleanupClaimArtifacts(lease);
 }
 
 /** A process that is genuinely alive for the duration of one test. */
@@ -232,6 +362,19 @@ test("a pre-spawn lease is removable only once its owner is gone", (t) => {
   }
 });
 
+test("a precise previous boot supersedes a reused owner pid", (t) => {
+  const rebooted = requirePreciseBoot(t);
+  if (!rebooted) return;
+  for (const state of ["allocated", "projecting", "ready"]) {
+    const verdict = proveLeaseReleasable({
+      state,
+      runner_pid: process.pid,
+      boot: rebooted,
+    });
+    assert.equal(verdict.removable, true, `${state}: the prior-boot owner cannot survive`);
+  }
+});
+
 test("a lease mid-spawn is not mistaken for one whose consumer exited", (t) => {
   const rebooted = requirePreciseBoot(t);
   if (!rebooted) return;
@@ -308,7 +451,10 @@ test("a headless consumer whose leader died but whose group survives is retained
   // probe correctly answers "absent" -- which would have made this pass against a
   // group check that does not exist. The headless engine spawns detached for
   // exactly this reason, so the fixture has to as well.
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") {
+    t.skip("POSIX process-group fixture; Windows tree-lifecycle proof is covered separately");
+    return;
+  }
   const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
     stdio: "ignore",
     detached: true,
@@ -326,6 +472,24 @@ test("a headless consumer whose leader died but whose group survives is retained
   });
   assert.equal(verdict.removable, false, "a surviving group must retain the lease");
   assert.match(verdict.reason, /still running/);
+});
+
+test("a precise previous boot supersedes a reused live pid", (t) => {
+  const rebooted = requirePreciseBoot(t);
+  if (!rebooted) return;
+  for (const state of ["spawning", "active"]) {
+    const verdict = proveLeaseReleasable({
+      state,
+      runner_pid: process.pid,
+      boot: rebooted,
+      consumer: { kind: "headless", pid: process.pid, pgid: process.pid },
+    });
+    assert.equal(
+      verdict.removable,
+      true,
+      `${state}: a current live process can only be reuse after a precise reboot`
+    );
+  }
 });
 
 test("a closed pane does not prove the partner process exited", (t) => {
@@ -520,14 +684,136 @@ test("a reused pid does not keep a lease alive forever", async () => {
   }
 });
 
+test("native Windows process generations use a fixed, bounded CIM query", () => {
+  const script = `
+    const cp = require("node:child_process");
+    const { syncBuiltinESMExports } = require("node:module");
+    const calls = [];
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    process.env.SystemRoot = "C:\\\\Windows";
+    cp.execFileSync = (file, args, options) => {
+      calls.push({ file, args, options: {
+        timeout: options.timeout,
+        maxBuffer: options.maxBuffer,
+        shell: options.shell,
+        windowsHide: options.windowsHide,
+        stdio: options.stdio,
+        probePid: options.env.DUALOG_INTERNAL_PROCESS_PROBE_PID,
+      } });
+      return "638923456789012345";
+    };
+    syncBuiltinESMExports();
+    import(${JSON.stringify(new URL("../src/process-probe.mjs", import.meta.url).href)}).then((m) => {
+      console.log(JSON.stringify({
+        pid: process.pid,
+        startedAt: m.processStartTime(process.pid),
+        same: m.probeRecordedProcess(process.pid, "638923456789012345"),
+        reused: m.probeRecordedProcess(process.pid, "638923456789012346"),
+        calls,
+      }));
+    });
+  `;
+  const out = JSON.parse(
+    execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+  );
+  assert.equal(out.startedAt, "638923456789012345");
+  assert.equal(out.same, "alive");
+  assert.equal(out.reused, "absent");
+  assert.equal(out.calls.length, 3);
+  for (const call of out.calls) {
+    assert.equal(
+      call.file.toLowerCase(),
+      "c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe"
+    );
+    assert.deepEqual(call.args.slice(0, 4), [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+    ]);
+    assert.match(call.args[4], /Get-CimInstance -ClassName Win32_Process/u);
+    assert.match(call.args[4], /CreationDate/u);
+    assert.match(call.args[4], /\$PSModuleAutoloadingPreference = 'None'/u);
+    assert.match(
+      call.args[4],
+      /\[IO\.Path\]::Combine\(\$PSHOME, 'Modules', 'CimCmdlets', 'CimCmdlets\.psd1'\)/u
+    );
+    assert.match(call.args[4], /Microsoft\.PowerShell\.Core\\Import-Module/u);
+    assert.match(call.args[4], /CimCmdlets\\Get-CimInstance/u);
+    assert.doesNotMatch(call.args[4], /(?:^|[;\s])Get-CimInstance(?:\s|$)/u);
+    assert.match(call.args[4], /\[uint32\]\$processId/u);
+    assert.match(call.args[4], /\[uint32\]::TryParse/u);
+    assert.equal(call.options.probePid, String(out.pid));
+    assert.equal(call.options.timeout, 5000);
+    assert.equal(call.options.maxBuffer, 4096);
+    assert.equal(call.options.shell, false);
+    assert.equal(call.options.windowsHide, true);
+    assert.deepEqual(call.options.stdio, ["ignore", "pipe", "ignore"]);
+  }
+});
+
+test("native Windows rejects malformed process generation output", () => {
+  const script = `
+    const cp = require("node:child_process");
+    const { syncBuiltinESMExports } = require("node:module");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    process.env.SystemRoot = "C:\\\\Windows";
+    cp.execFileSync = () => "638923456789012345\\nforged";
+    syncBuiltinESMExports();
+    import(${JSON.stringify(new URL("../src/process-probe.mjs", import.meta.url).href)}).then((m) => {
+      console.log(JSON.stringify({
+        startedAt: m.processStartTime(process.pid),
+        verdict: m.probeRecordedProcess(process.pid, "638923456789012345"),
+      }));
+    });
+  `;
+  const out = JSON.parse(
+    execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+  );
+  assert.equal(out.startedAt, null);
+  assert.equal(out.verdict, "alive", "unverifiable generation must retain");
+});
+
+test("native Windows rejects impossible process ids before launching PowerShell", () => {
+  const script = `
+    const cp = require("node:child_process");
+    const { syncBuiltinESMExports } = require("node:module");
+    const calls = [];
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    process.env.SystemRoot = "C:\\\\Windows";
+    cp.execFileSync = (file, args, options) => {
+      calls.push({ file, args, probePid: options.env.DUALOG_INTERNAL_PROCESS_PROBE_PID });
+      return "638923456789012345";
+    };
+    syncBuiltinESMExports();
+    import(${JSON.stringify(new URL("../src/process-probe.mjs", import.meta.url).href)}).then((m) => {
+      const invalid = [-1, 0, 1.5, Number.NaN, 4294967296, Number.MAX_SAFE_INTEGER]
+        .map((pid) => m.processStartTime(pid));
+      const unsigned = m.processStartTime(4294967295);
+      console.log(JSON.stringify({ invalid, unsigned, calls }));
+    });
+  `;
+  const out = JSON.parse(
+    execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+  );
+  assert.deepEqual(out.invalid, [null, null, null, null, null, null]);
+  assert.equal(out.unsigned, "638923456789012345");
+  assert.equal(out.calls.length, 1, "an impossible PID must never reach the identity command");
+  assert.equal(out.calls[0].probePid, "4294967295");
+  assert.match(out.calls[0].args[4], /\[uint32\]\$processId/u);
+  assert.match(out.calls[0].args[4], /\[uint32\]::TryParse/u);
+});
+
 test("a generation that cannot be read retains, rather than reading as reuse", () => {
-  // The reuse check needs `ps`. Where that is unavailable -- a restricted host,
-  // a stripped container -- an unreadable generation must NOT be taken as proof
-  // the pid was recycled, because that verdict deletes a live partner's home.
+  // The reuse check needs `ps` or Windows CIM. Where that is unavailable -- a
+  // restricted host or stripped container -- an unreadable generation must NOT
+  // be taken as proof the pid was recycled, because that verdict deletes a live
+  // partner's home.
   // Unverifiable resolves to "still running", the same direction every other
   // unknown in this module takes.
   const script = `
-    process.env.PATH = "";
+    if (process.platform === "win32") process.env.SystemRoot = "";
+    else process.env.PATH = "";
     import(${JSON.stringify(new URL("../src/process-probe.mjs", import.meta.url).href)}).then((m) => {
       console.log(JSON.stringify({
         startTime: m.processStartTime(process.pid),
@@ -536,7 +822,7 @@ test("a generation that cannot be read retains, rather than reading as reuse", (
     });
   `;
   const out = JSON.parse(execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim());
-  assert.equal(out.startTime, null, "precondition: ps must be unreachable in the child");
+  assert.equal(out.startTime, null, "precondition: the OS generation source must be unreachable");
   assert.equal(out.verdict, "alive", "an unverifiable generation must not authorize deletion");
 });
 
@@ -858,13 +1144,13 @@ test("boot identity prefers what the OS tracks over wall-clock arithmetic", () =
   assert.ok(identity, "this host must be able to identify its boot");
   assert.equal(typeof identity.host, "string");
 
-  // Both platforms this runs on expose a real boot identity -- /proc/.../boot_id
-  // on Linux, kern.boottime on macOS -- so falling back to wall-clock arithmetic
-  // here is a regression, not an environment difference.
-  if (process.platform === "linux" || process.platform === "darwin") {
+  // Every supported host exposes a real boot identity -- /proc/.../boot_id on
+  // Linux, kern.boottime on macOS, and CIM LastBootUpTime on Windows -- so a
+  // wall-clock fallback here is a regression, not an environment difference.
+  if (["linux", "darwin", "win32"].includes(process.platform)) {
     assert.equal(identity.precise, true, `${process.platform} must yield a precise boot identity`);
     assert.ok(
-      identity.source === "boot-id" || identity.source === "kern.boottime",
+      ["boot-id", "kern.boottime", "win32.last-boot-up-time"].includes(identity.source),
       `unexpected boot identity source: ${identity.source}`
     );
   }
@@ -909,18 +1195,220 @@ test("boot identity prefers what the OS tracks over wall-clock arithmetic", () =
   );
 });
 
+test("native Windows boot identity uses a fixed CIM query and strict output", () => {
+  const script = `
+    const fs = require("node:fs"), cp = require("node:child_process");
+    const { syncBuiltinESMExports } = require("node:module");
+    const originalReadFileSync = fs.readFileSync;
+    const calls = [];
+    let procReads = 0;
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    process.env.SystemRoot = "C:\\\\Windows";
+    fs.readFileSync = (target, ...args) => {
+      if (String(target) === "/proc/sys/kernel/random/boot_id") {
+        procReads += 1;
+        throw new Error("the Windows source must not probe Linux boot_id");
+      }
+      return originalReadFileSync(target, ...args);
+    };
+    cp.execFileSync = (file, args, options) => {
+      calls.push({ file, args, options });
+      if (!String(file).endsWith("\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe")) {
+        throw new Error("unexpected executable: " + file);
+      }
+      return "638923456789012345";
+    };
+    syncBuiltinESMExports();
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const identity = m.bootIdentity();
+      console.log(JSON.stringify({
+        identity,
+        same: m.isSameBoot({ ...identity }),
+        different: m.isSameBoot({ ...identity, id: identity.id + "-different" }),
+        calls,
+        procReads,
+      }));
+    });
+  `;
+  const out = JSON.parse(
+    execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+  );
+  assert.equal(out.identity.precise, true);
+  assert.equal(out.identity.source, "win32.last-boot-up-time");
+  assert.equal(out.identity.id, "win32.last-boot-up-time:638923456789012345");
+  assert.equal(out.same, true, "the same Windows boot must retain ambiguous leases");
+  assert.equal(out.different, false, "only a different precise Windows boot may authorize healing");
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.procReads, 0, "native Windows must not probe Linux boot_id");
+  assert.equal(
+    out.calls[0].file.toLowerCase(),
+    "c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe"
+  );
+  assert.deepEqual(out.calls[0].args.slice(0, 4), [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+  ]);
+  assert.match(out.calls[0].args[4], /Get-CimInstance -ClassName Win32_OperatingSystem/u);
+  assert.match(out.calls[0].args[4], /LastBootUpTime/u);
+  assert.match(out.calls[0].args[4], /\$PSModuleAutoloadingPreference = 'None'/u);
+  assert.match(
+    out.calls[0].args[4],
+    /\[IO\.Path\]::Combine\(\$PSHOME, 'Modules', 'CimCmdlets', 'CimCmdlets\.psd1'\)/u
+  );
+  assert.match(out.calls[0].args[4], /Microsoft\.PowerShell\.Core\\Import-Module/u);
+  assert.match(out.calls[0].args[4], /CimCmdlets\\Get-CimInstance/u);
+  assert.doesNotMatch(out.calls[0].args[4], /(?:^|[;\s])Get-CimInstance(?:\s|$)/u);
+  assert.equal(out.calls[0].options.windowsHide, true);
+  assert.equal(out.calls[0].options.timeout, 5000);
+  assert.equal(out.calls[0].options.maxBuffer, 4096);
+  assert.equal(out.calls[0].options.shell, false);
+});
+
+test("native Windows rejects malformed CIM boot identity output", () => {
+  const script = `
+    const cp = require("node:child_process");
+    const { syncBuiltinESMExports } = require("node:module");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    process.env.SystemRoot = "C:\\\\Windows";
+    cp.execFileSync = () => "638923456789012345\\nforged";
+    syncBuiltinESMExports();
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const identity = m.bootIdentity();
+      console.log(JSON.stringify(identity));
+    });
+  `;
+  const identity = JSON.parse(
+    execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+  );
+  assert.equal(identity.precise, false, "unvalidated command output must never authorize deletion");
+  assert.equal(identity.source, "uptime");
+});
+
+test("native Windows boot identity uses the shared strict SystemRoot resolver", () => {
+  for (const systemRoot of [
+    "C:\\Windows\\..\\Temp",
+    "C:\\Windows ",
+    "C:\\Windows:stream",
+    "\\\\server\\share\\Windows",
+  ]) {
+    const script = `
+      const cp = require("node:child_process");
+      const { syncBuiltinESMExports } = require("node:module");
+      let calls = 0;
+      Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+      process.env.SystemRoot = ${JSON.stringify(systemRoot)};
+      cp.execFileSync = () => { calls += 1; return "638923456789012345"; };
+      syncBuiltinESMExports();
+      import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+        console.log(JSON.stringify({ identity: m.bootIdentity(), calls }));
+      });
+    `;
+    const out = JSON.parse(
+      execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+    );
+    assert.equal(out.calls, 0, `${systemRoot}: an invalid root must never launch PowerShell`);
+    assert.equal(out.identity.precise, false, `${systemRoot}: invalid resolution must fail closed`);
+    assert.equal(out.identity.source, "uptime");
+  }
+});
+
+test("native Windows rejects .NET ticks beyond DateTime.MaxValue everywhere", () => {
+  const script = `
+    const cp = require("node:child_process");
+    const { syncBuiltinESMExports } = require("node:module");
+    let calls = 0;
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    process.env.SystemRoot = "C:\\\\Windows";
+    cp.execFileSync = () => {
+      calls += 1;
+      return "3155378976000000000";
+    };
+    syncBuiltinESMExports();
+    Promise.all([
+      import(${JSON.stringify(new URL("../src/process-probe.mjs", import.meta.url).href)}),
+      import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}),
+    ]).then(([probe, lease]) => {
+      const startedAt = probe.processStartTime(process.pid);
+      const verdict = probe.probeRecordedProcess(process.pid, "638923456789012345");
+      const identity = lease.bootIdentity();
+      console.log(JSON.stringify({ startedAt, verdict, identity, calls }));
+    });
+  `;
+  const out = JSON.parse(
+    execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+  );
+  assert.equal(out.startedAt, null, "an impossible process generation is unavailable");
+  assert.equal(out.verdict, "alive", "an impossible generation must retain the live process");
+  assert.equal(out.identity.precise, false, "impossible boot ticks cannot authorize deletion");
+  assert.equal(out.identity.source, "uptime");
+  assert.equal(out.calls, 3);
+});
+
+test("native Windows CIM failures and timeouts remain fail-closed", () => {
+  for (const errorCode of ["ENOENT", "ETIMEDOUT"]) {
+    const script = `
+      const cp = require("node:child_process");
+      const { syncBuiltinESMExports } = require("node:module");
+      let calls = 0;
+      Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+      process.env.SystemRoot = "C:\\\\Windows";
+      cp.execFileSync = () => {
+        calls += 1;
+        const error = new Error(${JSON.stringify(errorCode)});
+        error.code = ${JSON.stringify(errorCode)};
+        throw error;
+      };
+      syncBuiltinESMExports();
+      Promise.all([
+        import(${JSON.stringify(new URL("../src/process-probe.mjs", import.meta.url).href)}),
+        import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}),
+      ]).then(([probe, lease]) => {
+        const startedAt = probe.processStartTime(process.pid);
+        const verdict = probe.probeRecordedProcess(process.pid, "638923456789012345");
+        const identity = lease.bootIdentity();
+        const bootMismatch = lease.isSameBoot(
+          { host: identity.host, id: "previous-boot", precise: true },
+          identity
+        );
+        console.log(JSON.stringify({ startedAt, verdict, identity, bootMismatch, calls }));
+      });
+    `;
+    const out = JSON.parse(
+      execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+    );
+    assert.equal(out.startedAt, null, `${errorCode}: process generation must be unavailable`);
+    assert.equal(out.verdict, "alive", `${errorCode}: an unverified process must be retained`);
+    assert.equal(out.identity.precise, false, `${errorCode}: boot identity must be imprecise`);
+    assert.equal(out.identity.source, "uptime");
+    assert.equal(out.bootMismatch, null, `${errorCode}: failure cannot establish a reboot`);
+    assert.equal(out.calls, 3);
+  }
+});
+
 test("boot identity reports unavailable rather than throwing", () => {
   // FOUND IN REVIEW, on a restricted host: os.uptime() raises
   // `uv_uptime returned EPERM` rather than returning something unusable, and it
   // propagated out of allocateLease() -- so no lease-backed adapter could start
   // there at all. An unavailable identity only costs the self-healing of
   // identity-less spawning leases, which is a retention, not a failure.
-  // Everything unavailable at once: uptime raises EPERM (the reviewer's host),
-  // PATH is emptied so sysctl cannot be found, and /proc does not exist here.
+  // Everything unavailable at once: emulate Linux on every host, make uptime
+  // raise EPERM (the reviewer's host), and hide the boot-id file explicitly.
   const script = `
     const os = require("node:os");
+    const fs = require("node:fs");
+    const originalReadFileSync = fs.readFileSync;
+    Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
     os.uptime = () => { throw new Error("uv_uptime returned EPERM"); };
-    process.env.PATH = "";
+    fs.readFileSync = (target, ...args) => {
+      if (String(target) === "/proc/sys/kernel/random/boot_id") {
+        const err = new Error("boot id is unavailable");
+        err.code = "ENOENT";
+        throw err;
+      }
+      return originalReadFileSync(target, ...args);
+    };
     import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
       const identity = m.bootIdentity();
       // And a lease must still be judgeable, with the identity recorded absent.
@@ -951,7 +1439,11 @@ test("removal refuses anything that is not a lease", (t) => {
     const link = path.join(runtimeDir(), "b".repeat(32));
     fs.symlinkSync(outside, link);
     t.after(() => fs.rmSync(link, { force: true }));
-    assert.throws(() => removeLeaseDirectory(link), /symbolic link/);
+    assert.throws(
+      () => removeLeaseDirectory(link),
+      /symbolic link|whether this directory is in use could not be determined/u,
+      "a linked lease path must be refused whether the host proves it is free or fails closed"
+    );
     assert.ok(fs.existsSync(outside), "the link target must survive");
   }
 });
@@ -996,7 +1488,45 @@ test("deletion revalidates the root itself, not just what its caller checked", (
   assert.equal(out.targetSurvives, true, "and the link target must be untouched");
 });
 
-test("releasing takes the credentials with it", () => {
+test("strict POSIX removal leaves canonical attribution for late recreation", (t) => {
+  if (process.platform === "win32") {
+    t.skip("strict native Windows removal fails closed on unavailable handle evidence");
+    return;
+  }
+  const id = crypto.randomBytes(16).toString("hex");
+  const dir = path.join(runtimeDir(), id);
+  fs.mkdirSync(path.join(dir, "codex-home"), { recursive: true });
+  fs.chmodSync(dir, 0o700);
+  fs.writeFileSync(path.join(dir, "codex-home", "auth.json"), "secret");
+
+  removeLeaseDirectory(dir);
+  assert.equal(fs.existsSync(dir), false);
+  const markerPath = `${dir}.lease.json`;
+  const marker = JSON.parse(fs.readFileSync(markerPath, "utf-8"));
+  assert.equal(marker.strict_usage_only, true);
+  assert.equal(marker.strict_canonical_generation, true);
+  assert.equal(marker.release_relaxation_eligible, false);
+
+  fs.mkdirSync(path.join(dir, "codex-home"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "codex-home", "late.json"), "{}");
+  const receipt = sweepLeases({ apply: true });
+  assert.ok(receipt.removed.some((entry) => entry.dir === dir));
+  assert.equal(fs.existsSync(dir), false, "a fresh strict scan may reclaim the recreation");
+  assert.equal(fs.existsSync(markerPath), true, "the canonical marker remains permanent");
+
+  for (const entry of fs.readdirSync(runtimeDir())) {
+    if (!entry.endsWith(".lease.json")) continue;
+    const target = path.join(runtimeDir(), entry);
+    try {
+      const value = JSON.parse(fs.readFileSync(target, "utf-8"));
+      if (value.lease_id === id || value.release_generation === id) {
+        fs.rmSync(target, { force: true });
+      }
+    } catch {}
+  }
+});
+
+test("releasing takes the credentials with it", (t) => {
   const lease = newLease();
   transitionLease(lease, "projecting");
   const home = path.join(lease.dir, "codex-home");
@@ -1010,12 +1540,16 @@ test("releasing takes the credentials with it", () => {
     },
   });
 
-  const { released } = releaseLease(lease);
-  assert.equal(released, true);
+  const result = releaseAllowingUnknownDirectory(lease);
+  if (!releasedOrRetainedUnknown(t, lease, result, "successful credential cleanup")) {
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+    fs.rmSync(lease.metaPath, { force: true });
+    return;
+  }
   assert.equal(fs.existsSync(lease.dir), false, "the whole lease goes, auth.json included");
 });
 
-test("a runner can clean up after its own failed pre-spawn turn", () => {
+test("a runner can clean up after its own failed pre-spawn turn", (t) => {
   // FOUND BY SELF-REVIEW, not by the reviewer. proveLeaseReleasable() retains a
   // pre-spawn lease while its owner lives -- correct for a sweep in another
   // process, and exactly wrong for the owner itself, which is that live runner.
@@ -1028,9 +1562,13 @@ test("a runner can clean up after its own failed pre-spawn turn", () => {
   fs.mkdirSync(home, { recursive: true });
   fs.writeFileSync(path.join(home, "auth.json"), '{"token":"partial-projection"}');
 
-  const { released } = releaseLease(lease);
-  assert.equal(released, true, "the owner may reclaim its own pre-spawn lease");
-  assert.equal(fs.existsSync(lease.dir), false);
+  const ownerRelease = releaseAllowingUnknownDirectory(lease);
+  if (releasedOrRetainedUnknown(t, lease, ownerRelease, "successful owner cleanup")) {
+    assert.equal(fs.existsSync(lease.dir), false);
+  } else {
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+    fs.rmSync(lease.metaPath, { force: true });
+  }
 
   // A FAILED SPAWN too, once the consumer is provably absent. The owner has
   // awaited its own spawn call by the time it releases, so unlike a third-party
@@ -1048,8 +1586,22 @@ test("a runner can clean up after its own failed pre-spawn turn", () => {
       pane_pid: 999999,
     },
   });
-  assert.equal(releaseLease(failed).released, true, "the owner may reclaim its own failed spawn");
-  assert.equal(fs.existsSync(failed.dir), false);
+  const failedRelease = releaseAllowingUnknownDirectory(failed);
+  const failedTombstone = meta(failed);
+  assert.equal(failedTombstone.state, "released");
+  assert.equal(failedTombstone.released_from_state, "spawning");
+  assert.equal(
+    failedTombstone.consumer_never_created,
+    undefined,
+    "an identified tmux pane must never be rewritten as a never-created consumer"
+  );
+  assert.equal(failedTombstone.consumer.pane_pid, 999999, "the pane identity stays durable");
+  if (releasedOrRetainedUnknown(t, failed, failedRelease, "successful failed-spawn cleanup")) {
+    assert.equal(fs.existsSync(failed.dir), false);
+  } else {
+    fs.rmSync(failed.dir, { recursive: true, force: true });
+    fs.rmSync(failed.metaPath, { force: true });
+  }
 
   const unidentifiedPane = newLease();
   transitionLease(unidentifiedPane, "spawning", {
@@ -1121,7 +1673,7 @@ test("releasing a lease whose consumer is still live does nothing", () => {
   fs.rmSync(lease.dir, { recursive: true, force: true });
 });
 
-test("a lease record survives the partner recreating its home", () => {
+test("a lease record survives the partner recreating its home", (t) => {
   // THE PRODUCTION INCIDENT, fixed structurally rather than worked around.
   //
   // A partner CLI outlived its tmux pane and, after the lease was released,
@@ -1143,7 +1695,14 @@ test("a lease record survives the partner recreating its home", () => {
   assert.equal(path.dirname(lease.metaPath), path.resolve(runtimeDir()));
   assert.equal(fs.existsSync(path.join(lease.dir, "lease.json")), false, "nothing inside the lease");
 
-  assert.equal(releaseLease(lease).released, true);
+  const initialRelease = releaseAllowingUnknownDirectory(lease);
+  if (!releasedOrRetainedUnknown(t, lease, initialRelease, "recreated-home reclamation")) {
+    assert.equal(fs.existsSync(lease.metaPath), true, "the sibling record must survive retention");
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+    fs.rmSync(lease.metaPath, { force: true });
+    return;
+  }
+
   assert.equal(fs.existsSync(lease.dir), false);
 
   // A TOMBSTONE remains, so what the directory was is still knowable.
@@ -1157,10 +1716,765 @@ test("a lease record survives the partner recreating its home", () => {
 
   // Reclaimed on the record, not on age and not on ownership.
   const receipt = sweepLeases({ apply: true });
-  const removed = receipt.removed.find((r) => r.dir === lease.dir);
-  assert.ok(removed, "a recreated home must be reclaimable");
-  assert.match(removed.reason, /recreated after the lease was released/);
+  const removed = sweepRemovedOrRetainedUnknown(
+    t,
+    lease,
+    receipt,
+    "successful recreated-home sweep"
+  );
+  if (removed) {
+    assert.match(removed.reason, /recreated after the lease was released/);
+    assert.equal(fs.existsSync(lease.dir), false);
+  } else {
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+    fs.rmSync(lease.metaPath, { force: true });
+  }
+});
+
+test("same-boot cleanup claims are taken over only for absent or reused owners", (t) => {
+  const currentStart = processStartTime(process.pid);
+  assert.ok(currentStart, "the supported host must expose this process generation");
+
+  for (const fixture of [
+    { name: "absent", ownerPid: 999999, ownerStartTime: "recorded-dead-generation" },
+    { name: "reused", ownerPid: process.pid, ownerStartTime: `${currentStart}-previous` },
+  ]) {
+    const lease = newLease();
+    transitionLease(lease, "projecting");
+    const claim = installCleanupClaim(lease, {
+      ownerPid: fixture.ownerPid,
+      ownerStartTime: fixture.ownerStartTime,
+    });
+
+    const released = releaseLease(lease);
+    assert.deepEqual(released, { released: true, reason: null }, fixture.name);
+    assert.equal(fs.existsSync(lease.dir), false, `${fixture.name}: the lease is reclaimed`);
+    assert.equal(fs.existsSync(claim.claimPath), false, `${fixture.name}: the new claim was released`);
+    assert.equal(
+      fs.existsSync(claim.archivedPath),
+      true,
+      `${fixture.name}: the exact stale generation remains archived`
+    );
+    cleanupLeaseFamilyArtifacts(lease);
+  }
+});
+
+test("a precise previous boot permits cleanup-claim takeover", (t) => {
+  const oldBoot = requirePreciseBoot(t);
+  if (!oldBoot) return;
+  const lease = newLease();
+  transitionLease(lease, "projecting");
+  const claim = installCleanupClaim(lease, {
+    ownerPid: process.pid,
+    ownerStartTime: processStartTime(process.pid),
+    boot: oldBoot,
+  });
+
+  const released = releaseLease(lease);
+  assert.deepEqual(released, { released: true, reason: null });
+  assert.equal(fs.existsSync(lease.dir), false, "nothing from the prior boot can own the claim");
+  assert.equal(fs.existsSync(claim.archivedPath), true);
+  cleanupLeaseFamilyArtifacts(lease);
+});
+
+test("live, unknown, and malformed cleanup claims retain fail-closed", (t) => {
+  const currentStart = processStartTime(process.pid);
+  assert.ok(currentStart, "the supported host must expose this process generation");
+
+  const live = newLease();
+  transitionLease(live, "projecting");
+  const liveClaim = installCleanupClaim(live, {
+    ownerPid: process.pid,
+    ownerStartTime: currentStart,
+  });
+  const liveResult = releaseLease(live);
+  assert.equal(liveResult.released, false);
+  assert.match(liveResult.reason, /cleanup owner process is still alive/);
+  assert.equal(fs.existsSync(live.dir), true);
+  assert.equal(fs.existsSync(liveClaim.claimPath), true);
+  cleanupLeaseFamilyArtifacts(live);
+
+  const unknown = newLease();
+  transitionLease(unknown, "projecting");
+  const unknownPid = 424242;
+  const unknownClaim = installCleanupClaim(unknown, {
+    ownerPid: unknownPid,
+    ownerStartTime: "unprobeable-generation",
+  });
+  const originalKill = process.kill;
+  process.kill = (pid, signal) => {
+    if (pid === unknownPid && signal === 0) {
+      const error = new Error("synthetic process probe failure");
+      error.code = "EIO";
+      throw error;
+    }
+    return originalKill.call(process, pid, signal);
+  };
+  let unknownResult;
+  try {
+    unknownResult = releaseLease(unknown);
+  } finally {
+    process.kill = originalKill;
+  }
+  assert.equal(unknownResult.released, false);
+  assert.match(unknownResult.reason, /could not be probed \(unknown\)/);
+  assert.equal(fs.existsSync(unknown.dir), true);
+  assert.equal(fs.existsSync(unknownClaim.claimPath), true);
+  cleanupLeaseFamilyArtifacts(unknown);
+
+  const malformed = newLease();
+  transitionLease(malformed, "projecting");
+  const malformedPath = `${malformed.dir}.cleanup.claim`;
+  fs.mkdirSync(malformedPath, { mode: 0o700 });
+  fs.writeFileSync(path.join(malformedPath, "claim.json"), "{}", { mode: 0o600 });
+  const malformedResult = releaseLease(malformed);
+  assert.equal(malformedResult.released, false);
+  assert.match(malformedResult.reason, /claim record is malformed/);
+  assert.equal(fs.existsSync(malformed.dir), true);
+  assert.equal(fs.existsSync(malformedPath), true);
+  cleanupLeaseFamilyArtifacts(malformed);
+});
+
+test("competing stale-claim reclaimers cannot move a fresh live claim", (t) => {
+  const currentStart = processStartTime(process.pid);
+  assert.ok(currentStart, "the supported host must expose this process generation");
+  const lease = newLease();
+  transitionLease(lease, "projecting");
+  const stale = installCleanupClaim(lease, {
+    ownerPid: 999999,
+    ownerStartTime: "dead-generation",
+  });
+  const freshToken = crypto.randomBytes(16).toString("hex");
+  const originalRenameSync = fs.renameSync;
+  let injected = false;
+  fs.renameSync = (source, target) => {
+    const result = originalRenameSync(source, target);
+    if (!injected && String(source) === stale.claimPath && String(target) === stale.archivedPath) {
+      injected = true;
+      installCleanupClaim(lease, {
+        ownerPid: process.pid,
+        ownerStartTime: currentStart,
+        token: freshToken,
+      });
+    }
+    return result;
+  };
+
+  let released;
+  try {
+    released = releaseLease(lease);
+  } finally {
+    fs.renameSync = originalRenameSync;
+  }
+  assert.equal(injected, true, "the deterministic contender must acquire in the takeover gap");
+  assert.equal(released.released, false);
+  assert.match(released.reason, /cleanup owner process is still alive/);
+  assert.equal(fs.existsSync(lease.dir), true, "the fresh claimant's generation is untouched");
+  assert.equal(fs.existsSync(stale.archivedPath), true, "the stale token occupies its archive");
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(stale.claimPath, "claim.json"), "utf-8")).token,
+    freshToken,
+    "the live canonical claim was neither moved nor removed"
+  );
+  cleanupLeaseFamilyArtifacts(lease);
+});
+
+test("an atomic quarantine never removes a late canonical generation", (t) => {
+  const lease = newLease();
+  transitionLease(lease, "projecting");
+  const originalCredential = path.join(lease.dir, "codex-home", "auth.json");
+  fs.mkdirSync(path.dirname(originalCredential), { recursive: true });
+  fs.writeFileSync(originalCredential, '{"token":"original-generation"}');
+
+  const originalRenameSync = fs.renameSync;
+  let quarantineDir = null;
+  let competingError = null;
+  fs.renameSync = (source, target) => {
+    const result = originalRenameSync(source, target);
+    if (String(source) === lease.dir) {
+      quarantineDir = String(target);
+      // Exact race: an absolute-path writer arrives immediately after the
+      // namespace switch. It must land in a NEW canonical generation and must
+      // never be part of the recursive removal below.
+      const late = path.join(lease.dir, "codex-home", "late.json");
+      fs.mkdirSync(path.dirname(late), { recursive: true });
+      fs.writeFileSync(late, '{"generation":"late-canonical"}');
+      // A second cleanup that scanned before this namespace switch must not be
+      // able to consume the just-created canonical generation. The exclusive
+      // canonical claim serializes that stale attempt.
+      try {
+        removeLeaseDirectory(lease.dir);
+      } catch (error) {
+        competingError = error.message;
+      }
+    }
+    return result;
+  };
+
+  let result;
+  try {
+    result = releaseLease(lease);
+  } finally {
+    fs.renameSync = originalRenameSync;
+  }
+
+  assert.deepEqual(result, { released: true, reason: null });
+  assert.ok(quarantineDir, "release must atomically switch the checked generation");
+  assert.match(competingError, /another cleanup owns the canonical generation/);
+  assert.equal(fs.existsSync(quarantineDir), false, "only the detached original generation goes");
+  assert.equal(
+    fs.readFileSync(path.join(lease.dir, "codex-home", "late.json"), "utf-8"),
+    '{"generation":"late-canonical"}',
+    "the late canonical writer must survive"
+  );
+  const quarantineRecord = JSON.parse(
+    fs.readFileSync(`${quarantineDir}.lease.json`, "utf-8")
+  );
+  assert.equal(quarantineRecord.quarantined_from, lease.id);
+  assert.equal(quarantineRecord.release_generation, lease.id);
+  assert.equal(quarantineRecord.quarantine_generation, true);
+  assert.equal(fs.existsSync(lease.metaPath), true, "the canonical marker still attributes recreation");
+
+  // A later sweep may handle the new canonical generation on its own proof.
+  const swept = sweepLeases({ apply: true });
+  assert.ok(swept.removed.some((entry) => entry.dir === lease.dir));
   assert.equal(fs.existsSync(lease.dir), false);
+
+  for (const entry of fs.readdirSync(runtimeDir())) {
+    if (!entry.endsWith(".lease.json")) continue;
+    const target = path.join(runtimeDir(), entry);
+    try {
+      const value = JSON.parse(fs.readFileSync(target, "utf-8"));
+      if (value.lease_id === lease.id || value.release_generation === lease.id) {
+        fs.rmSync(target, { force: true });
+      }
+    } catch {}
+  }
+});
+
+test("native Windows serializes two sweepers and preserves a late canonical writer", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-win-quarantine-race-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const script = `
+    const fs = require("node:fs"), path = require("node:path");
+    const cp = require("node:child_process");
+    const { syncBuiltinESMExports } = require("node:module");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    process.env.SystemRoot = "C:\\\\Windows";
+    process.env.HOME = ${JSON.stringify(home)};
+    process.env.USERPROFILE = ${JSON.stringify(home)};
+    process.env.HOMEDRIVE = "";
+    process.env.HOMEPATH = ${JSON.stringify(home)};
+    cp.execFileSync = () => "638923456789012345";
+    syncBuiltinESMExports();
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const turnDir = path.join(${JSON.stringify(home)}, ".dualog", "sessions", "win-race", "turns", "t1");
+      fs.mkdirSync(turnDir, { recursive: true });
+      const lease = m.allocateLease({
+        sessionId: "win-race", turnId: "t1", agent: "codex", engine: "headless", turnDir,
+      });
+      m.transitionLease(lease, "projecting");
+      const auth = path.join(lease.dir, "codex-home", "auth.json");
+      fs.mkdirSync(path.dirname(auth), { recursive: true });
+      fs.writeFileSync(auth, '{"token":"original-generation"}');
+
+      const originalRenameSync = fs.renameSync;
+      let quarantineDir = null, competingError = null;
+      fs.renameSync = (source, target) => {
+        const result = originalRenameSync(source, target);
+        if (String(source) === lease.dir) {
+          quarantineDir = String(target);
+          const late = path.join(lease.dir, "codex-home", "late.json");
+          fs.mkdirSync(path.dirname(late), { recursive: true });
+          fs.writeFileSync(late, '{"generation":"late-canonical"}');
+          try { m.removeLeaseDirectory(lease.dir); }
+          catch (error) { competingError = error.message; }
+        }
+        return result;
+      };
+
+      let released;
+      try { released = m.releaseLease(lease); }
+      finally { fs.renameSync = originalRenameSync; }
+      const quarantineRecord = JSON.parse(fs.readFileSync(quarantineDir + ".lease.json", "utf-8"));
+      console.log(JSON.stringify({
+        released,
+        competingError,
+        quarantineDir,
+        quarantineSurvives: fs.existsSync(quarantineDir),
+        late: fs.readFileSync(path.join(lease.dir, "codex-home", "late.json"), "utf-8"),
+        canonicalMarkerSurvives: fs.existsSync(lease.metaPath),
+        quarantinedFrom: quarantineRecord.quarantined_from,
+        releaseGeneration: quarantineRecord.release_generation,
+      }));
+    });
+  `;
+  const out = JSON.parse(
+    execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+  );
+  assert.deepEqual(out.released, { released: true, reason: null });
+  assert.match(out.competingError, /another cleanup owns the canonical generation/);
+  assert.equal(out.quarantineSurvives, false, "only the detached Windows generation is removed");
+  assert.equal(out.late, '{"generation":"late-canonical"}');
+  assert.equal(out.canonicalMarkerSurvives, true, "late recreation stays attributable");
+  assert.equal(out.quarantinedFrom, out.releaseGeneration);
+});
+
+test("native Windows rename failure retains the canonical credential generation", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-win-quarantine-holder-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const script = `
+    const fs = require("node:fs"), path = require("node:path");
+    const cp = require("node:child_process");
+    const { syncBuiltinESMExports } = require("node:module");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    process.env.SystemRoot = "C:\\\\Windows";
+    process.env.HOME = ${JSON.stringify(home)};
+    process.env.USERPROFILE = ${JSON.stringify(home)};
+    process.env.HOMEDRIVE = "";
+    process.env.HOMEPATH = ${JSON.stringify(home)};
+    cp.execFileSync = () => "638923456789012345";
+    syncBuiltinESMExports();
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const turnDir = path.join(${JSON.stringify(home)}, ".dualog", "sessions", "win-holder", "turns", "t1");
+      fs.mkdirSync(turnDir, { recursive: true });
+      const lease = m.allocateLease({
+        sessionId: "win-holder", turnId: "t1", agent: "codex", engine: "headless", turnDir,
+      });
+      m.transitionLease(lease, "projecting");
+      const auth = path.join(lease.dir, "codex-home", "auth.json");
+      fs.mkdirSync(path.dirname(auth), { recursive: true });
+      fs.writeFileSync(auth, '{"token":"held-generation"}');
+
+      const originalRenameSync = fs.renameSync;
+      let reservedDir = null;
+      fs.renameSync = (source, target) => {
+        if (String(source) === lease.dir) {
+          reservedDir = String(target);
+          const error = new Error("synthetic Windows sharing violation");
+          error.code = "EBUSY";
+          throw error;
+        }
+        return originalRenameSync(source, target);
+      };
+      let released;
+      try { released = m.releaseLease(lease); }
+      finally { fs.renameSync = originalRenameSync; }
+      console.log(JSON.stringify({
+        released,
+        reservedDir,
+        canonicalSurvives: fs.existsSync(lease.dir),
+        auth: fs.readFileSync(auth, "utf-8"),
+        reservedDirectoryExists: fs.existsSync(reservedDir),
+        reservedMarkerExists: fs.existsSync(reservedDir + ".lease.json"),
+        canonicalClaimExists: fs.existsSync(lease.dir + ".cleanup.claim"),
+      }));
+    });
+  `;
+  const out = JSON.parse(
+    execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+  );
+  assert.equal(out.released.released, false);
+  assert.match(out.released.reason, /could not atomically quarantine.*EBUSY/);
+  assert.equal(out.canonicalSurvives, true, "a holder-blocked rename cannot detach the payload");
+  assert.equal(out.auth, '{"token":"held-generation"}');
+  assert.equal(out.reservedDirectoryExists, false);
+  assert.equal(out.reservedMarkerExists, true, "the reserved generation stays attributable");
+  assert.equal(out.canonicalClaimExists, false, "the failed attempt retires its serialization claim");
+});
+
+test("a holder acquired during deletion leaves an attributable quarantine", (t) => {
+  if (process.platform === "win32") {
+    t.skip("native Windows relies on sharing semantics and durable lifecycle proof");
+    return;
+  }
+
+  const lease = newLease();
+  transitionLease(lease, "projecting");
+  const credential = path.join(lease.dir, "codex-home", "auth.json");
+  fs.mkdirSync(path.dirname(credential), { recursive: true });
+  fs.writeFileSync(credential, '{"token":"held-generation"}');
+
+  const originalRenameSync = fs.renameSync;
+  let quarantineDir = null;
+  let heldFd = null;
+  fs.renameSync = (source, target) => {
+    const result = originalRenameSync(source, target);
+    if (String(source) === lease.dir) {
+      quarantineDir = String(target);
+      heldFd = fs.openSync(path.join(quarantineDir, "codex-home", "auth.json"), "r");
+    }
+    return result;
+  };
+
+  let result;
+  try {
+    result = releaseLease(lease);
+  } finally {
+    fs.renameSync = originalRenameSync;
+  }
+
+  assert.equal(result.released, false, "the post-rename usage check must stop removal");
+  assert.match(result.reason, /retained the attributable generation/);
+  assert.ok(quarantineDir);
+  assert.equal(fs.existsSync(lease.dir), false, "the canonical name is no longer the checked inode");
+  assert.equal(fs.existsSync(quarantineDir), true, "the held generation remains intact");
+  assert.equal(
+    JSON.parse(fs.readFileSync(`${quarantineDir}.lease.json`, "utf-8")).quarantined_from,
+    lease.id,
+    "its sibling manifest makes the moved generation recoverable"
+  );
+
+  fs.closeSync(heldFd);
+  heldFd = null;
+  const retried = sweepLeases({ apply: true });
+  const removed = retried.removed.find((entry) => entry.dir === quarantineDir);
+  const retained = retried.retained.find((entry) => entry.dir === quarantineDir);
+  assert.notEqual(Boolean(removed), Boolean(retained));
+  if (removed) {
+    assert.equal(fs.existsSync(quarantineDir), false, "a later free proof reclaims the generation");
+  } else {
+    assert.match(retained.reason, UNKNOWN_DIRECTORY_USAGE);
+    fs.rmSync(quarantineDir, { recursive: true, force: true });
+  }
+
+  for (const entry of fs.readdirSync(runtimeDir())) {
+    if (!entry.endsWith(".lease.json")) continue;
+    const target = path.join(runtimeDir(), entry);
+    try {
+      const value = JSON.parse(fs.readFileSync(target, "utf-8"));
+      if (value.lease_id === lease.id || value.release_generation === lease.id) {
+        fs.rmSync(target, { force: true });
+      }
+    } catch {}
+  }
+});
+
+test("a crash before cleanup-claim publication leaves only a recoverable staged artifact", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-claim-stage-crash-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const statePath = path.join(home, "crash-state.json");
+  const childEnv = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    HOMEDRIVE: "",
+    HOMEPATH: home,
+  };
+  const crashScript = `
+    const fs = require("node:fs"), path = require("node:path");
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const turnDir = path.join(${JSON.stringify(home)}, ".dualog", "sessions", "claim-stage-crash", "turns", "t1");
+      fs.mkdirSync(turnDir, { recursive: true });
+      const lease = m.allocateLease({
+        sessionId: "claim-stage-crash", turnId: "t1", agent: "codex", engine: "headless", turnDir,
+      });
+      m.transitionLease(lease, "projecting");
+      fs.mkdirSync(path.join(lease.dir, "codex-home"), { recursive: true });
+      fs.writeFileSync(path.join(lease.dir, "codex-home", "auth.json"), "secret");
+      const originalRenameSync = fs.renameSync;
+      fs.renameSync = (source, target) => {
+        const sourceText = String(source), targetText = String(target);
+        if (
+          sourceText.startsWith(lease.dir + ".cleanup.claim.stage-") &&
+          targetText === lease.dir + ".cleanup.claim"
+        ) {
+          const claim = JSON.parse(fs.readFileSync(path.join(sourceText, "claim.json"), "utf-8"));
+          fs.writeFileSync(${JSON.stringify(statePath)}, JSON.stringify({
+            dir: lease.dir,
+            metaPath: lease.metaPath,
+            canonicalClaim: targetText,
+            stagedPath: sourceText,
+            claim,
+          }));
+          process.exit(44);
+        }
+        return originalRenameSync(source, target);
+      };
+      m.releaseLease(lease);
+    });
+  `;
+  const crashed = spawnSync(process.execPath, ["-e", crashScript], {
+    encoding: "utf-8",
+    env: childEnv,
+  });
+  assert.equal(crashed.status, 44, crashed.stderr);
+
+  const state = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+  assert.equal(fs.existsSync(state.dir), true, "publication never exposed cleanup authority");
+  assert.equal(fs.existsSync(state.canonicalClaim), false, "an incomplete publish is not canonical");
+  assert.equal(fs.existsSync(state.stagedPath), true, "the complete off-canonical record survives");
+  assert.equal(state.claim.owner_pid, crashed.pid);
+  assert.equal(state.claim.token, path.basename(state.stagedPath).split(".stage-")[1]);
+
+  const recoveryScript = `
+    const fs = require("node:fs");
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const receipt = m.sweepLeases({ apply: true });
+      console.log(JSON.stringify({
+        removed: receipt.removed.map((entry) => entry.dir),
+        retained: receipt.retained,
+        errors: receipt.errors,
+        leaseSurvives: fs.existsSync(${JSON.stringify(state.dir)}),
+        stageSurvives: fs.existsSync(${JSON.stringify(state.stagedPath)}),
+      }));
+    });
+  `;
+  const recovered = JSON.parse(
+    execFileSync(process.execPath, ["-e", recoveryScript], {
+      encoding: "utf-8",
+      env: childEnv,
+    }).trim()
+  );
+  assert.deepEqual(recovered.errors, []);
+  assert.equal(recovered.leaseSurvives, false, "a fresh complete claim reclaims the lease");
+  assert.equal(recovered.stageSurvives, false, "the dead publisher's staged record is reaped");
+  assert.ok(recovered.removed.includes(state.dir));
+  assert.ok(recovered.removed.includes(state.stagedPath));
+});
+
+test("a crash after claim creation but before rename is safely taken over", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-claim-crash-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const statePath = path.join(home, "crash-state.json");
+  const childEnv = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    HOMEDRIVE: "",
+    HOMEPATH: home,
+  };
+  const crashScript = `
+    const fs = require("node:fs"), path = require("node:path");
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const turnDir = path.join(${JSON.stringify(home)}, ".dualog", "sessions", "crash-claim", "turns", "t1");
+      fs.mkdirSync(turnDir, { recursive: true });
+      const lease = m.allocateLease({
+        sessionId: "crash-claim", turnId: "t1", agent: "codex", engine: "headless", turnDir,
+      });
+      m.transitionLease(lease, "projecting");
+      fs.mkdirSync(path.join(lease.dir, "codex-home"), { recursive: true });
+      fs.writeFileSync(path.join(lease.dir, "codex-home", "auth.json"), "secret");
+      const originalRenameSync = fs.renameSync;
+      fs.renameSync = (source, target) => {
+        if (String(source) === lease.dir) {
+          const claimPath = lease.dir + ".cleanup.claim";
+          const claim = JSON.parse(fs.readFileSync(path.join(claimPath, "claim.json"), "utf-8"));
+          fs.writeFileSync(${JSON.stringify(statePath)}, JSON.stringify({
+            id: lease.id,
+            dir: lease.dir,
+            metaPath: lease.metaPath,
+            claimPath,
+            claim,
+          }));
+          process.exit(43);
+        }
+        return originalRenameSync(source, target);
+      };
+      m.releaseLease(lease);
+    });
+  `;
+  const crashed = spawnSync(process.execPath, ["-e", crashScript], {
+    encoding: "utf-8",
+    env: childEnv,
+  });
+  assert.equal(crashed.status, 43, crashed.stderr);
+
+  const state = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+  assert.equal(fs.existsSync(state.dir), true, "the canonical generation was not renamed");
+  assert.equal(fs.existsSync(state.claimPath), true, "the interrupted claim remains");
+  assert.equal(state.claim.owner_pid, crashed.pid);
+  assert.equal(typeof state.claim.owner_start_time, "string");
+  assert.ok(state.claim.owner_start_time.length > 0, "the claim records its process generation");
+  assert.equal(state.claim.boot.precise, true, "the claim records precise boot identity when available");
+
+  const recoveryScript = `
+    const fs = require("node:fs");
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const receipt = m.sweepLeases({ apply: true });
+      console.log(JSON.stringify({
+        removed: receipt.removed.map((entry) => entry.dir),
+        retained: receipt.retained.map((entry) => entry.dir),
+        errors: receipt.errors,
+        survives: fs.existsSync(${JSON.stringify(state.dir)}),
+      }));
+    });
+  `;
+  const recovered = JSON.parse(
+    execFileSync(process.execPath, ["-e", recoveryScript], {
+      encoding: "utf-8",
+      env: childEnv,
+    }).trim()
+  );
+  assert.deepEqual(recovered.errors, []);
+  assert.equal(recovered.survives, false, "the dead same-boot owner can be taken over");
+  assert.ok(recovered.removed.includes(state.dir));
+  assert.equal(fs.existsSync(state.claimPath), false, "the recovery owner's claim was released");
+  assert.equal(
+    fs.existsSync(`${state.claimPath}.stale-${state.claim.token}`),
+    true,
+    "the exact crashed claim generation remains archived"
+  );
+});
+
+test("a crash during cleanup-claim retirement leaves a recoverable retired artifact", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-claim-retire-crash-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const statePath = path.join(home, "crash-state.json");
+  const childEnv = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    HOMEDRIVE: "",
+    HOMEPATH: home,
+  };
+  const crashScript = `
+    const fs = require("node:fs"), path = require("node:path");
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const turnDir = path.join(${JSON.stringify(home)}, ".dualog", "sessions", "claim-retire-crash", "turns", "t1");
+      fs.mkdirSync(turnDir, { recursive: true });
+      const lease = m.allocateLease({
+        sessionId: "claim-retire-crash", turnId: "t1", agent: "codex", engine: "headless", turnDir,
+      });
+      m.transitionLease(lease, "projecting");
+      fs.mkdirSync(path.join(lease.dir, "codex-home"), { recursive: true });
+      fs.writeFileSync(path.join(lease.dir, "codex-home", "auth.json"), "secret");
+      const originalRmSync = fs.rmSync;
+      fs.rmSync = (target, options) => {
+        const targetText = String(target);
+        if (targetText.startsWith(lease.dir + ".cleanup.claim.retired-")) {
+          const claim = JSON.parse(fs.readFileSync(path.join(targetText, "claim.json"), "utf-8"));
+          fs.writeFileSync(${JSON.stringify(statePath)}, JSON.stringify({
+            dir: lease.dir,
+            metaPath: lease.metaPath,
+            canonicalClaim: lease.dir + ".cleanup.claim",
+            retiredPath: targetText,
+            claim,
+          }));
+          process.exit(45);
+        }
+        return originalRmSync(target, options);
+      };
+      m.releaseLease(lease);
+    });
+  `;
+  const crashed = spawnSync(process.execPath, ["-e", crashScript], {
+    encoding: "utf-8",
+    env: childEnv,
+  });
+  assert.equal(crashed.status, 45, crashed.stderr);
+
+  const state = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+  assert.equal(fs.existsSync(state.dir), false, "the checked credential generation was removed");
+  assert.equal(fs.existsSync(state.canonicalClaim), false, "retirement first removed canonical authority");
+  assert.equal(fs.existsSync(state.retiredPath), true, "the interrupted retired generation survives");
+  assert.equal(state.claim.owner_pid, crashed.pid);
+
+  const recoveryScript = `
+    const fs = require("node:fs");
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const receipt = m.sweepLeases({ apply: true });
+      console.log(JSON.stringify({
+        removed: receipt.removed.map((entry) => entry.dir),
+        retained: receipt.retained,
+        errors: receipt.errors,
+        retiredSurvives: fs.existsSync(${JSON.stringify(state.retiredPath)}),
+      }));
+    });
+  `;
+  const recovered = JSON.parse(
+    execFileSync(process.execPath, ["-e", recoveryScript], {
+      encoding: "utf-8",
+      env: childEnv,
+    }).trim()
+  );
+  assert.deepEqual(recovered.errors, []);
+  assert.equal(recovered.retiredSurvives, false, "a dead publisher's retired record is reaped");
+  assert.ok(recovered.removed.includes(state.retiredPath));
+});
+
+test("a crash after quarantine rename leaves a recoverable attributed generation", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-quarantine-crash-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const statePath = path.join(home, "crash-state.json");
+  const childEnv = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    HOMEDRIVE: "",
+    HOMEPATH: home,
+  };
+  const crashScript = `
+    const fs = require("node:fs"), path = require("node:path");
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const turnDir = path.join(${JSON.stringify(home)}, ".dualog", "sessions", "crash", "turns", "t1");
+      fs.mkdirSync(turnDir, { recursive: true });
+      const lease = m.allocateLease({
+        sessionId: "crash", turnId: "t1", agent: "codex", engine: "headless", turnDir,
+      });
+      m.transitionLease(lease, "projecting");
+      fs.mkdirSync(path.join(lease.dir, "codex-home"), { recursive: true });
+      fs.writeFileSync(path.join(lease.dir, "codex-home", "auth.json"), "secret");
+      const originalRenameSync = fs.renameSync;
+      fs.renameSync = (source, target) => {
+        const result = originalRenameSync(source, target);
+        if (String(source) === lease.dir) {
+          fs.writeFileSync(${JSON.stringify(statePath)}, JSON.stringify({
+            id: lease.id, dir: lease.dir, metaPath: lease.metaPath, quarantineDir: String(target),
+          }));
+          process.exit(42);
+        }
+        return result;
+      };
+      m.releaseLease(lease);
+    });
+  `;
+  const crashed = spawnSync(process.execPath, ["-e", crashScript], {
+    encoding: "utf-8",
+    env: childEnv,
+  });
+  assert.equal(crashed.status, 42, crashed.stderr);
+
+  const state = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+  assert.equal(fs.existsSync(state.dir), false, "the canonical generation was detached");
+  assert.equal(fs.existsSync(state.metaPath), true, "the canonical tombstone survived");
+  assert.equal(fs.existsSync(state.quarantineDir), true, "the crash retained the moved payload");
+  const quarantineMetaPath = `${state.quarantineDir}.lease.json`;
+  assert.equal(
+    JSON.parse(fs.readFileSync(quarantineMetaPath, "utf-8")).release_generation,
+    state.id,
+    "the pre-rename manifest attributes the crash generation"
+  );
+  assert.equal(
+    fs.existsSync(`${state.dir}.cleanup.claim`),
+    true,
+    "a crashed canonical claim fails closed against stale competing cleanup"
+  );
+
+  const recoveryScript = `
+    const fs = require("node:fs");
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((m) => {
+      const receipt = m.sweepLeases({ apply: true });
+      console.log(JSON.stringify({
+        removed: receipt.removed.map((entry) => entry.dir),
+        retained: receipt.retained.map((entry) => entry.dir),
+        survives: fs.existsSync(${JSON.stringify(state.quarantineDir)}),
+      }));
+    });
+  `;
+  const recovered = JSON.parse(
+    execFileSync(process.execPath, ["-e", recoveryScript], {
+      encoding: "utf-8",
+      env: childEnv,
+    }).trim()
+  );
+  assert.equal(recovered.survives, false, "the independent quarantine id remains sweepable");
+  assert.ok(recovered.removed.includes(state.quarantineDir));
+  assert.equal(
+    fs.existsSync(`${state.dir}.cleanup.claim`),
+    true,
+    "recovery never guesses that a crashed canonical claim is stale"
+  );
 });
 
 test("a tombstone identifies what to check; it does not authorize deletion", (t) => {
@@ -1195,7 +2509,53 @@ test("a tombstone identifies what to check; it does not authorize deletion", (t)
   fs.rmSync(lease.metaPath, { force: true });
 });
 
-test("releasing a tombstoned lease re-probes too, not only the sweep", () => {
+test("released-tombstone dry-run and apply both retain a directory held by this caller", (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows open-handle behavior is enforced by the removal syscall");
+    return;
+  }
+  const lease = newLease();
+  const auth = path.join(lease.dir, "auth.json");
+  fs.writeFileSync(auth, '{"token":"held-during-sweep"}');
+  fs.writeFileSync(
+    lease.metaPath,
+    JSON.stringify({
+      schema_version: 1,
+      lease_id: lease.id,
+      state: "released",
+      released_from_state: "active",
+      released_at: new Date().toISOString(),
+      consumer: { kind: "headless", pid: 999999, pgid: 999999 },
+    })
+  );
+
+  const fd = fs.openSync(auth, "r");
+  const dry = sweepLeases();
+  const dryRetained = dry.retained.find((entry) => entry.dir === lease.dir);
+  assert.ok(dryRetained, "dry-run must retain the held released directory");
+  assert.match(dryRetained.reason, /still has this directory open/);
+
+  const applied = sweepLeases({ apply: true });
+  const appliedRetained = applied.retained.find((entry) => entry.dir === lease.dir);
+  assert.ok(appliedRetained, "apply must make the same authorization decision");
+  assert.match(appliedRetained.reason, /still has this directory open/);
+  assert.equal(fs.existsSync(auth), true);
+
+  fs.closeSync(fd);
+  const finished = sweepLeases({ apply: true });
+  const removed = finished.removed.find((entry) => entry.dir === lease.dir);
+  if (removed) {
+    assert.equal(fs.existsSync(lease.dir), false);
+  } else {
+    const retained = finished.retained.find((entry) => entry.dir === lease.dir);
+    assert.match(retained.reason, UNKNOWN_DIRECTORY_USAGE);
+    t.diagnostic("post-close sweep retained because the host-wide usage scan is incomplete");
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+  }
+  fs.rmSync(lease.metaPath, { force: true });
+});
+
+test("releasing a tombstoned lease re-probes too, not only the sweep", (t) => {
   // FOUND IN REVIEW. sweepLeases() re-probed a released record, but
   // releaseLease() fell through to proveLeaseReleasable(), where `released` was
   // immediately removable. A failed tmux turn calls the owner cleanup TWICE --
@@ -1219,7 +2579,8 @@ test("releasing a tombstoned lease re-probes too, not only the sweep", () => {
   assert.match(refused.reason, /running again/);
   assert.equal(fs.existsSync(lease.dir), true);
 
-  // And once that consumer really is gone, it goes.
+  // And once that consumer really is gone, it goes -- on a host that can prove
+  // the directory itself is unused. A restricted host must retain instead.
   fs.writeFileSync(
     lease.metaPath,
     JSON.stringify({
@@ -1230,7 +2591,10 @@ test("releasing a tombstoned lease re-probes too, not only the sweep", () => {
       consumer: { kind: "headless", pid: 999999, pgid: 999999 },
     })
   );
-  assert.equal(releaseLease(lease).released, true);
+  const finished = releaseAllowingUnknownDirectory(lease);
+  if (!releasedOrRetainedUnknown(t, lease, finished, "successful tombstone reclamation")) {
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+  }
   fs.rmSync(lease.metaPath, { force: true });
 });
 
@@ -1268,7 +2632,7 @@ test("an unattributable directory is retained, not aged out", () => {
   fs.rmSync(orphan, { recursive: true, force: true });
 });
 
-test("a spawn the owner watched fail is not the same as one that may have happened", () => {
+test("a spawn the owner watched fail is not the same as one that may have happened", (t) => {
   // FOUND IN REVIEW. The headless engine writes `spawning` with only a kind
   // before spawn(), and an identity-less spawning lease is retained until the
   // next reboot -- correctly, because a crash there leaves no portable proof
@@ -1292,12 +2656,13 @@ test("a spawn the owner watched fail is not the same as one that may have happen
   transitionLease(observed, "spawning", {
     consumer: { kind: "headless", spawn_outcome: "failed" },
   });
-  assert.equal(
-    releaseLease(observed).released,
-    true,
-    "a spawn the owner saw throw releases immediately"
-  );
-  assert.equal(fs.existsSync(observed.dir), false);
+  const observedRelease = releaseAllowingUnknownDirectory(observed);
+  if (releasedOrRetainedUnknown(t, observed, observedRelease, "successful failed-spawn cleanup")) {
+    assert.equal(fs.existsSync(observed.dir), false);
+  } else {
+    fs.rmSync(observed.dir, { recursive: true, force: true });
+    fs.rmSync(observed.metaPath, { force: true });
+  }
 });
 
 test("an incomplete usage scan is not a free one", (t) => {
@@ -1349,6 +2714,40 @@ test("an incomplete usage scan is not a free one", (t) => {
   assert.equal(fs.existsSync(held), true, "and the held credential must still be there");
 });
 
+test("native macOS lsof removes a lifecycle-proven unused runtime lease", (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("exercises the native macOS lsof binary at the deletion boundary");
+    return;
+  }
+
+  const lease = newLease();
+  t.after(() => {
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+    fs.rmSync(lease.metaPath, { force: true });
+  });
+  assert.equal(
+    fs.statSync(lease.dir).mode & 0o777,
+    0o700,
+    "precondition: runtime leases are private"
+  );
+
+  // The owner observed spawn() fail before it returned a process identity. That
+  // is the durable lifecycle proof; the deletion choke point must still obtain
+  // a fresh native lsof no-use result before removing the directory.
+  transitionLease(lease, "spawning", {
+    consumer: { kind: "headless", spawn_outcome: "failed" },
+  });
+  const result = releaseLease(lease);
+
+  assert.deepEqual(
+    result,
+    { released: true, reason: null },
+    "missing, broken, or incorrectly invoked lsof must prevent release on macOS"
+  );
+  assert.equal(fs.existsSync(lease.dir), false, "the lifecycle-proven lease is removed");
+  assert.equal(meta(lease).state, "released", "the durable tombstone survives removal");
+});
+
 test("a released record with no probeable consumer is retained", () => {
   // Falling through to the usage check here let a null, partial, or unknown-kind
   // consumer authorize deletion whenever usage happened to be `free` -- and
@@ -1369,13 +2768,191 @@ test("a released record with no probeable consumer is retained", () => {
   );
 });
 
-test("a pre-spawn release records that nothing was ever started", () => {
+test("prior-boot lifecycle proof survives the released tombstone for release and sweep", () => {
+  const script = `
+    const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
+    const cp = require("node:child_process");
+    const { syncBuiltinESMExports } = require("node:module");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    process.env.SystemRoot = "C:\\\\Windows";
+    cp.execFileSync = (file) => {
+      if (!String(file).endsWith("\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe")) {
+        throw new Error("unexpected executable: " + file);
+      }
+      return "638923456789012345";
+    };
+    syncBuiltinESMExports();
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-prior-boot-release-"));
+    process.env.HOME = home; process.env.USERPROFILE = home;
+    process.env.HOMEDRIVE = ""; process.env.HOMEPATH = home;
+
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((leaseApi) => {
+      const current = leaseApi.bootIdentity();
+      const oldBoot = { ...current, id: "previous-test-boot" };
+      const makeLease = (turnId) => {
+        const turnDir = path.join(home, ".dualog", "sessions", "prior-boot", "turns", turnId);
+        fs.mkdirSync(turnDir, { recursive: true });
+        return leaseApi.allocateLease({
+          sessionId: "prior-boot",
+          turnId,
+          agent: "codex",
+          engine: "headless",
+          turnDir,
+          runnerPid: 999999,
+        });
+      };
+      const setPreviousBoot = (lease) => {
+        const metadata = JSON.parse(fs.readFileSync(lease.metaPath, "utf-8"));
+        fs.writeFileSync(lease.metaPath, JSON.stringify({ ...metadata, boot: oldBoot }));
+      };
+      const releaseAndSweep = (lease) => {
+        const released = leaseApi.releaseLease(lease);
+        const tombstone = JSON.parse(fs.readFileSync(lease.metaPath, "utf-8"));
+        fs.mkdirSync(path.join(lease.dir, "recreated"), { recursive: true });
+        const dry = leaseApi.sweepLeases();
+        const applied = leaseApi.sweepLeases({ apply: true });
+        leaseApi.sweepLeases({ apply: true, now: Date.now() + 25 * 60 * 60 * 1000 });
+        return {
+          released,
+          tombstone,
+          dryRemoved: dry.removed.some((entry) => entry.dir === lease.dir && entry.applied === false),
+          appliedRemoved: applied.removed.some(
+            (entry) => entry.dir === lease.dir && entry.applied === true
+          ),
+          survives: fs.existsSync(lease.dir),
+          recordSurvives: fs.existsSync(lease.metaPath),
+        };
+      };
+
+      const direct = makeLease("strict-direct");
+      let directError = null;
+      try { leaseApi.removeLeaseDirectory(direct.dir); }
+      catch (error) { directError = error.message; }
+      const directSurvivesAfterCall = fs.existsSync(direct.dir);
+
+      const preSpawn = makeLease("pre-spawn");
+      leaseApi.transitionLease(preSpawn, "projecting");
+      const preSpawnRelease = leaseApi.releaseLease(preSpawn);
+
+      const observedHeadless = makeLease("observed-headless");
+      leaseApi.transitionLease(observedHeadless, "active", {
+        consumer: {
+          kind: "headless",
+          pid: 999999,
+          pgid: null,
+          windows_tree_termination: "wrapper-exit-observed",
+        },
+      });
+      const observedHeadlessRelease = leaseApi.releaseLease(observedHeadless);
+
+      const legacyHeadless = makeLease("legacy-headless");
+      leaseApi.transitionLease(legacyHeadless, "active", {
+        consumer: { kind: "headless", pid: 999999, pgid: null },
+      });
+      const legacyHeadlessRelease = leaseApi.releaseLease(legacyHeadless);
+
+      const sameBoot = makeLease("same-boot");
+      leaseApi.transitionLease(sameBoot, "spawning", { consumer: null });
+      const sameBootRelease = leaseApi.releaseLease(sameBoot);
+      const sameBootSweep = leaseApi.sweepLeases({ apply: true });
+
+      const identityless = makeLease("identityless");
+      leaseApi.transitionLease(identityless, "spawning", { consumer: null });
+      setPreviousBoot(identityless);
+      const identitylessResult = releaseAndSweep(identityless);
+
+      const windowsTree = makeLease("windows-tree");
+      leaseApi.transitionLease(windowsTree, "active", {
+        consumer: {
+          kind: "headless",
+          pid: 999999,
+          pgid: 999999,
+          windows_tree_termination: "failed",
+        },
+      });
+      setPreviousBoot(windowsTree);
+      const windowsTreeResult = releaseAndSweep(windowsTree);
+
+      console.log(JSON.stringify({
+        current,
+        directError,
+        directSurvivesAfterCall,
+        preSpawnRelease,
+        preSpawnSurvives: fs.existsSync(preSpawn.dir),
+        observedHeadlessRelease,
+        observedHeadlessSurvives: fs.existsSync(observedHeadless.dir),
+        legacyHeadlessRelease,
+        legacyHeadlessSurvives: fs.existsSync(legacyHeadless.dir),
+        sameBootRelease,
+        sameBootRemoved: sameBootSweep.removed.some((entry) => entry.dir === sameBoot.dir),
+        sameBootSurvives: fs.existsSync(sameBoot.dir),
+        identitylessResult,
+        windowsTreeResult,
+      }));
+    });
+  `;
+  const out = JSON.parse(
+    execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+  );
+  assert.equal(out.current.precise, true);
+  assert.equal(out.current.source, "win32.last-boot-up-time");
+  assert.match(out.directError, /could not be determined/);
+  assert.equal(out.directSurvivesAfterCall, true, "the public Windows removal path is strict");
+  assert.deepEqual(out.preSpawnRelease, { released: true, reason: null });
+  assert.equal(out.preSpawnSurvives, false, "owner-proven no-spawn cleanup may proceed");
+  assert.deepEqual(out.observedHeadlessRelease, { released: true, reason: null });
+  assert.equal(
+    out.observedHeadlessSurvives,
+    false,
+    "an explicitly observed Windows foreground lifecycle may proceed"
+  );
+  assert.equal(out.legacyHeadlessRelease.released, false);
+  assert.match(out.legacyHeadlessRelease.reason, /could not be determined/);
+  assert.equal(
+    out.legacyHeadlessSurvives,
+    true,
+    "a legacy wrapper-only record cannot relax Windows handle uncertainty"
+  );
+  assert.equal(out.sameBootRelease.released, false, "same-boot spawning ambiguity must retain");
+  assert.equal(out.sameBootRemoved, false, "same-boot sweep must retain");
+  assert.equal(out.sameBootSurvives, true, "same-boot credential directory must survive");
+  for (const [name, result] of [
+    ["identitylessResult", out.identitylessResult],
+    ["windowsTreeResult", out.windowsTreeResult],
+  ]) {
+    assert.deepEqual(result.released, { released: true, reason: null }, name);
+    assert.equal(result.tombstone.state, "released", name);
+    assert.ok(["spawning", "active"].includes(result.tombstone.released_from_state), name);
+    assert.equal(
+      result.tombstone.consumer_never_created,
+      undefined,
+      `${name}: prior-boot proof must not be rewritten as never-created`
+    );
+    assert.equal(result.dryRemoved, true, `${name}: dry-run must reproduce authorization`);
+    assert.equal(result.appliedRemoved, true, `${name}: apply must reproduce authorization`);
+    assert.equal(result.survives, false, `${name}: the recreated directory should be swept`);
+    assert.equal(
+      result.recordSurvives,
+      true,
+      `${name}: the permanent marker must keep late recreation attributable`
+    );
+  }
+  assert.equal(out.identitylessResult.tombstone.released_from_state, "spawning");
+  assert.equal(out.windowsTreeResult.tombstone.released_from_state, "active");
+});
+
+test("a pre-spawn release records that nothing was ever started", (t) => {
   // The tombstone rule is "no probeable consumer means retain". A lease released
   // BEFORE anything spawned legitimately has none -- so the owner records that
   // explicitly, rather than the reaper inferring it from an absence.
   const lease = newLease();
   transitionLease(lease, "projecting");
-  assert.equal(releaseLease(lease).released, true);
+  const initialRelease = releaseAllowingUnknownDirectory(lease);
+  if (!releasedOrRetainedUnknown(t, lease, initialRelease, "successful pre-spawn cleanup")) {
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+    fs.rmSync(lease.metaPath, { force: true });
+    return;
+  }
 
   const tombstone = JSON.parse(fs.readFileSync(lease.metaPath, "utf-8"));
   assert.equal(tombstone.state, "released");
@@ -1388,7 +2965,13 @@ test("a pre-spawn release records that nothing was ever started", () => {
   // Which is what lets a recreated directory be reclaimed here and nowhere else.
   fs.mkdirSync(path.join(lease.dir, "codex-home"), { recursive: true });
   const receipt = sweepLeases({ apply: true });
-  assert.ok(receipt.removed.some((r) => r.dir === lease.dir));
+  const removed = sweepRemovedOrRetainedUnknown(
+    t,
+    lease,
+    receipt,
+    "successful never-created sweep"
+  );
+  if (!removed) fs.rmSync(lease.dir, { recursive: true, force: true });
   fs.rmSync(lease.metaPath, { force: true });
 });
 
@@ -1412,17 +2995,17 @@ test("the sweep keeps a recreated directory whose record names no probeable cons
   const receipt = sweepLeases({ apply: true });
   const retained = receipt.retained.find((r) => r.dir === lease.dir);
   assert.ok(retained, "a record with no probeable consumer must retain its directory");
-  assert.match(retained.reason, /no probeable consumer/);
+  assert.match(retained.reason, /no (?:probeable )?consumer|no consumer that can be probed/);
   assert.equal(fs.existsSync(lease.dir), true);
   fs.rmSync(lease.dir, { recursive: true, force: true });
   fs.rmSync(lease.metaPath, { force: true });
 });
 
-test("a tombstone is not aged out until its consumer is proven gone", () => {
-  // FOUND IN REVIEW. Expiring on elapsed time alone re-opened the hole the
-  // sibling record closed: a consumer keeps a token, touches nothing for a day,
-  // then recreates its home -- and with the tombstone already discarded, what it
-  // leaves is unattributable and retained forever.
+test("a tombstone is never aged out, even after its consumer is proven gone", () => {
+  // FOUND IN REVIEW. Even a fresh absence probe cannot be coupled atomically to
+  // unlinking the sibling record. A process can remember the path, recreate its
+  // home after that probe, and leave it unattributable if the marker is then
+  // discarded. The tiny record therefore outlives the credential directory.
   const lease = newLease();
   transitionLease(lease, "active", {
     consumer: { kind: "headless", pid: process.pid, pgid: process.pid },
@@ -1446,7 +3029,8 @@ test("a tombstone is not aged out until its consumer is proven gone", () => {
     "a long-expired record whose consumer is alive must be kept"
   );
 
-  // And once that consumer is gone, the record may go.
+  // Consumer absence authorizes removing a PRESENT directory. It still cannot
+  // authorize removing the last record while that directory is absent.
   fs.writeFileSync(
     lease.metaPath,
     JSON.stringify({
@@ -1458,7 +3042,74 @@ test("a tombstone is not aged out until its consumer is proven gone", () => {
     })
   );
   sweepLeases({ apply: true, now: Date.now() });
-  assert.equal(fs.existsSync(lease.metaPath), false);
+  assert.equal(
+    fs.existsSync(lease.metaPath),
+    true,
+    "consumer absence cannot make sibling-record unlink atomic"
+  );
+  fs.rmSync(lease.metaPath, { force: true });
+});
+
+test("a spent marker survives recreation and concurrent replacement during sweep", () => {
+  const lease = newLease();
+  const oldRecord = {
+    schema_version: 1,
+    lease_id: lease.id,
+    state: "released",
+    released_from_state: "projecting",
+    release_generation: lease.id,
+    released_at: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+    consumer_never_created: true,
+    consumer: null,
+  };
+  fs.writeFileSync(lease.metaPath, JSON.stringify(oldRecord));
+  fs.rmSync(lease.dir, { recursive: true, force: true });
+
+  const replacement = {
+    ...oldRecord,
+    released_from_state: "active",
+    replacement_revision: "arrived-after-absence-check",
+    consumer_never_created: false,
+    consumer: { kind: "headless", pid: process.pid, pgid: process.pid },
+  };
+  const originalReadFileSync = fs.readFileSync;
+  let interleaved = false;
+  fs.readFileSync = (target, ...args) => {
+    const bytes = originalReadFileSync(target, ...args);
+    if (!interleaved && String(target) === lease.metaPath) {
+      interleaved = true;
+      // Exact old failure window: the sweep had observed owner absence, then a
+      // late process recreated the directory and a concurrent writer replaced
+      // the sibling record before the sweep unlinked that pathname.
+      fs.mkdirSync(path.join(lease.dir, "codex-home"), { recursive: true });
+      fs.writeFileSync(path.join(lease.dir, "codex-home", "late.json"), "{}");
+      fs.writeFileSync(lease.metaPath, JSON.stringify(replacement));
+    }
+    return bytes;
+  };
+
+  let receipt;
+  try {
+    receipt = sweepLeases({ apply: true, now: Date.now() });
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.equal(interleaved, true, "the deterministic interleaving must have occurred");
+  assert.equal(fs.existsSync(lease.dir), true, "the recreated generation survives this snapshot");
+  assert.equal(fs.existsSync(lease.metaPath), true, "the replacement marker must never be unlinked");
+  assert.equal(
+    JSON.parse(fs.readFileSync(lease.metaPath, "utf-8")).replacement_revision,
+    replacement.replacement_revision,
+    "sweep must not unlink a concurrent record replacement"
+  );
+  assert.ok(
+    receipt.retained.some((entry) => entry.dir === lease.dir),
+    "the snapshot reports the permanent marker conservatively"
+  );
+
+  fs.rmSync(lease.dir, { recursive: true, force: true });
+  fs.rmSync(lease.metaPath, { force: true });
 });
 
 test("a release that cannot persist its tombstone keeps the directory", (t) => {
@@ -1492,7 +3143,11 @@ test("a release that cannot persist its tombstone keeps the directory", (t) => {
   }
 
   assert.equal(result.released, false, "a release that cannot be recorded must not destroy");
-  assert.match(result.reason, /could not be persisted/);
+  assert.match(
+    result.reason,
+    /could not be persisted|whether this directory is in use could not be determined/u,
+    "the release must fail closed at the first unavailable proof"
+  );
   assert.equal(fs.existsSync(lease.dir), true, "and the directory must survive");
   assert.equal(fs.existsSync(lease.metaPath), true, "as must the record it could not replace");
 
@@ -1500,11 +3155,10 @@ test("a release that cannot persist its tombstone keeps the directory", (t) => {
   fs.rmSync(lease.metaPath, { force: true });
 });
 
-test("a never-created marker record is reaped too, not kept forever", () => {
-  // FOUND IN REVIEW. The marker exists precisely because these leases have no
-  // consumer to probe -- and the expiry branch demanded one, so every projection
-  // failure and every missing-binary turn left a permanent metadata file. The
-  // credentials went; the bookkeeping accumulated.
+test("a never-created marker remains as compact attribution", (t) => {
+  // No consumer existed, so the credential directory can be removed. The
+  // sibling marker still cannot be unlinked atomically with continued path
+  // absence, and remains as the bounded bookkeeping cost of safe recreation.
   for (const state of ["projecting", "spawning"]) {
     const lease = newLease();
     if (state === "spawning") {
@@ -1515,23 +3169,28 @@ test("a never-created marker record is reaped too, not kept forever", () => {
       transitionLease(lease, "projecting");
     }
 
-    assert.equal(releaseLease(lease).released, true, state);
+    const result = releaseAllowingUnknownDirectory(lease);
+    if (!releasedOrRetainedUnknown(t, lease, result, `${state} marker cleanup`)) {
+      fs.rmSync(lease.dir, { recursive: true, force: true });
+      fs.rmSync(lease.metaPath, { force: true });
+      continue;
+    }
     assert.equal(fs.existsSync(lease.dir), false, `${state}: the directory goes`);
     assert.equal(fs.existsSync(lease.metaPath), true, `${state}: the marker remains for now`);
 
-    // Fresh: kept, in case a late recreation needs attributing.
+    // Fresh or old: kept, because age never proves future path absence.
     sweepLeases({ apply: true });
     assert.equal(fs.existsSync(lease.metaPath), true, `${state}: not reaped while fresh`);
 
-    // Aged out: reaped, because the owner proved there was never a consumer.
     sweepLeases({ apply: true, now: Date.now() + 25 * 60 * 60 * 1000 });
-    assert.equal(fs.existsSync(lease.metaPath), false, `${state}: reaped once spent`);
+    assert.equal(fs.existsSync(lease.metaPath), true, `${state}: age cannot erase attribution`);
+    fs.rmSync(lease.metaPath, { force: true });
   }
 });
 
-test("a spent lease record is eventually reaped, once its directory is gone", () => {
-  // Tombstones are metadata, not credentials, so age IS the right measure for
-  // them -- otherwise the runtime root fills with records of turns long past.
+test("a spent lease record remains after its directory is gone", (t) => {
+  // Tombstones are tiny metadata. Keeping them is necessary because no finite
+  // age establishes that a process will not recreate the canonical path later.
   const lease = newLease();
   transitionLease(lease, "active", {
     consumer: {
@@ -1540,7 +3199,12 @@ test("a spent lease record is eventually reaped, once its directory is gone", ()
       session_name: "dualog-lease-test-no-such-session",
     },
   });
-  assert.equal(releaseLease(lease).released, true);
+  const result = releaseAllowingUnknownDirectory(lease);
+  if (!releasedOrRetainedUnknown(t, lease, result, "spent-record cleanup")) {
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+    fs.rmSync(lease.metaPath, { force: true });
+    return;
+  }
   assert.equal(fs.existsSync(lease.metaPath), true, "the tombstone outlives the directory");
 
   // Not while it is fresh: a recreation may still be coming.
@@ -1549,12 +3213,13 @@ test("a spent lease record is eventually reaped, once its directory is gone", ()
 
   const later = Date.now() + 25 * 60 * 60 * 1000;
   sweepLeases({ apply: true, now: later });
-  assert.equal(fs.existsSync(lease.metaPath), false, "and is reaped once nothing can reference it");
+  assert.equal(fs.existsSync(lease.metaPath), true, "and age cannot erase attribution");
+  fs.rmSync(lease.metaPath, { force: true });
 });
 
 // --- the sweep -----------------------------------------------------------------
 
-test("the sweep reports what it will not touch, and touches nothing on a dry run", () => {
+test("the sweep reports what it will not touch, and touches nothing on a dry run", (t) => {
   const stray = path.join(runtimeDir(), "definitely-not-a-lease-id");
   fs.mkdirSync(stray, { recursive: true });
 
@@ -1577,13 +3242,37 @@ test("the sweep reports what it will not touch, and touches nothing on a dry run
   assert.ok(retainedDirs.includes(stray), "an unknown directory is reported, never removed");
   assert.ok(retainedDirs.includes(malformed), "unreadable metadata retains");
   assert.ok(retainedDirs.includes(live.dir), "a live consumer retains");
-  assert.ok(dry.removed.some((r) => r.dir === dead.dir));
-  assert.ok(dry.removed.every((r) => r.applied === false));
+  const dryRemovedDead = dry.removed.find((r) => r.dir === dead.dir);
+  const dryRetainedDead = dry.retained.find((r) => r.dir === dead.dir);
+  assert.notEqual(Boolean(dryRemovedDead), Boolean(dryRetainedDead));
+  if (dryRemovedDead) {
+    assert.equal(dryRemovedDead.applied, false);
+  } else {
+    const retainedDead = dryRetainedDead;
+    assert.ok(retainedDead, "an unprovably free dead consumer must still retain");
+    assert.match(retainedDead.reason, /could not be determined/);
+  }
   assert.equal(fs.existsSync(dead.dir), true, "a dry run changes nothing");
 
   const applied = sweepLeases({ apply: true });
-  assert.ok(applied.removed.some((r) => r.dir === dead.dir && r.applied === true));
-  assert.equal(fs.existsSync(dead.dir), false);
+  const appliedRemovedDead = applied.removed.find((r) => r.dir === dead.dir);
+  const appliedRetainedDead = applied.retained.find((r) => r.dir === dead.dir);
+  assert.notEqual(Boolean(appliedRemovedDead), Boolean(appliedRetainedDead));
+  if (appliedRemovedDead) {
+    assert.equal(appliedRemovedDead.applied, true);
+    assert.equal(fs.existsSync(dead.dir), false);
+    const tombstone = JSON.parse(fs.readFileSync(dead.metaPath, "utf-8"));
+    assert.equal(tombstone.state, "released", "ordinary sweep must persist a tombstone first");
+    assert.equal(tombstone.released_from_state, "active");
+    assert.ok(tombstone.released_at);
+    sweepLeases({ apply: true, now: Date.now() + 25 * 60 * 60 * 1000 });
+    assert.equal(fs.existsSync(dead.metaPath), true, "the spent sweep tombstone remains attributable");
+  } else {
+    const retainedDead = appliedRetainedDead;
+    assert.ok(retainedDead, "apply must not turn unknown directory usage into permission");
+    assert.match(retainedDead.reason, /could not be determined/);
+    assert.equal(fs.existsSync(dead.dir), true);
+  }
   assert.equal(fs.existsSync(live.dir), true, "the live one is still there");
   assert.equal(fs.existsSync(stray), true);
   assert.equal(fs.existsSync(malformed), true);
@@ -1591,6 +3280,8 @@ test("the sweep reports what it will not touch, and touches nothing on a dry run
   fs.rmSync(stray, { recursive: true, force: true });
   fs.rmSync(malformed, { recursive: true, force: true });
   fs.rmSync(live.dir, { recursive: true, force: true });
+  fs.rmSync(dead.dir, { recursive: true, force: true });
+  fs.rmSync(dead.metaPath, { force: true });
 });
 
 // --- the turn paths, pinned at the source --------------------------------------
@@ -1608,7 +3299,7 @@ test("every exit from a partner turn releases its lease, and only on proof", () 
   const src = fs.readFileSync(
     new URL("../src/partner-invocation.mjs", import.meta.url),
     "utf-8"
-  );
+  ).replace(/\r\n?/gu, "\n");
 
   const releases = (src.match(/^.*releaseLeaseQuietly\([^)]*\).*$/gm) || []).filter(
     (line) => !line.includes("function releaseLeaseQuietly")
@@ -1677,7 +3368,7 @@ test("every exit from a partner turn releases its lease, and only on proof", () 
   const leaseSrc = fs.readFileSync(
     new URL("../src/runtime-lease.mjs", import.meta.url),
     "utf-8"
-  );
+  ).replace(/\r\n?/gu, "\n");
   const settled = leaseSrc.match(/sleepSync\(SPAWN_SETTLE_MS\)/g) || [];
   assert.equal(settled.length, 1, "the failed-spawn shortcut must settle before its second probe");
   assert.equal(
@@ -1689,11 +3380,52 @@ test("every exit from a partner turn releases its lease, and only on proof", () 
   const headless = fs.readFileSync(
     new URL("../src/engines/headless.mjs", import.meta.url),
     "utf-8"
-  );
+  ).replace(/\r\n?/gu, "\n");
   assert.match(
     headless,
     /\} finally \{[\s\S]{0,400}releaseLease\(lease\)/,
     "the headless engine has a dozen exit paths, so its release must be in a finally"
+  );
+});
+
+test("same-UID ambiguity relaxation stays private to durable lifecycle cleanup", () => {
+  const usageSrc = fs
+    .readFileSync(new URL("../src/directory-usage.mjs", import.meta.url), "utf-8")
+    .replace(/\r\n?/gu, "\n");
+  const leaseSrc = fs
+    .readFileSync(new URL("../src/runtime-lease.mjs", import.meta.url), "utf-8")
+    .replace(/\r\n?/gu, "\n");
+
+  assert.match(usageSrc, /export function probeDirectoryUsageEvidence\(dir\)/);
+  assert.doesNotMatch(
+    usageSrc,
+    /export function probeDirectoryInUseAfterConsumerProof/u,
+    "the directory module may classify ambiguity but must never authorize it"
+  );
+  assert.doesNotMatch(
+    leaseSrc,
+    /export function removeLeaseDirectoryAfterConsumerProof/u,
+    "the relaxed deletion path must not be public"
+  );
+  assert.equal(
+    (leaseSrc.match(/removeLeaseDirectoryAfterConsumerProof\(/gu) || []).length,
+    3,
+    "only its definition, finishRelease, and released-tombstone sweep may reach it"
+  );
+  assert.match(
+    leaseSrc,
+    /function finishRelease\([\s\S]+writeJsonAtomic\(metaPathFor\(dir\)[\s\S]+removeLeaseDirectoryAfterConsumerProof\(dir\)/u,
+    "the tombstone must be durable before the private deletion check"
+  );
+  assert.match(
+    leaseSrc,
+    /const verdict = prospectiveLeaseRemovalVerdict\(dir, record\)[\s\S]{0,700}finishRelease\(dir, record\.metaPath, verdict\.releaseMeta\)/u,
+    "ordinary sweep dry-run and apply must share prospective proof, then apply via finishRelease"
+  );
+  assert.match(
+    leaseSrc,
+    /consumerAbsent === true[\s\S]{0,200}record\.value\.runner_pid === process\.pid[\s\S]{0,200}\["allocated", "projecting", "ready"\]/u,
+    "the caller assertion alone may authorize only this owner's pre-spawn states"
   );
 });
 
@@ -1713,6 +3445,11 @@ test("a partner that outlives its pane keeps its lease until it really exits", a
     t.skip("tmux is not installed");
     return;
   }
+  if (ORIGINAL_TMUX_BINARY === undefined) delete process.env.DUALOG_TMUX_BINARY;
+  else process.env.DUALOG_TMUX_BINARY = ORIGINAL_TMUX_BINARY;
+  t.after(() => {
+    process.env.DUALOG_TMUX_BINARY = FIXTURE_TMUX_BINARY;
+  });
   const { startTmuxSession, terminateTmuxSession } = await import("../src/tmux-runtime.mjs");
   const { probeProcess } = await import("../src/process-probe.mjs");
 
@@ -1774,8 +3511,13 @@ test("a partner that outlives its pane keeps its lease until it really exits", a
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   assert.equal(probeProcess(handle.panePid), "absent", "the fake partner should have exited by now");
-  assert.equal(releaseLease(lease).released, true);
-  assert.equal(fs.existsSync(lease.dir), false);
+  const finished = releaseAllowingUnknownDirectory(lease);
+  if (releasedOrRetainedUnknown(t, lease, finished, "successful post-process cleanup")) {
+    assert.equal(fs.existsSync(lease.dir), false);
+  } else {
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+    fs.rmSync(lease.metaPath, { force: true });
+  }
 });
 
 test("a setsid descendant keeps the lease, though no identity check can see it", async (t) => {
@@ -1789,7 +3531,7 @@ test("a setsid descendant keeps the lease, though no identity check can see it",
   // Asking the kernel about the DIRECTORY instead answers the question that
   // actually governs deletion, and ancestry cannot hide from it.
   if (process.platform === "win32") {
-    t.skip("Windows blocks removal of an open directory in the platform itself");
+    t.skip("POSIX setsid/process-group fixture; Windows tree lifecycle has separate coverage");
     return;
   }
 
@@ -1826,7 +3568,11 @@ test("a setsid descendant keeps the lease, though no identity check can see it",
 
   const verdict = releaseLease(lease);
   assert.equal(verdict.released, false, "a descendant holding the home must keep the lease");
-  assert.match(verdict.reason, /still has this directory open/);
+  assert.match(
+    verdict.reason,
+    /still has this directory open|whether this directory is in use could not be determined/u,
+    "a detected holder or an incomplete usage scan must both retain"
+  );
   assert.equal(
     fs.readFileSync(path.join(home, "auth.json"), "utf-8"),
     '{"token":"held-by-a-descendant"}',
@@ -1842,11 +3588,19 @@ test("a setsid descendant keeps the lease, though no identity check can see it",
   try {
     process.kill(-escapee.pid, "SIGKILL");
   } catch {}
+  const { probeProcess } = await import("../src/process-probe.mjs");
   const deadline = Date.now() + 8000;
-  while (Date.now() < deadline && releaseLease(lease).released === false) {
+  while (Date.now() < deadline && probeProcess(escapee.pid) !== "absent") {
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
-  assert.equal(fs.existsSync(lease.dir), false, "and it is reclaimed once nothing holds it");
+  assert.equal(probeProcess(escapee.pid), "absent", "the detached holder must have exited");
+  const finished = releaseAllowingUnknownDirectory(lease);
+  if (releasedOrRetainedUnknown(t, lease, finished, "successful detached-holder cleanup")) {
+    assert.equal(fs.existsSync(lease.dir), false, "and it is reclaimed once nothing holds it");
+  } else {
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+    fs.rmSync(lease.metaPath, { force: true });
+  }
 });
 
 test("an undeterminable usage answer cannot authorize deletion at ANY path", (t) => {
@@ -1855,13 +3609,18 @@ test("an undeterminable usage answer cannot authorize deletion at ANY path", (t)
   // removal WITHOUT going through the verdict (the owner's failed-spawn
   // shortcut, the released-tombstone branch). So on a host with no lsof the
   // answer was `unknown` and the directory was removed anyway.
-  if (process.platform === "win32") {
-    t.skip("Windows enforces this in the platform itself");
-    return;
-  }
   const script = `
     process.env.PATH = "";
     const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
+    const originalReaddirSync = fs.readdirSync;
+    fs.readdirSync = (target, ...args) => {
+      if (String(target) === "/proc") {
+        const error = new Error("procfs is unavailable");
+        error.code = "ENOENT";
+        throw error;
+      }
+      return originalReaddirSync(target, ...args);
+    };
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-unknown-"));
     process.env.HOME = home; process.env.USERPROFILE = home;
     process.env.HOMEDRIVE = ""; process.env.HOMEPATH = home;
@@ -1886,18 +3645,322 @@ test("an undeterminable usage answer cannot authorize deletion at ANY path", (t)
   assert.equal(out.survives, true);
 });
 
+test("only lifecycle-proven cleanup may relax an unrelated same-UID permission hole", () => {
+  const script = `
+    const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
+    const crossSpawn = require("cross-spawn");
+    const originalReadFileSync = fs.readFileSync;
+    const originalReaddirSync = fs.readdirSync;
+    const originalReadlinkSync = fs.readlinkSync;
+    const originalStatSync = fs.statSync;
+    const originalRenameSync = fs.renameSync;
+    const hiddenPid = "424242";
+    const holderPid = "424243";
+    let leaseReal = null;
+    let readableHolder = false;
+    let restrictedProc = false;
+
+    Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+    Object.defineProperty(process, "getuid", { configurable: true, value: () => 1000 });
+    const denied = (code) => {
+      const error = new Error(code);
+      error.code = code;
+      throw error;
+    };
+    fs.readFileSync = (target, ...args) => {
+      const value = String(target);
+      if (value === "/proc/sys/kernel/random/boot_id") {
+        return "current-proof-boot\\n";
+      }
+      if (value === "/proc/self/mountinfo") {
+        return restrictedProc
+          ? "148 146 0:72 / /proc rw,relatime - proc proc rw,hidepid=invisible\\n"
+          : "148 146 0:72 / /proc rw,relatime - proc proc rw\\n";
+      }
+      if (
+        value === "/proc/" + hiddenPid + "/status" ||
+        value === "/proc/" + holderPid + "/status"
+      ) {
+        return "Name:\\tssh-agent-like\\nUid:\\t1000\\t1000\\t1000\\t1000\\n";
+      }
+      return originalReadFileSync(target, ...args);
+    };
+    fs.readdirSync = (target, ...args) => {
+      const value = String(target);
+      if (value === "/proc") return readableHolder ? [hiddenPid, holderPid] : [hiddenPid];
+      if (value === "/proc/" + hiddenPid + "/fd") return denied("EACCES");
+      if (value === "/proc/" + holderPid + "/fd") return [];
+      return originalReaddirSync(target, ...args);
+    };
+    fs.readlinkSync = (target, ...args) => {
+      if (String(target) === "/proc/" + hiddenPid + "/cwd") return denied("EACCES");
+      if (String(target) === "/proc/" + holderPid + "/cwd") return leaseReal;
+      return originalReadlinkSync(target, ...args);
+    };
+    fs.statSync = (target, ...args) => {
+      const stat = originalStatSync(target, ...args);
+      if (!leaseReal || String(target) !== leaseReal) return stat;
+      return new Proxy(stat, {
+        get(value, key) {
+          if (key === "uid") return 1000;
+          if (key === "mode") return (value.mode & ~0o777) | 0o700;
+          const member = Reflect.get(value, key, value);
+          return typeof member === "function" ? member.bind(value) : member;
+        },
+      });
+    };
+    fs.renameSync = (source, target) => {
+      let movedGeneration = false;
+      try {
+        movedGeneration = leaseReal != null && fs.realpathSync(source) === leaseReal;
+      } catch {}
+      const result = originalRenameSync(source, target);
+      if (movedGeneration) leaseReal = fs.realpathSync(target);
+      return result;
+    };
+
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-proof-mode-"));
+    process.env.HOME = home; process.env.USERPROFILE = home;
+    process.env.HOMEDRIVE = ""; process.env.HOMEPATH = home;
+    const fixtureTmux = path.join(home, "tmux-fixture");
+    process.env.DUALOG_TMUX_BINARY = fixtureTmux;
+    crossSpawn.sync = (command, args) => {
+      if (command === fixtureTmux && Array.isArray(args) && args.includes("has-session")) {
+        return {
+          pid: 0,
+          output: [null, "", "can't find session: fixture"],
+          stdout: "",
+          stderr: "can't find session: fixture",
+          status: 1,
+          signal: null,
+        };
+      }
+      throw new Error("unexpected child process: " + command);
+    };
+    import(${JSON.stringify(new URL("../src/runtime-lease.mjs", import.meta.url).href)}).then((leaseApi) => {
+      const makeLease = (turnId, engine = "headless") => {
+        const turnDir = path.join(
+          home,
+          ".dualog",
+          "sessions",
+          "dialog-proof-0000",
+          "turns",
+          turnId
+        );
+        fs.mkdirSync(turnDir, { recursive: true });
+        return leaseApi.allocateLease({
+          sessionId: "dialog-proof-0000",
+          turnId,
+          agent: "codex",
+          engine,
+          turnDir,
+        });
+      };
+
+      const lease = makeLease("t1");
+      leaseReal = fs.realpathSync(lease.dir);
+      leaseApi.transitionLease(lease, "projecting");
+
+      let directError = null;
+      try { leaseApi.removeLeaseDirectory(lease.dir); }
+      catch (error) { directError = error.message; }
+      const release = leaseApi.releaseLease(lease);
+      const preSpawnTombstone = JSON.parse(fs.readFileSync(lease.metaPath, "utf-8"));
+
+      const headless = makeLease("t2");
+      leaseReal = fs.realpathSync(headless.dir);
+      leaseApi.transitionLease(headless, "active", {
+        consumer: { kind: "headless", pid: 999999, pgid: 999999 },
+      });
+      const headlessRelease = leaseApi.releaseLease(headless);
+
+      const legacyTmux = makeLease("t3", "tmux-interactive");
+      leaseReal = fs.realpathSync(legacyTmux.dir);
+      leaseApi.transitionLease(legacyTmux, "active", {
+        consumer: {
+          kind: "tmux",
+          session_name: "dualog-absent-legacy",
+          tmux_transport: "local",
+          tmux_distro: null,
+          tmux_launcher: fixtureTmux,
+          tmux_control_binary: fixtureTmux,
+          tmux_socket_name: "dualog",
+        },
+      });
+      const legacyTmuxRelease = leaseApi.releaseLease(legacyTmux);
+
+      const readable = makeLease("t4");
+      leaseReal = fs.realpathSync(readable.dir);
+      leaseApi.transitionLease(readable, "active", {
+        consumer: { kind: "headless", pid: 999999, pgid: 999999 },
+      });
+      readableHolder = true;
+      const readableRelease = leaseApi.releaseLease(readable);
+      readableHolder = false;
+
+      const restricted = makeLease("t5");
+      leaseReal = fs.realpathSync(restricted.dir);
+      leaseApi.transitionLease(restricted, "projecting");
+      restrictedProc = true;
+      const restrictedRelease = leaseApi.releaseLease(restricted);
+      restrictedProc = false;
+
+      const oldSchema = makeLease("t6");
+      leaseReal = fs.realpathSync(oldSchema.dir);
+      leaseApi.transitionLease(oldSchema, "projecting");
+      const oldSchemaMeta = JSON.parse(fs.readFileSync(oldSchema.metaPath, "utf-8"));
+      fs.writeFileSync(oldSchema.metaPath, JSON.stringify({ ...oldSchemaMeta, schema_version: 0 }));
+      const oldSchemaRelease = leaseApi.releaseLease(oldSchema);
+
+      const wrongId = makeLease("t7");
+      leaseReal = fs.realpathSync(wrongId.dir);
+      leaseApi.transitionLease(wrongId, "projecting");
+      const wrongIdMeta = JSON.parse(fs.readFileSync(wrongId.metaPath, "utf-8"));
+      fs.writeFileSync(wrongId.metaPath, JSON.stringify({ ...wrongIdMeta, lease_id: "b".repeat(32) }));
+      const wrongIdRelease = leaseApi.releaseLease(wrongId);
+
+      const legacyRecord = makeLease("t8");
+      leaseReal = fs.realpathSync(legacyRecord.dir);
+      leaseApi.transitionLease(legacyRecord, "projecting");
+      fs.renameSync(legacyRecord.metaPath, path.join(legacyRecord.dir, "lease.json"));
+      const legacyRecordRelease = leaseApi.releaseLease(legacyRecord);
+      const migratedLegacy = JSON.parse(fs.readFileSync(legacyRecord.metaPath, "utf-8"));
+
+      const priorPreSpawn = makeLease("t9");
+      leaseReal = fs.realpathSync(priorPreSpawn.dir);
+      leaseApi.transitionLease(priorPreSpawn, "projecting");
+      const priorMeta = JSON.parse(fs.readFileSync(priorPreSpawn.metaPath, "utf-8"));
+      fs.writeFileSync(
+        priorPreSpawn.metaPath,
+        JSON.stringify({ ...priorMeta, boot: { ...priorMeta.boot, id: "previous-proof-boot" } })
+      );
+      const priorDry = leaseApi.sweepLeases();
+      const priorApply = leaseApi.sweepLeases({ apply: true });
+      const priorRelease = leaseApi.releaseLease(priorPreSpawn);
+      const priorReleasedDry = leaseApi.sweepLeases();
+      const priorReleasedApply = leaseApi.sweepLeases({ apply: true });
+
+      console.log(JSON.stringify({
+        directError,
+        survivedDirectCall: directError != null,
+        release,
+        survivesAfterProof: fs.existsSync(lease.dir),
+        preSpawnTombstone,
+        headlessRelease,
+        headlessSurvives: fs.existsSync(headless.dir),
+        legacyTmuxRelease,
+        legacyTmuxSurvives: fs.existsSync(legacyTmux.dir),
+        readableRelease,
+        readableSurvives: fs.existsSync(readable.dir),
+        restrictedRelease,
+        restrictedSurvives: fs.existsSync(restricted.dir),
+        oldSchemaRelease,
+        oldSchemaSurvives: fs.existsSync(oldSchema.dir),
+        wrongIdRelease,
+        wrongIdSurvives: fs.existsSync(wrongId.dir),
+        legacyRecordRelease,
+        legacyRecordSurvives: fs.existsSync(legacyRecord.dir),
+        migratedLegacy,
+        priorDryRetained: priorDry.retained.some((entry) => entry.dir === priorPreSpawn.dir),
+        priorApplyRetained: priorApply.retained.some((entry) => entry.dir === priorPreSpawn.dir),
+        priorRelease,
+        priorReleasedDryRetained: priorReleasedDry.retained.some(
+          (entry) => entry.dir === priorPreSpawn.dir
+        ),
+        priorReleasedApplyRetained: priorReleasedApply.retained.some(
+          (entry) => entry.dir === priorPreSpawn.dir
+        ),
+        priorPreSpawnSurvives: fs.existsSync(priorPreSpawn.dir),
+      }));
+    });
+  `;
+  const out = JSON.parse(
+    execFileSync(process.execPath, ["-e", script], { encoding: "utf-8" }).trim()
+  );
+  assert.match(out.directError, /whether this directory is in use could not be determined/);
+  assert.equal(out.survivedDirectCall, true, "the strict public choke point must retain");
+  assert.deepEqual(out.release, { released: true, reason: null });
+  assert.equal(out.survivesAfterProof, false, "owner-proven pre-spawn cleanup may proceed");
+  assert.equal(out.preSpawnTombstone.schema_version, 1);
+  assert.equal(out.preSpawnTombstone.state, "released");
+  assert.equal(out.preSpawnTombstone.released_from_state, "projecting");
+  assert.equal(out.preSpawnTombstone.consumer_never_created, true);
+
+  assert.deepEqual(out.headlessRelease, { released: true, reason: null });
+  assert.equal(
+    out.headlessSurvives,
+    false,
+    "a freshly absent PID and PGID may relax an unrelated same-UID permission hole"
+  );
+
+  assert.equal(out.legacyTmuxRelease.released, false);
+  assert.match(out.legacyTmuxRelease.reason, /could not be determined/);
+  assert.equal(
+    out.legacyTmuxSurvives,
+    true,
+    "session-name-only tmux absence is too weak to relax incomplete evidence"
+  );
+
+  assert.equal(out.readableRelease.released, false);
+  assert.match(out.readableRelease.reason, /still has this directory open/);
+  assert.equal(out.readableSurvives, true, "an actual readable holder always blocks");
+
+  assert.equal(out.restrictedRelease.released, false);
+  assert.match(out.restrictedRelease.reason, /could not be determined/);
+  assert.equal(out.restrictedSurvives, true, "restricted proc enumeration remains fail-closed");
+
+  assert.equal(out.oldSchemaRelease.released, false);
+  assert.match(out.oldSchemaRelease.reason, /could not be determined/);
+  assert.equal(
+    out.oldSchemaSurvives,
+    true,
+    "a non-current record may pass only a strict free scan"
+  );
+  assert.equal(out.wrongIdRelease.released, false);
+  assert.match(out.wrongIdRelease.reason, /could not be determined/);
+  assert.equal(
+    out.wrongIdSurvives,
+    true,
+    "a tombstone for another lease id cannot relax incomplete evidence"
+  );
+  assert.equal(out.legacyRecordRelease.released, false);
+  assert.match(out.legacyRecordRelease.reason, /could not be determined/);
+  assert.equal(out.legacyRecordSurvives, true, "a legacy in-directory record stays strict");
+  assert.equal(
+    out.migratedLegacy.release_relaxation_eligible,
+    false,
+    "migrating the tombstone must not upgrade legacy evidence"
+  );
+  assert.equal(out.priorDryRetained, true);
+  assert.equal(out.priorApplyRetained, true);
+  assert.equal(out.priorRelease.released, false);
+  assert.match(out.priorRelease.reason, /could not be determined/);
+  assert.equal(out.priorReleasedDryRetained, true);
+  assert.equal(out.priorReleasedApplyRetained, true);
+  assert.equal(
+    out.priorPreSpawnSurvives,
+    true,
+    "a prior-boot pre-spawn proof must never relax Linux same-UID ambiguity"
+  );
+});
+
 test("usage that cannot be determined retains, and never reads as free", (t) => {
   // The probe needs /proc or lsof. Where neither is reachable -- a stripped
-  // container, a restricted PATH -- the answer is `unknown`, and on a platform
-  // that does not enforce this itself that must retain. Reading it as "free"
-  // would turn a missing tool into permission to delete a live partner's home.
-  if (process.platform === "win32") {
-    t.skip("Windows answers unknown by design and relies on the platform");
-    return;
-  }
+  // container, a restricted PATH, or native Windows -- the answer is `unknown`,
+  // and the strict verdict must retain. Reading it as "free" would turn missing
+  // evidence into permission to delete a live partner's home.
   const script = `
     process.env.PATH = "";
     const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
+    const originalReaddirSync = fs.readdirSync;
+    fs.readdirSync = (target, ...args) => {
+      if (String(target) === "/proc") {
+        const error = new Error("procfs is unavailable");
+        error.code = "ENOENT";
+        throw error;
+      }
+      return originalReaddirSync(target, ...args);
+    };
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-nolsof-"));
     Promise.all([
       import(${JSON.stringify(new URL("../src/directory-usage.mjs", import.meta.url).href)}),
@@ -1925,7 +3988,7 @@ test("the removal choke point refuses a directory in use, whatever the caller be
   // unskippable. A future path that forgets the check still cannot delete a home
   // out from under a running process.
   if (process.platform === "win32") {
-    t.skip("Windows enforces this in the platform");
+    t.skip("POSIX live-cwd fixture; Windows strict removal is covered below");
     return;
   }
   const lease = newLease();
@@ -1959,9 +4022,61 @@ test("the removal choke point refuses a directory in use, whatever the caller be
   fs.rmSync(lease.metaPath, { force: true });
 });
 
+test("the caller's own credential descriptor blocks strict removal and release until closed", (t) => {
+  const strictLease = newLease();
+  const strictAuth = path.join(strictLease.dir, "auth.json");
+  fs.writeFileSync(strictAuth, '{"token":"strict-self-holder"}');
+  const strictFd = fs.openSync(strictAuth, "r");
+  try {
+    assert.throws(
+      () => removeLeaseDirectory(strictLease.dir),
+      /a process still has this directory open|whether this directory is in use could not be determined/u,
+      "the exported strict choke point must count the process calling it"
+    );
+    assert.equal(fs.existsSync(strictAuth), true);
+  } finally {
+    fs.closeSync(strictFd);
+    fs.rmSync(strictLease.dir, { recursive: true, force: true });
+    fs.rmSync(strictLease.metaPath, { force: true });
+  }
+
+  if (process.platform === "win32") {
+    // There is no portable Windows handle scan. The assertion above is the
+    // important boundary: callers without a durable lifecycle proof cannot turn
+    // that unknown into permission. The private release path is tested with
+    // synthetic Windows lifecycle records above.
+    t.skip("Windows has no portable self-handle scan beyond the strict assertion above");
+    return;
+  }
+
+  const releasedLease = newLease();
+  const releasedAuth = path.join(releasedLease.dir, "auth.json");
+  fs.writeFileSync(releasedAuth, '{"token":"release-self-holder"}');
+  transitionLease(releasedLease, "active", {
+    consumer: { kind: "headless", pid: 999999, pgid: 999999 },
+  });
+  const releasedFd = fs.openSync(releasedAuth, "r");
+  const blocked = releaseLease(releasedLease);
+  assert.equal(blocked.released, false);
+  assert.match(blocked.reason, /a process still has this directory open/);
+  assert.equal(fs.existsSync(releasedAuth), true, "release must retain while its caller holds auth");
+
+  fs.closeSync(releasedFd);
+  const finished = releaseLease(releasedLease);
+  if (finished.released) {
+    assert.equal(fs.existsSync(releasedLease.dir), false, "closing the descriptor permits release");
+  } else {
+    assert.match(finished.reason, UNKNOWN_DIRECTORY_USAGE);
+    assert.equal(fs.existsSync(releasedLease.dir), true, "other incomplete evidence still retains");
+    t.diagnostic("closing the caller descriptor exposed unrelated host-wide visibility ambiguity");
+    fs.rmSync(releasedLease.dir, { recursive: true, force: true });
+  }
+  fs.rmSync(releasedLease.metaPath, { force: true });
+});
+
 // --- the property all of it exists for ----------------------------------------
 
-test("a partner's credentials land in the lease and never in the session archive", async () => {
+test("a partner's credentials land in the lease and never in the session archive", async (t) => {
   // THE POINT. Config isolation used to seed a partner's real auth into
   // `<sessionDir>/codex-home` -- a directory kept so a conversation could be
   // reread months later -- so every session ever run retained a live credential
@@ -2025,6 +4140,16 @@ test("a partner's credentials land in the lease and never in the session archive
       session_name: "dualog-lease-test-no-such-session",
     },
   });
-  assert.equal(releaseLease(lease).released, true);
-  assert.equal(fs.existsSync(path.join(lease.dir, "codex-home", "auth.json")), false);
+  const finished = releaseAllowingUnknownDirectory(lease);
+  if (releasedOrRetainedUnknown(t, lease, finished, "successful credential cleanup")) {
+    assert.equal(fs.existsSync(path.join(lease.dir, "codex-home", "auth.json")), false);
+  } else {
+    assert.equal(
+      fs.existsSync(path.join(lease.dir, "codex-home", "auth.json")),
+      true,
+      "fail-closed cleanup leaves the credential in its private runtime lease, not the archive"
+    );
+    fs.rmSync(lease.dir, { recursive: true, force: true });
+    fs.rmSync(lease.metaPath, { force: true });
+  }
 });

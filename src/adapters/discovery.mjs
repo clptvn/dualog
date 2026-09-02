@@ -29,8 +29,10 @@ import { Buffer } from "node:buffer";
 
 import { modelEntries } from "./schema.mjs";
 import { loadCatalog, enrich } from "./catalog.mjs";
+import { findBinary } from "./negotiate.mjs";
 import {
   resolveWslLoginShell,
+  resolveWslPartnerExecutable,
   resolveWslRouteDistro,
   tmuxRoute,
 } from "../tmux-runtime.mjs";
@@ -38,7 +40,10 @@ import {
   DEFAULT_WSL_LOGIN_SHELL,
   wslLoginShellArgs,
 } from "../wsl-shell.mjs";
-import { terminateWindowsProcessTree } from "../windows-process-tree.mjs";
+import {
+  spawnWithTrustedWindowsComSpec,
+  terminateWindowsProcessTree,
+} from "../windows-process-tree.mjs";
 // Imported rather than restated: the recursion sentinel is a safety mechanism,
 // and a second copy of it here is a second copy that can drift out of step with
 // the one every partner spawn uses.
@@ -82,16 +87,24 @@ export function execFileViaCrossSpawn(
   {
     spawnImpl = crossSpawn,
     platform = process.platform,
+    env = options?.env ?? process.env,
     terminateWindowsTreeFn = terminateWindowsProcessTree,
   } = {}
 ) {
   let child;
   try {
-    child = spawnImpl(command, args, {
+    const spawnOptions = {
       env: options?.env,
       windowsHide: options?.windowsHide,
       stdio: ["ignore", "pipe", "pipe"],
-    });
+    };
+    child = spawnWithTrustedWindowsComSpec(
+      spawnImpl,
+      command,
+      args,
+      spawnOptions,
+      { platform, env }
+    );
   } catch (err) {
     queueMicrotask(() => callback(err, "", ""));
     return null;
@@ -197,6 +210,7 @@ export function execFileViaCrossSpawn(
 
 export function discoveryProcessImplementations({
   platform = process.platform,
+  env = process.env,
   execFileImpl = null,
   spawnImpl = null,
   crossSpawnImpl = crossSpawn,
@@ -210,6 +224,7 @@ export function discoveryProcessImplementations({
             execFileViaCrossSpawn(command, args, options, callback, {
               spawnImpl: crossSpawnImpl,
               platform,
+              env,
               terminateWindowsTreeFn,
             })
         : execFile),
@@ -1066,10 +1081,15 @@ function discoveryRuntimeRoute(
   return tmuxRouteFn({ env, platform });
 }
 
-/** Keep cached account catalogs scoped to the distro that supplied them. */
-function discoveryCacheAdapterId(adapterId, route) {
-  if (route?.transport !== "wsl") return adapterId;
-  return `${adapterId}@wsl:${route.distro || "default"}`;
+/** Keep process-backed catalogs scoped to the exact command and namespace. */
+function discoveryCacheAdapterId(adapterId, route, partnerCommand = null) {
+  const namespace =
+    route?.transport === "wsl"
+      ? `${adapterId}@wsl:${route.distro || "default"}`
+      : adapterId;
+  if (!partnerCommand) return namespace;
+  const encoded = Buffer.from(partnerCommand, "utf-8").toString("base64url");
+  return `${namespace}@command:${encoded}`;
 }
 
 /**
@@ -1099,6 +1119,8 @@ export async function resolveDiscovery(adapter, options = {}) {
     home = os.homedir(),
     platform = process.platform,
     engine = null,
+    partnerCommand = null,
+    projectPath = process.cwd(),
     now = Date.now(),
     refresh = false,
     cache = discoveryCache,
@@ -1111,15 +1133,21 @@ export async function resolveDiscovery(adapter, options = {}) {
     tmuxRouteFn = tmuxRoute,
     resolveWslRouteDistroFn = resolveWslRouteDistro,
     resolveWslLoginShellFn = resolveWslLoginShell,
+    resolveWslPartnerExecutableFn = resolveWslPartnerExecutable,
     execFileImpl = null,
     spawnImpl = null,
     terminateWindowsTreeFn = terminateWindowsProcessTree,
+    findBinaryFn = findBinary,
   } = options;
 
   const config = adapter?.discovery ?? null;
   const strategy = config?.strategy ?? "static";
+  let processPartnerCommand = ["cli-command", "sdk-control"].includes(strategy)
+    ? partnerCommand
+    : null;
   const processImplementations = discoveryProcessImplementations({
     platform,
+    env,
     execFileImpl,
     spawnImpl,
     terminateWindowsTreeFn,
@@ -1184,7 +1212,78 @@ export async function resolveDiscovery(adapter, options = {}) {
     };
   }
 
-  const cacheAdapterId = discoveryCacheAdapterId(adapter.id, route);
+  if (["cli-command", "sdk-control"].includes(strategy)) {
+    const requestedCommand =
+      processPartnerCommand ?? config.command ?? adapter.binary.default;
+    if (route?.transport === "wsl") {
+      try {
+        processPartnerCommand = await resolveWslPartnerExecutableFn(requestedCommand, {
+          projectPath: projectPath || process.cwd(),
+          route,
+          resolveWslLoginShellFn,
+        });
+      } catch (err) {
+        let result = staticResult(adapter, [
+          notice(
+            "command_failed",
+            `discovery command ${JSON.stringify(requestedCommand)} was not trusted in WSL: ${err?.message ?? err}`
+          ),
+        ]);
+        result = await applyCatalogEnrichment(result, adapter, config, {
+          now,
+          refresh,
+          options,
+        });
+        return result;
+      }
+      if (!processPartnerCommand) {
+        let result = staticResult(adapter, [
+          notice(
+            "command_failed",
+            `discovery command ${JSON.stringify(requestedCommand)} was not found in the selected WSL distribution`
+          ),
+        ]);
+        result = await applyCatalogEnrichment(result, adapter, config, {
+          now,
+          refresh,
+          options,
+        });
+        return result;
+      }
+    } else {
+      const usingInjectedProcessIo =
+        strategy === "cli-command"
+          ? runCommand !== defaultRunCommand || execFileImpl !== null
+          : runControl !== defaultRunControlRequest || spawnImpl !== null;
+      processPartnerCommand =
+        usingInjectedProcessIo && partnerCommand == null
+          ? requestedCommand
+          : findBinaryFn(requestedCommand, env, {
+              platform,
+              excludedRoots: [projectPath || process.cwd()],
+            });
+      if (!processPartnerCommand) {
+        let result = staticResult(adapter, [
+          notice(
+            "command_failed",
+            `discovery command ${JSON.stringify(requestedCommand)} was not found on an absolute PATH entry`
+          ),
+        ]);
+        result = await applyCatalogEnrichment(result, adapter, config, {
+          now,
+          refresh,
+          options,
+        });
+        return result;
+      }
+    }
+  }
+
+  const cacheAdapterId = discoveryCacheAdapterId(
+    adapter.id,
+    route,
+    processPartnerCommand
+  );
   if (!refresh) {
     const hit = cache.get(strategy, cacheAdapterId);
     if (hit) return hit;
@@ -1207,6 +1306,7 @@ export async function resolveDiscovery(adapter, options = {}) {
       spawnImpl: processImplementations.spawnImpl,
       platform,
       terminateWindowsTreeFn,
+      partnerCommand: processPartnerCommand,
     };
     if (strategy === "local-cache") result = await resolveLocalCache(adapter, config, context);
     else if (strategy === "cli-command") result = await resolveCliCommand(adapter, config, context);
@@ -1545,9 +1645,9 @@ function resolveUserConfigHome(adapter, env, home) {
 async function resolveCliCommand(
   adapter,
   config,
-  { env, now, route, runCommand, execFileImpl }
+  { env, now, route, runCommand, execFileImpl, partnerCommand }
 ) {
-  const command = config.command ?? adapter.binary.default;
+  const command = partnerCommand ?? config.command ?? adapter.binary.default;
   const label = `${command} ${config.args.join(" ")}`;
 
   // Run with the USER's environment, not a partner's isolated one: this listing
@@ -1629,9 +1729,10 @@ async function resolveSdkControl(
     spawnImpl,
     platform,
     terminateWindowsTreeFn,
+    partnerCommand,
   }
 ) {
-  const command = config.command ?? adapter.binary.default;
+  const command = partnerCommand ?? config.command ?? adapter.binary.default;
   const label = `${command} (list_models control request)`;
 
   const run = await runControl({
@@ -2166,7 +2267,7 @@ function defaultRunControlRequest({
     const invocation = prepareDiscoveryCommand(command, args, route);
     let child;
     try {
-      child = spawnImpl(invocation.command, invocation.args, {
+      const spawnOptions = {
         // The user's own environment, so the CLI reports what the USER can
         // select -- plus the sentinel, so anything this child spawns knows it
         // is downstream of us. The WSL wrapper exports the same sentinel again
@@ -2174,7 +2275,14 @@ function defaultRunControlRequest({
         env: { ...env, ...partnerSentinelEnv() },
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
-      });
+      };
+      child = spawnWithTrustedWindowsComSpec(
+        spawnImpl,
+        invocation.command,
+        invocation.args,
+        spawnOptions,
+        { platform, env: spawnOptions.env }
+      );
     } catch (err) {
       return resolve({
         line: null,

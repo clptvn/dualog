@@ -4,7 +4,7 @@ import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import fs from "fs";
 import path from "path";
-import { spawn, execSync, execFileSync } from "child_process";
+import { spawn, execFileSync } from "child_process";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
 import {
@@ -50,7 +50,11 @@ import {
   listAdapters,
   tryGetAdapter,
 } from "./adapters/registry.mjs";
-import { describeAdapter, negotiate } from "./adapters/negotiate.mjs";
+import {
+  describeAdapter,
+  findBinary,
+  negotiate,
+} from "./adapters/negotiate.mjs";
 import { isEnumerable, modelIds } from "./adapters/schema.mjs";
 import { resolveDiscovery } from "./adapters/discovery.mjs";
 import { resolveDiscoveryForValidation } from "./adapters/resolve-for-validation.mjs";
@@ -64,11 +68,10 @@ import {
   extractNormalizedFindings,
   selectAspects,
 } from "./pr-review-aspects.mjs";
-import { ENGINES, resolveRunnableEngine } from "./engines/index.mjs";
+import { ENGINES } from "./engines/index.mjs";
 import { reapOrphanedHeadlessChildren } from "./engines/headless.mjs";
 import { resolvePartnerRuntimeContext } from "./partner-invocation.mjs";
 import { sweepLeases } from "./runtime-lease.mjs";
-import { tmuxRoute } from "./tmux-runtime.mjs";
 
 const server = new McpServer({
   name: "dualog",
@@ -170,6 +173,19 @@ function resolveSessionDir(sessionId) {
   // New sessions land under the current root; sessions created before the
   // rename are still readable in place rather than orphaned.
   return resolveExistingSessionDir(sessionId);
+}
+
+/** Resolve a review-side VCS tool without granting the reviewed tree PATH authority. */
+function resolveReviewExecutable(command, projectPath) {
+  return findBinary(command, process.env, { excludedRoots: [projectPath] });
+}
+
+function missingReviewExecutableMessage(command, projectPath) {
+  const display = command === "gh" ? 'The GitHub CLI ("gh")' : "Git";
+  return (
+    `${display} was not found on a trusted absolute PATH entry outside the reviewed project ` +
+    `${JSON.stringify(projectPath)}.`
+  );
 }
 
 function readConv(sessionId) {
@@ -396,27 +412,36 @@ async function preflightPartner(partnerAgent, {
       errorText: `Unknown partner_agent "${partnerAgent}". Known adapters: ${adapterIds().join(", ")}`,
     };
   }
+  const requestedPartnerCommand = partnerCommand || adapter.binary.default;
 
   let runtimeContext;
   try {
     runtimeContext = await resolvePartnerRuntimeContext({
       partnerAgent,
-      partnerCommand,
+      partnerCommand: requestedPartnerCommand,
       projectPath: projectPath || process.cwd(),
     });
   } catch (err) {
     return { ok: false, errorText: err.message };
   }
   const engine = runtimeContext.engine;
-  const runtimeDecision = Object.freeze({
-    version: 1,
-    engine,
-    tmuxTransport: runtimeContext.tmuxTransport,
-    tmuxDistro: runtimeContext.tmuxDistro,
-    tmuxLauncher: runtimeContext.tmuxLauncher,
-    tmuxControlBinary: runtimeContext.tmuxControlBinary,
-    tmuxSocketName: runtimeContext.tmuxSocketName,
-  });
+  const requireBinary = !(
+    engine === "tmux-interactive" && runtimeContext.tmuxTransport === "wsl"
+  );
+  const preflightPartnerCommand = requireBinary
+    ? findBinary(requestedPartnerCommand, process.env, {
+        excludedRoots: [projectPath || process.cwd()],
+      })
+    : runtimeContext.partnerCommand;
+  if (!preflightPartnerCommand) {
+    return {
+      ok: false,
+      errorText:
+        `Cannot start a ${adapter.displayName} session as requested:\n` +
+        `  - [binary_not_found] "${requestedPartnerCommand}" was not found on PATH, so adapter "${adapter.id}" cannot start.` +
+        (adapter.binary.installHint ? ` Install: ${adapter.binary.installHint}` : ""),
+    };
+  }
 
   const requestedEffort = requestedReasoningEffortForAdapter(reasoningEffort);
 
@@ -429,6 +454,7 @@ async function preflightPartner(partnerAgent, {
     model,
     projectPath,
     engine,
+    partnerCommand: preflightPartnerCommand,
     tmuxRoute: runtimeContext.tmuxRoute,
   });
 
@@ -436,13 +462,11 @@ async function preflightPartner(partnerAgent, {
   try {
     result = negotiate(adapter, {
       engine,
-      partnerCommand,
+      partnerCommand: preflightPartnerCommand,
       // resolveRunnableEngine() already ran this exact partner command through
       // the WSL shell tmux uses. A native PATH probe would reject that verified
       // WSL executable before a Windows host can start an interactive turn.
-      requireBinary: !(
-        engine === "tmux-interactive" && runtimeContext.tmuxTransport === "wsl"
-      ),
+      requireBinary,
       toolProfile: toolProfile || "read",
       model: model || null,
       reasoningEffort: requestedEffort,
@@ -466,9 +490,29 @@ async function preflightPartner(partnerAgent, {
     };
   }
 
+  // Both transports cross the detached-runner boundary with an exact file:
+  // local/headless uses the host's trusted PATH, while native Windows -> WSL
+  // uses the selected distro's login-shell PATH and rejects anything inside the
+  // translated reviewed project. Repeating either lookup from the runner's cwd
+  // would restore executable authority to the tree being reviewed.
+  const resolvedPartnerCommand = requireBinary
+    ? result.binaryPath
+    : preflightPartnerCommand;
+  const runtimeDecision = Object.freeze({
+    version: 2,
+    engine,
+    partnerCommand: resolvedPartnerCommand,
+    tmuxTransport: runtimeContext.tmuxTransport,
+    tmuxDistro: runtimeContext.tmuxDistro,
+    tmuxLauncher: runtimeContext.tmuxLauncher,
+    tmuxControlBinary: runtimeContext.tmuxControlBinary,
+    tmuxSocketName: runtimeContext.tmuxSocketName,
+  });
+
   return {
     ok: true,
     engine,
+    partnerCommand: resolvedPartnerCommand,
     runtimeDecision,
     // What the caller asked for, echoed back untouched. This is the only field
     // that can prove the parameter survived transport: `effort` below is the
@@ -860,7 +904,7 @@ server.tool(
     const softCap = max_rounds || 5;
     const hardCap = softCap + 5;
     const partnerTimeoutMs = normalizePartnerTimeout(partner_timeout_ms);
-    const partnerCommand = resolvePartnerCommandValue(
+    let partnerCommand = resolvePartnerCommandValue(
       partnerAgent,
       partner_command,
       codex_command,
@@ -883,6 +927,7 @@ server.tool(
     if (!preflight.ok) {
       return { content: [{ type: "text", text: `Error: ${preflight.errorText}` }] };
     }
+    partnerCommand = preflight.partnerCommand;
     const effectiveReasoningEffort = preflight.effort;
     // The model the invocation will ACTUALLY use, which is not always the one
     // requested: an adapter with capabilities.modelFlag:false drops it entirely
@@ -1160,7 +1205,7 @@ server.tool(
     const softCap = max_rounds || 5;
     const hardCap = softCap + 5;
     const partnerTimeoutMs = normalizePartnerTimeout(partner_timeout_ms);
-    const partnerCommand = resolvePartnerCommandValue(
+    let partnerCommand = resolvePartnerCommandValue(
       partnerAgent,
       partner_command,
       codex_command,
@@ -1181,6 +1226,7 @@ server.tool(
     if (!preflight.ok) {
       return { content: [{ type: "text", text: `Error: ${preflight.errorText}` }] };
     }
+    partnerCommand = preflight.partnerCommand;
     const effectiveReasoningEffort = preflight.effort;
     // The model the invocation will ACTUALLY use, which is not always the one
     // requested: an adapter with capabilities.modelFlag:false drops it entirely
@@ -1195,18 +1241,29 @@ server.tool(
     // it reaches the host, and the runner log does not.
     const preflightWarnings = preflight.warnings ?? [];
 
+    const gitPath = resolveReviewExecutable("git", project_path);
+    if (!gitPath) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: ${missingReviewExecutableMessage("git", project_path)} Install Git and retry.`,
+          },
+        ],
+      };
+    }
     const execOpts = { cwd: project_path, timeout: 30000, maxBuffer: 10 * 1024 * 1024 };
 
     // Resolve current branch and HEAD SHA for metadata
     let currentBranch, headSha;
     try {
-      headSha = execSync("git rev-parse HEAD", {
+      headSha = execFileSync(gitPath, ["rev-parse", "HEAD"], {
         cwd: project_path,
         timeout: 10000,
       }).toString().trim();
     } catch {}
     try {
-      currentBranch = execSync("git rev-parse --abbrev-ref HEAD", {
+      currentBranch = execFileSync(gitPath, ["rev-parse", "--abbrev-ref", "HEAD"], {
         cwd: project_path,
         timeout: 10000,
       })
@@ -1228,19 +1285,28 @@ server.tool(
     try {
       if (target === "staged") {
         // Only staged changes
-        diff = execSync("git diff --cached", execOpts).toString();
-        diffStat = execSync("git diff --cached --stat", { ...execOpts, timeout: 10000 }).toString();
+        diff = execFileSync(gitPath, ["diff", "--cached"], execOpts).toString();
+        diffStat = execFileSync(gitPath, ["diff", "--cached", "--stat"], {
+          ...execOpts,
+          timeout: 10000,
+        }).toString();
         diffLabel = "staged changes vs HEAD";
       } else if (target === "uncommitted") {
         // All working tree changes (staged + unstaged) vs HEAD
-        diff = execSync("git diff HEAD", execOpts).toString();
-        diffStat = execSync("git diff HEAD --stat", { ...execOpts, timeout: 10000 }).toString();
+        diff = execFileSync(gitPath, ["diff", "HEAD"], execOpts).toString();
+        diffStat = execFileSync(gitPath, ["diff", "HEAD", "--stat"], {
+          ...execOpts,
+          timeout: 10000,
+        }).toString();
         diffLabel = "uncommitted changes vs HEAD";
 
         // If no diff against HEAD (maybe no commits yet), try plain diff
         if (!diff.trim()) {
-          diff = execSync("git diff", execOpts).toString();
-          diffStat = execSync("git diff --stat", { ...execOpts, timeout: 10000 }).toString();
+          diff = execFileSync(gitPath, ["diff"], execOpts).toString();
+          diffStat = execFileSync(gitPath, ["diff", "--stat"], {
+            ...execOpts,
+            timeout: 10000,
+          }).toString();
           diffLabel = "unstaged changes";
         }
       } else if (target.startsWith("commit:")) {
@@ -1248,29 +1314,31 @@ server.tool(
         if (!/^[0-9a-fA-F]{4,40}$/.test(sha)) {
           throw new Error(`Invalid commit SHA: ${sha}`);
         }
-        diff = execFileSync("git", ["show", sha, "--format="], execOpts).toString();
-        diffStat = execFileSync("git", ["show", sha, "--stat", "--format="], { ...execOpts, timeout: 10000 }).toString();
+        diff = execFileSync(gitPath, ["show", sha, "--format="], execOpts).toString();
+        diffStat = execFileSync(gitPath, ["show", sha, "--stat", "--format="], { ...execOpts, timeout: 10000 }).toString();
         diffLabel = `commit ${sha}`;
       } else {
         // Branch mode
         const baseBranch = validateGitBranchName(
           base_branch || "main",
           "base_branch",
-          project_path
+          project_path,
+          gitPath
         );
         const headBranch = validateGitBranchName(
           branch || currentBranch,
           "branch",
-          project_path
+          project_path,
+          gitPath
         );
 
         try {
-          diff = execFileSync("git", ["diff", "--end-of-options", `${baseBranch}...${headBranch}`], execOpts).toString();
-          diffStat = execFileSync("git", ["diff", "--stat", "--end-of-options", `${baseBranch}...${headBranch}`], { ...execOpts, timeout: 10000 }).toString();
+          diff = execFileSync(gitPath, ["diff", "--end-of-options", `${baseBranch}...${headBranch}`], execOpts).toString();
+          diffStat = execFileSync(gitPath, ["diff", "--stat", "--end-of-options", `${baseBranch}...${headBranch}`], { ...execOpts, timeout: 10000 }).toString();
         } catch {
           // Fall back to two-dot diff
-          diff = execFileSync("git", ["diff", "--end-of-options", `${baseBranch}..${headBranch}`], execOpts).toString();
-          diffStat = execFileSync("git", ["diff", "--stat", "--end-of-options", `${baseBranch}..${headBranch}`], { ...execOpts, timeout: 10000 }).toString();
+          diff = execFileSync(gitPath, ["diff", "--end-of-options", `${baseBranch}..${headBranch}`], execOpts).toString();
+          diffStat = execFileSync(gitPath, ["diff", "--stat", "--end-of-options", `${baseBranch}..${headBranch}`], { ...execOpts, timeout: 10000 }).toString();
         }
         diffLabel = `${headBranch} vs ${baseBranch}`;
       }
@@ -1558,7 +1626,7 @@ function validatePullRequestRef(ref) {
 }
 
 /** Validate a user/persisted branch before placing it in a git revision range. */
-function validateGitBranchName(ref, label, projectPath) {
+function validateGitBranchName(ref, label, projectPath, gitPath) {
   if (typeof ref !== "string" || !ref.trim() || ref.startsWith("-")) {
     throw new Error(
       `Invalid ${label} ${JSON.stringify(ref)}: expected a branch name, not a git option.`
@@ -1574,7 +1642,7 @@ function validateGitBranchName(ref, label, projectPath) {
     // `..`, which could otherwise change the range we construct below). It does
     // not require the branch to exist, so remote/not-yet-fetched names remain
     // valid inputs and the eventual diff retains its useful error message.
-    execFileSync("git", ["check-ref-format", "--branch", ref], {
+    execFileSync(gitPath, ["check-ref-format", "--branch", ref], {
       cwd: projectPath,
       timeout: 10000,
       stdio: "pipe",
@@ -1589,6 +1657,13 @@ function validateGitBranchName(ref, label, projectPath) {
 
 function resolvePullRequest(ref, projectPath) {
   const safeRef = validatePullRequestRef(ref);
+  const ghPath = resolveReviewExecutable("gh", projectPath);
+  if (!ghPath) {
+    throw new Error(
+      `${missingReviewExecutableMessage("gh", projectPath)} Install it, or omit "pr" and ` +
+        `review the change locally with diff_target instead.`
+    );
+  }
 
   const execOpts = {
     cwd: projectPath,
@@ -1599,7 +1674,7 @@ function resolvePullRequest(ref, projectPath) {
   let view;
   try {
     view = execFileSync(
-      "gh",
+      ghPath,
       [
         "pr",
         "view",
@@ -1636,7 +1711,7 @@ function resolvePullRequest(ref, projectPath) {
 
   let diff;
   try {
-    diff = execFileSync("gh", ["pr", "diff", safeRef], execOpts).toString();
+    diff = execFileSync(ghPath, ["pr", "diff", safeRef], execOpts).toString();
   } catch (err) {
     const stderr = (err.stderr || "").toString().trim();
     throw new Error(
@@ -1790,7 +1865,7 @@ server.tool(
 
     const followUpRounds = follow_up_rounds || 5;
     const partnerTimeoutMs = normalizePartnerTimeout(partner_timeout_ms);
-    const partnerCommand = resolvePartnerCommandValue(
+    let partnerCommand = resolvePartnerCommandValue(
       partnerAgent,
       partner_command,
       codex_command,
@@ -1809,6 +1884,7 @@ server.tool(
     if (!preflight.ok) {
       return { content: [{ type: "text", text: `Error: ${preflight.errorText}` }] };
     }
+    partnerCommand = preflight.partnerCommand;
 
     // Anything the caller must know about how the reviewed change was resolved,
     // surfaced in the start response's `notices`. Declared before the first
@@ -1822,10 +1898,24 @@ server.tool(
     // refresh baseline floating. None is fatal, and none may be silent.
     const startupNotices = [];
 
+    const gitPath = resolveReviewExecutable("git", project_path);
+    if (!gitPath) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: ${missingReviewExecutableMessage("git", project_path)} Install Git and retry.`,
+          },
+        ],
+      };
+    }
     const execOpts = { cwd: project_path, timeout: 30000, maxBuffer: 10 * 1024 * 1024 };
     let currentBranch, headSha;
     try {
-      headSha = execSync("git rev-parse HEAD", { cwd: project_path, timeout: 10000 })
+      headSha = execFileSync(gitPath, ["rev-parse", "HEAD"], {
+        cwd: project_path,
+        timeout: 10000,
+      })
         .toString()
         .trim();
     } catch {
@@ -1842,7 +1932,7 @@ server.tool(
       );
     }
     try {
-      currentBranch = execSync("git rev-parse --abbrev-ref HEAD", {
+      currentBranch = execFileSync(gitPath, ["rev-parse", "--abbrev-ref", "HEAD"], {
         cwd: project_path,
         timeout: 10000,
       })
@@ -1887,13 +1977,13 @@ server.tool(
         delete prInfo.diff;
         scopeLabel = `pull request #${resolved.number} (${resolved.head} → ${resolved.base})`;
       } else if (target === "staged") {
-        diff = execSync("git diff --cached", execOpts).toString();
+        diff = execFileSync(gitPath, ["diff", "--cached"], execOpts).toString();
         scopeLabel = "staged changes vs HEAD";
       } else if (target === "uncommitted") {
-        diff = execSync("git diff HEAD", execOpts).toString();
+        diff = execFileSync(gitPath, ["diff", "HEAD"], execOpts).toString();
         scopeLabel = "uncommitted changes vs HEAD";
         if (!diff.trim()) {
-          diff = execSync("git diff", execOpts).toString();
+          diff = execFileSync(gitPath, ["diff"], execOpts).toString();
           scopeLabel = "unstaged changes";
         }
       } else if (target.startsWith("commit:")) {
@@ -1901,21 +1991,23 @@ server.tool(
         if (!/^[0-9a-fA-F]{4,40}$/.test(sha)) {
           throw new Error(`Invalid commit SHA: ${sha}`);
         }
-        diff = execFileSync("git", ["show", sha, "--format="], execOpts).toString();
+        diff = execFileSync(gitPath, ["show", sha, "--format="], execOpts).toString();
         scopeLabel = `commit ${sha}`;
       } else if (target === "branch") {
         const baseBranch = validateGitBranchName(
           base_branch || "main",
           "base_branch",
-          project_path
+          project_path,
+          gitPath
         );
         const headBranch = validateGitBranchName(
           branch || currentBranch,
           "branch",
-          project_path
+          project_path,
+          gitPath
         );
         try {
-          diff = execFileSync("git", ["diff", "--end-of-options", `${baseBranch}...${headBranch}`], execOpts).toString();
+          diff = execFileSync(gitPath, ["diff", "--end-of-options", `${baseBranch}...${headBranch}`], execOpts).toString();
         } catch {
           // Keep the fallback -- it is the right recovery for a stale base, a
           // shallow clone, or a detached HEAD -- but say so. Three dots is
@@ -1923,7 +2015,7 @@ server.tool(
           // the branch point, so the panel can end up reviewing commits the
           // author never wrote and filing findings against them, all under a
           // label that still reads "branch X vs Y".
-          diff = execFileSync("git", ["diff", "--end-of-options", `${baseBranch}..${headBranch}`], execOpts).toString();
+          diff = execFileSync(gitPath, ["diff", "--end-of-options", `${baseBranch}..${headBranch}`], execOpts).toString();
           startupNotices.push(
             `the three-dot (merge-base) diff of ${baseBranch}...${headBranch} failed, so a two-dot diff was used instead: the review may include commits added to ${baseBranch} since the branch point`
           );
@@ -2557,6 +2649,11 @@ server.tool(
       try {
         const refreshOpts = { cwd: status.project_path, timeout: 30000, maxBuffer: 10 * 1024 * 1024 };
         const baseline = status.head_sha || "HEAD";
+        const executableName = status.diff_target === "pr" ? "gh" : "git";
+        const executablePath = resolveReviewExecutable(executableName, status.project_path);
+        if (!executablePath) {
+          throw new Error(missingReviewExecutableMessage(executableName, status.project_path));
+        }
         let refreshedDiff;
         if (status.diff_target === "pr") {
           // The only refresh path that leaves the machine. A PR review's subject
@@ -2565,7 +2662,7 @@ server.tool(
           // slow or fail offline, which the catch below turns into "keep using
           // the diff we started with" rather than a failed send.
           refreshedDiff = execFileSync(
-            "gh",
+            executablePath,
             ["pr", "diff", validatePullRequestRef(status.pr_number ?? status.branch)],
             refreshOpts
           ).toString();
@@ -2582,24 +2679,26 @@ server.tool(
 
           try {
             refreshedDiff = filesChanged.length > 0
-              ? execFileSync("git", ["diff", "--end-of-options", baseline, "--", ...filesChanged], refreshOpts).toString()
-              : execFileSync("git", ["diff", "--end-of-options", baseline], refreshOpts).toString();
+              ? execFileSync(executablePath, ["diff", "--end-of-options", baseline, "--", ...filesChanged], refreshOpts).toString()
+              : execFileSync(executablePath, ["diff", "--end-of-options", baseline], refreshOpts).toString();
           } catch {
-            refreshedDiff = execFileSync("git", ["diff", "HEAD"], refreshOpts).toString();
+            refreshedDiff = execFileSync(executablePath, ["diff", "HEAD"], refreshOpts).toString();
           }
         } else if (status.diff_target === "branch") {
           const base = validateGitBranchName(
             status.base_branch || "main",
             "base_branch",
-            status.project_path
+            status.project_path,
+            executablePath
           );
           const head = validateGitBranchName(
             status.branch,
             "branch",
-            status.project_path
+            status.project_path,
+            executablePath
           );
           try {
-            refreshedDiff = execFileSync("git", ["diff", "--end-of-options", `${base}...${head}`], refreshOpts).toString();
+            refreshedDiff = execFileSync(executablePath, ["diff", "--end-of-options", `${base}...${head}`], refreshOpts).toString();
           } catch {
             // Same fallback as the start path, and the same hazard: two dots
             // also includes whatever the base gained since the branch point, so
@@ -2607,7 +2706,7 @@ server.tool(
             // scope label stays identical. The partner would then file findings
             // against commits the author never wrote, mid-conversation, with
             // nothing marking the change of subject.
-            refreshedDiff = execFileSync("git", ["diff", "--end-of-options", `${base}..${head}`], refreshOpts).toString();
+            refreshedDiff = execFileSync(executablePath, ["diff", "--end-of-options", `${base}..${head}`], refreshOpts).toString();
             refreshNotice =
               `the merge-base diff of ${base}...${head} failed, so this refresh used a two-dot diff: ` +
               `the reviewed change may now include commits ${base} gained since the branch point`;
@@ -2615,9 +2714,9 @@ server.tool(
         } else {
           // uncommitted: diff against the original HEAD SHA to keep baseline stable
           try {
-            refreshedDiff = execFileSync("git", ["diff", "--end-of-options", baseline], refreshOpts).toString();
+            refreshedDiff = execFileSync(executablePath, ["diff", "--end-of-options", baseline], refreshOpts).toString();
           } catch {
-            refreshedDiff = execFileSync("git", ["diff"], refreshOpts).toString();
+            refreshedDiff = execFileSync(executablePath, ["diff"], refreshOpts).toString();
           }
         }
         writeFileAtomic(path.join(sessionDir, "diff_refreshed.patch"), refreshedDiff);
@@ -3373,14 +3472,28 @@ server.tool(
       return { content: [{ type: "text", text: `Error: ${err.message}` }] };
     }
 
-    let resolvedEngine;
+    const projectPath = process.cwd();
+    const requestedPartnerCommand = adapter.binary.default;
+    let runtimeContext;
     try {
-      resolvedEngine = await resolveRunnableEngine(adapter, {
-        requested: engine ?? null,
+      runtimeContext = await resolvePartnerRuntimeContext({
+        partnerAgent: adapter.id,
+        partnerCommand: requestedPartnerCommand,
+        projectPath,
+        requestedEngine: engine ?? null,
       });
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${err.message}` }] };
     }
+    const resolvedEngine = runtimeContext.engine;
+    const requireBinary = !(
+      resolvedEngine === "tmux-interactive" && runtimeContext.tmuxTransport === "wsl"
+    );
+    const resolvedPartnerCommand = requireBinary
+      ? findBinary(requestedPartnerCommand, process.env, {
+          excludedRoots: [projectPath],
+        })
+      : runtimeContext.partnerCommand;
 
     // Discovery, on the same terms the start tools use.
     //
@@ -3393,19 +3506,23 @@ server.tool(
     // start_dialog then rejects against the live catalog.
     const discoveredModels = await resolveDiscoveryForValidation(adapter, {
       model: model ?? null,
+      projectPath,
       engine: resolvedEngine,
+      partnerCommand: resolvedPartnerCommand,
+      tmuxRoute: runtimeContext.tmuxRoute,
     });
 
     const result = negotiate(adapter, {
       engine: resolvedEngine,
-      requireBinary: !(
-        resolvedEngine === "tmux-interactive" && tmuxRoute().transport === "wsl"
-      ),
+      partnerCommand: resolvedPartnerCommand,
+      requireBinary,
       model: model ?? null,
       reasoningEffort: reasoning_effort ?? null,
       toolProfile: tool_profile ?? null,
       allowUnknownModel: allow_unknown_model === true,
       discoveredModels,
+      projectPath,
+      sessionDir: projectPath,
     });
 
     const { resolution } = result;
@@ -3433,7 +3550,22 @@ server.tool(
                 effective_effort: resolution.effectiveEffort,
               },
               notices: result.notices,
-              adapter: await describeAdapter(adapter, { probe: true }),
+              adapter: await describeAdapter(adapter, {
+                probe: true,
+                projectPath,
+                ...(runtimeContext.tmuxRoute
+                  ? { tmuxRouteFn: () => runtimeContext.tmuxRoute }
+                  : {}),
+                ...(runtimeContext.tmuxTransport === "wsl"
+                  ? {
+                      pinnedWslRuntime: {
+                        partnerCommand: runtimeContext.partnerCommand,
+                        tmuxDistro: runtimeContext.tmuxDistro,
+                        tmuxRoute: runtimeContext.tmuxRoute,
+                      },
+                    }
+                  : {}),
+              }),
             },
             null,
             2

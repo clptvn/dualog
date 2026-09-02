@@ -36,13 +36,17 @@ const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const RUNNER_PATH = path.join(REPO_ROOT, "src", "pr-review-runner.mjs");
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-pr-panel-"));
+const TRUSTED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-pr-panel-tools-"));
 const HOME = path.join(ROOT, "home");
 const ADAPTER_DIR = path.join(ROOT, "adapters");
-const BIN_DIR = path.join(ROOT, "bin");
+const BIN_DIR = path.join(TRUSTED_ROOT, "bin");
 fs.mkdirSync(HOME, { recursive: true });
 fs.mkdirSync(BIN_DIR, { recursive: true });
 
-process.on("exit", () => fs.rmSync(ROOT, { recursive: true, force: true }));
+process.on("exit", () => {
+  fs.rmSync(ROOT, { recursive: true, force: true });
+  fs.rmSync(TRUSTED_ROOT, { recursive: true, force: true });
+});
 
 // The canned report carries a normalized finding so the extraction path is
 // exercised with real runner output rather than a hand-written string.
@@ -318,22 +322,26 @@ async function stopRunner(child, sessionDir) {
   }
 }
 
-async function waitForPartnerMessages(sessionDir, count, deadlineMs = 90000) {
+function runnerLogTail(sessionDir) {
+  try {
+    return fs.readFileSync(path.join(sessionDir, "runner.log"), "utf-8").slice(-3000);
+  } catch {
+    return "(no runner log)";
+  }
+}
+
+async function waitForPartnerMessages(sessionDir, count, child, deadlineMs = 90000) {
   const giveUpAt = Date.now() + deadlineMs;
   for (;;) {
     const messages = readConversation(sessionDir);
     const partner = messages.filter((m) => m.from === "fake-panel");
     if (partner.length >= count) return messages;
-    if (Date.now() >= giveUpAt) {
-      const log = (() => {
-        try {
-          return fs.readFileSync(path.join(sessionDir, "runner.log"), "utf-8").slice(-3000);
-        } catch {
-          return "(no runner log)";
-        }
-      })();
+    const exited = child.exitCode !== null || child.signalCode !== null;
+    if (exited || Date.now() >= giveUpAt) {
       assert.fail(
-        `expected ${count} partner message(s), saw ${partner.length}.\nrunner.log tail:\n${log}`
+        `expected ${count} partner message(s), saw ${partner.length}` +
+          `${exited ? ` before runner exit (${child.exitCode ?? child.signalCode})` : ""}.` +
+          `\nrunner.log tail:\n${runnerLogTail(sessionDir)}`
       );
     }
     await sleep(250);
@@ -347,7 +355,7 @@ test("the panel runs one pass per aspect, then consolidates exactly once", async
 
   try {
     // Two specialists plus one consolidation.
-    const messages = await waitForPartnerMessages(sessionDir, aspects.length + 1);
+    const messages = await waitForPartnerMessages(sessionDir, aspects.length + 1, child);
     const partner = messages.filter((m) => m.from === "fake-panel");
 
     // Matched with the SHARED pattern the server parses with, not a local copy.
@@ -403,7 +411,7 @@ test("panel progress is recorded on disk while the panel is still running", asyn
   const child = startRunner(sessionDir);
 
   try {
-    await waitForPartnerMessages(sessionDir, aspects.length + 1);
+    await waitForPartnerMessages(sessionDir, aspects.length + 1, child);
 
     // panel_state.json is the only place that distinguishes "this aspect found
     // nothing" from "this aspect never ran", which is the distinction a reader
@@ -469,7 +477,14 @@ test("a pass that returns nothing is recorded as failed, not as clean", async ()
         panel = null;
       }
       if (panel?.completed?.some((c) => c.aspect === "code")) break;
-      if (Date.now() >= giveUpAt) assert.fail("the empty pass never resolved either way");
+      const exited = child.exitCode !== null || child.signalCode !== null;
+      if (exited || Date.now() >= giveUpAt) {
+        assert.fail(
+          `the empty pass never resolved either way` +
+            `${exited ? ` before runner exit (${child.exitCode ?? child.signalCode})` : ""}.` +
+            `\nrunner.log tail:\n${runnerLogTail(sessionDir)}`
+        );
+      }
       await sleep(500);
     }
 
@@ -513,7 +528,7 @@ test("a disobedient specialist cannot approve the session through the real runne
   const child = startRunner(sessionDir, 2, DISOBEDIENT_BIN);
 
   try {
-    const messages = await waitForPartnerMessages(sessionDir, aspects.length + 1);
+    const messages = await waitForPartnerMessages(sessionDir, aspects.length + 1, child);
     const partner = messages.filter((m) => m.from === "fake-panel");
     const pass = partner.find((m) => ASPECT_HEADER_RE.test(m.content));
 
@@ -605,7 +620,7 @@ test("a blocking prose finding omitted from normalized output is still durably l
   const child = startRunner(sessionDir, 2, UNINDEXED_BIN);
 
   try {
-    const messages = await waitForPartnerMessages(sessionDir, 2);
+    const messages = await waitForPartnerMessages(sessionDir, 2, child);
     const panel = JSON.parse(
       fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8")
     );
@@ -645,7 +660,7 @@ test("an advisory-only specialist is complete without entering the blocking ledg
   const child = startRunner(sessionDir, 2, ADVISORY_BIN);
 
   try {
-    const messages = await waitForPartnerMessages(sessionDir, 2);
+    const messages = await waitForPartnerMessages(sessionDir, 2, child);
     const panel = JSON.parse(
       fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8")
     );
@@ -673,7 +688,7 @@ test("the runner durably blocks a shadow normalized-findings block", async () =>
   const child = startRunner(sessionDir, 2, AMBIGUOUS_PROTOCOL_BIN);
 
   try {
-    const messages = await waitForPartnerMessages(sessionDir, 2);
+    const messages = await waitForPartnerMessages(sessionDir, 2, child);
     const panel = JSON.parse(
       fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8")
     );
@@ -718,7 +733,7 @@ test("a panel with survivors consolidates, and carries the hole into every verdi
   try {
     // One survivor plus consolidation. The failed pass appends a system message,
     // not a partner one.
-    const messages = await waitForPartnerMessages(sessionDir, 2);
+    const messages = await waitForPartnerMessages(sessionDir, 2, child);
     const partner = messages.filter((m) => m.from === "fake-panel");
 
     const passes = partner.filter((m) => ASPECT_HEADER_RE.test(m.content));
@@ -773,7 +788,7 @@ test("a panel with survivors consolidates, and carries the hole into every verdi
       }) + "\n"
     );
 
-    await waitForPartnerMessages(sessionDir, 3);
+    await waitForPartnerMessages(sessionDir, 3, child);
 
     const followUps = fs
       .readdirSync(turnsDir)
@@ -802,7 +817,7 @@ test("a host message after the panel gets a follow-up turn, not a second panel",
   const child = startRunner(sessionDir);
 
   try {
-    await waitForPartnerMessages(sessionDir, 2);
+    await waitForPartnerMessages(sessionDir, 2, child);
 
     // Append a host message the way send_message would.
     const convPath = path.join(sessionDir, "conversation.jsonl");
@@ -823,7 +838,7 @@ test("a host message after the panel gets a follow-up turn, not a second panel",
     // a duplicate id. (An earlier version of this test deleted the cache and
     // claimed it was preventing id reuse, which had it exactly backwards.)
 
-    const messages = await waitForPartnerMessages(sessionDir, 3);
+    const messages = await waitForPartnerMessages(sessionDir, 3, child);
     const partner = messages.filter((m) => m.from === "fake-panel");
     const followUp = partner[partner.length - 1];
 

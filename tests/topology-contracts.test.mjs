@@ -125,7 +125,12 @@ function wslRegistrationFixtures(cliStatus) {
 
 test("native Windows host registrations pin the same WSL distro for both Desktop hosts", () => {
   const cliStatus = {
-    wsl: { distroAvailable: true, distro: DISTRO },
+    wsl: {
+      binary: "C:\\Windows\\System32\\wsl.exe",
+      binaryAvailable: true,
+      distroAvailable: true,
+      distro: DISTRO,
+    },
   };
   const registrations = nativeRegistrationFixtures(cliStatus);
 
@@ -134,10 +139,17 @@ test("native Windows host registrations pin the same WSL distro for both Desktop
   assert.deepEqual(registrations.claude, {
     command: "C:\\Program Files\\nodejs\\node.exe",
     args: ["C:\\dualog\\src\\dialog-server.mjs"],
-    env: { DUALOG_WSL_DISTRO: DISTRO },
+    env: {
+      DUALOG_WSL_DISTRO: DISTRO,
+      DUALOG_WSL_BINARY: "C:\\Windows\\System32\\wsl.exe",
+    },
   });
   assert.match(registrations.codex, /\[mcp_servers\.dualog\]/u);
   assert.match(registrations.codex, /DUALOG_WSL_DISTRO = "Ubuntu-24\.04"/u);
+  assert.match(
+    registrations.codex,
+    /DUALOG_WSL_BINARY = "C:\\\\Windows\\\\System32\\\\wsl\.exe"/u
+  );
   assert.match(registrations.codex, /C:\\\\Program Files\\\\nodejs\\\\node\.exe/u);
 });
 
@@ -215,7 +227,14 @@ test("all four requested host-to-partner topologies keep paths and transport in 
     },
   ];
 
-  const cliStatus = { wsl: { distroAvailable: true, distro: DISTRO } };
+  const cliStatus = {
+    wsl: {
+      binary: "C:\\Windows\\System32\\wsl.exe",
+      binaryAvailable: true,
+      distroAvailable: true,
+      distro: DISTRO,
+    },
+  };
   const nativeRegistrations = nativeRegistrationFixtures(cliStatus);
   const wslRegistrations = wslRegistrationFixtures(cliStatus);
 

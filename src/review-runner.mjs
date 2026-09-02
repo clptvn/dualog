@@ -38,7 +38,7 @@ import {
 
 const sessionDir = process.argv[2];
 const projectPath = process.argv[3] || process.cwd();
-const partnerCommand = process.argv[4] || "codex";
+const positionalPartnerCommand = process.argv[4] || "codex";
 const SOFT_CAP = parseInt(process.argv[5], 10) || 5;
 const HARD_CAP = SOFT_CAP + 5;
 const RAW_REASONING_EFFORT = process.argv[6] || null;
@@ -55,6 +55,8 @@ const PARTNER_TIMEOUT_MS =
 const RUNNER_TOKEN = readRunnerToken();
 const PREFLIGHT_RUNTIME = readRunnerRuntimeDecision();
 const PREFLIGHT_ENGINE = PREFLIGHT_RUNTIME?.engine ?? null;
+const partnerCommand =
+  PREFLIGHT_RUNTIME?.partnerCommand ?? positionalPartnerCommand;
 // Read as a flag, not by index: the preflight already decided this, and the
 // turn must validate the model on the same terms or it will reject an id the
 // start call deliberately allowed.

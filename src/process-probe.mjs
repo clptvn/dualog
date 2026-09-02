@@ -7,6 +7,42 @@
 // sweep but must not block reclaiming a completed turn's lease.
 
 import { execFileSync } from "child_process";
+import { resolveWindowsSystem32Executable } from "./windows-process-tree.mjs";
+
+const WINDOWS_PROCESS_ID_ENV = "DUALOG_INTERNAL_PROCESS_PROBE_PID";
+const WINDOWS_PROCESS_CREATION_SCRIPT = [
+  "$PSModuleAutoloadingPreference = 'None';",
+  "$cimModule = [IO.Path]::Combine($PSHOME, 'Modules', 'CimCmdlets', 'CimCmdlets.psd1');",
+  "Microsoft.PowerShell.Core\\Import-Module -Name $cimModule -Force -ErrorAction Stop;",
+  `$raw = [Environment]::GetEnvironmentVariable('${WINDOWS_PROCESS_ID_ENV}', 'Process');`,
+  "[uint32]$processId = 0;",
+  "if (-not [uint32]::TryParse($raw, [ref]$processId) -or $processId -eq 0) { exit 2 };",
+  "$instance = CimCmdlets\\Get-CimInstance -ClassName Win32_Process -Filter (\"ProcessId = {0}\" -f $processId) -Property CreationDate -ErrorAction Stop;",
+  "if ($null -eq $instance -or $null -eq $instance.CreationDate) { exit 3 };",
+  "[Console]::Out.Write($instance.CreationDate.ToUniversalTime().Ticks.ToString([Globalization.CultureInfo]::InvariantCulture))",
+].join(" ");
+const MAX_WINDOWS_PID = 0xffffffff;
+const MAX_DOTNET_TICKS = 3155378975999999999n;
+
+export function isValidDotNetTicks(value) {
+  if (!/^[1-9][0-9]{15,18}$/u.test(value)) return false;
+  try {
+    return BigInt(value) <= MAX_DOTNET_TICKS;
+  } catch {
+    return false;
+  }
+}
+
+function withExactWindowsEnvironmentValue(env, name, value) {
+  const next = {};
+  for (const [key, entry] of Object.entries(env ?? {})) {
+    if (key.toLocaleLowerCase("en-US") !== name.toLocaleLowerCase("en-US")) {
+      next[key] = entry;
+    }
+  }
+  next[name] = value;
+  return next;
+}
 
 /**
  * `isProcessAlive()` is not usable at this boundary.
@@ -38,15 +74,55 @@ export function probeProcess(pid) {
  * makes an old lease look alive indefinitely -- which retains a credential copy
  * forever, the failure this whole design exists to bound.
  *
- * `ps -o lstart` is second-granular, so two processes started within the same
- * second are indistinguishable. That residual is real and documented here rather
- * than papered over: it makes reuse detection very likely, not certain, and it
- * errs toward "still alive", which retains.
+ * POSIX `ps -o lstart` is second-granular, so two processes started within the
+ * same second are indistinguishable. Native Windows uses CIM CreationDate as
+ * invariant UTC .NET ticks. Both fail closed: an unavailable generation returns
+ * null, and the recorded process is treated as still alive.
  */
-export function processStartTime(pid) {
+export function processStartTime(
+  pid,
+  {
+    platform = process.platform,
+    env = process.env,
+    execFileSyncFn = execFileSync,
+  } = {}
+) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  if (platform === "win32") {
+    // Win32 process ids are DWORDs. Rejecting an impossible value here keeps it
+    // out of both the environment and PowerShell, while still accepting the
+    // unsigned half of the range that an `[int]` parser incorrectly rejected.
+    if (pid > MAX_WINDOWS_PID) return null;
+    const powershell = resolveWindowsSystem32Executable("powershell.exe", {
+      env,
+      subdirectories: ["WindowsPowerShell", "v1.0"],
+    });
+    if (!powershell) return null;
+    try {
+      const out = execFileSyncFn(
+        powershell,
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PROCESS_CREATION_SCRIPT],
+        {
+          encoding: "utf-8",
+          timeout: 5000,
+          maxBuffer: 4096,
+          shell: false,
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "ignore"],
+          env: withExactWindowsEnvironmentValue(
+            env,
+            WINDOWS_PROCESS_ID_ENV,
+            String(pid)
+          ),
+        }
+      );
+      return isValidDotNetTicks(out) ? out : null;
+    } catch {
+      return null;
+    }
+  }
   try {
-    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+    const out = execFileSyncFn("ps", ["-o", "lstart=", "-p", String(pid)], {
       encoding: "utf-8",
       timeout: 2000,
       stdio: ["ignore", "pipe", "ignore"],

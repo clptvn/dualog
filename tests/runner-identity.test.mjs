@@ -205,7 +205,9 @@ test("every session type the server can write has a runner mapping", () => {
   // Reads the real tool definitions rather than a list maintained here, so a
   // fourth session type cannot be added without either appearing in RUNNERS or
   // failing this case.
-  const server = fs.readFileSync(path.join(SRC_DIR, "dialog-server.mjs"), "utf-8");
+  const server = fs
+    .readFileSync(path.join(SRC_DIR, "dialog-server.mjs"), "utf-8")
+    .replace(/\r\n?/gu, "\n");
   // Anchored to the status-object literal, not to any `type:` key. A bare scan
   // also matches the `type: "text"` of every MCP content block in the file.
   const written = new Set(

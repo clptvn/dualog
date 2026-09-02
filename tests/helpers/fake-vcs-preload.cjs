@@ -1,7 +1,7 @@
 // Preloaded into the live MCP server process by pr-review-server-e2e.test.mjs.
-// It intercepts only `gh`; every other child-process call reaches the real
-// executable. `syncBuiltinESMExports` updates dialog-server.mjs's named ESM
-// import, so the test exercises the real PR resolver/refresh handler without a
+// It intercepts `gh` and can record `git` argv; every real git call still reaches
+// the executable. `syncBuiltinESMExports` updates dialog-server.mjs's named ESM
+// import, so the tests exercise the real resolver/review handlers without a
 // POSIX-only PATH shim or a Windows .cmd wrapper.
 
 const childProcess = require("node:child_process");
@@ -10,10 +10,28 @@ const { syncBuiltinESMExports } = require("node:module");
 
 const originalExecFileSync = childProcess.execFileSync;
 
+function executableName(command) {
+  return String(command)
+    .replaceAll("\\", "/")
+    .split("/")
+    .at(-1)
+    .replace(/\.(?:com|exe|bat|cmd)$/iu, "")
+    .toLowerCase();
+}
+
 function appendCall(args) {
   const logPath = process.env.DUALOG_TEST_GH_LOG;
   if (!logPath) return;
   fs.appendFileSync(logPath, `${JSON.stringify(args)}\n`);
+}
+
+function appendGitCall(command, args, options) {
+  const logPath = process.env.DUALOG_TEST_GIT_LOG;
+  if (!logPath) return;
+  fs.appendFileSync(
+    logPath,
+    `${JSON.stringify({ command, args, cwd: options?.cwd ?? process.cwd() })}\n`
+  );
 }
 
 function nextDiff() {
@@ -39,7 +57,11 @@ function nextDiff() {
 }
 
 childProcess.execFileSync = function fakeExecFileSync(command, args = [], options) {
-  if (command !== "gh") {
+  const executable = executableName(command);
+  if (executable === "git") {
+    appendGitCall(command, args, options);
+  }
+  if (executable !== "gh") {
     return originalExecFileSync.call(this, command, args, options);
   }
 

@@ -75,7 +75,7 @@ import {
 
 const sessionDir = process.argv[2];
 const projectPath = process.argv[3] || process.cwd();
-const partnerCommand = process.argv[4] || "codex";
+const positionalPartnerCommand = process.argv[4] || "codex";
 // The FOLLOW-UP budget only. Panel and consolidation turns are the review
 // itself, not rounds of conversation about it, so they are not charged here --
 // the server folds them into status.max_rounds separately so computeBudget,
@@ -93,6 +93,8 @@ const PARTNER_TIMEOUT_MS =
 const RUNNER_TOKEN = readRunnerToken();
 const PREFLIGHT_RUNTIME = readRunnerRuntimeDecision();
 const PREFLIGHT_ENGINE = PREFLIGHT_RUNTIME?.engine ?? null;
+const partnerCommand =
+  PREFLIGHT_RUNTIME?.partnerCommand ?? positionalPartnerCommand;
 const ALLOW_UNKNOWN_MODEL = process.argv.includes("--allow-unknown-model");
 
 if (!sessionDir || HOST_AGENT === PARTNER_AGENT) {

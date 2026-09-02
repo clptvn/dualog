@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import { resolvePartnerRuntimeContext } from "../src/partner-invocation.mjs";
 
 const source = (name) =>
-  fs.readFileSync(fileURLToPath(new URL(`../src/${name}`, import.meta.url)), "utf-8");
+  fs
+    .readFileSync(fileURLToPath(new URL(`../src/${name}`, import.meta.url)), "utf-8")
+    .replace(/\r\n?/gu, "\n");
 
 const DIALOG = source("dialog-runner.mjs");
 const REVIEW = source("review-runner.mjs");

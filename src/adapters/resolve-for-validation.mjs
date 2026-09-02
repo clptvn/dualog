@@ -22,18 +22,25 @@ export async function resolveDiscoveryForValidation(
     model = null,
     projectPath = null,
     engine = null,
+    partnerCommand = null,
     tmuxRoute = null,
     env = process.env,
     platform = process.platform,
     log,
   } = {}
 ) {
-  if (!adapter) return null;
+  // Discovery only contributes model-specific identity, effort and tool
+  // capability checks. With no requested model there is no catalog entry to
+  // validate, so starting a control subprocess is both unnecessary and, for a
+  // direct runner using an interactive fixture, capable of delaying the real
+  // tmux launch until the discovery timeout expires.
+  if (!adapter || !model) return null;
 
   try {
     let discovered = await resolveDiscovery(adapter, {
       projectPath,
       engine,
+      partnerCommand,
       env,
       platform,
       ...(tmuxRoute ? { tmuxRouteFn: () => tmuxRoute } : {}),

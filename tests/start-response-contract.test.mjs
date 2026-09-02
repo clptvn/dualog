@@ -172,6 +172,7 @@ async function withServer(t, body) {
       DUALOG_ROLE: "",
       DUALOG_DEPTH: "",
       DUALOG_MAX_DEPTH: "",
+      DUALOG_STRATEGY: "headless",
     },
     stderr: "ignore",
   });
@@ -306,6 +307,20 @@ test("a start response can be closed before any partner turn, leaving nothing be
       partner_command: "true",
     });
 
+    assert.ok(
+      path.isAbsolute(started.partner_command),
+      "the start response must expose the exact executable preflight approved"
+    );
+    const status = readStatus(
+      path.join(home, ".dualog", "sessions"),
+      started.session_id
+    );
+    assert.equal(
+      status.partner_command,
+      started.partner_command,
+      "persisted status and the runner handoff must share the pinned command"
+    );
+
     // This is the recovery path the docs promise when a parameter is dropped.
     const ended = await callJson(client, "end_dialog", { session_id: started.session_id });
     assert.equal(ended.ended, true, "a session with no partner turns must be closable");
@@ -320,26 +335,14 @@ test("a start response can be closed before any partner turn, leaving nothing be
   });
 });
 
-// The partner here must be CODEX, not claude, and `partner_command: "true"` is
-// not enough to make that choice cosmetic.
-//
-// Preflight runs resolveDiscoveryForValidation() before negotiation, and that
-// call is never given partner_command -- it takes `{ model, projectPath }` only.
-// Claude's discovery strategy is sdk-control, which falls back to
-// `adapter.binary.default`, so naming claude here booted the operator's REAL
-// installed CLI. Verified with a logging shim first on PATH:
-//
-//   INVOKED: --input-format stream-json --output-format stream-json --verbose
-//            -p --bare --mcp-config {"mcpServers":{}} --strict-mcp-config
-//
-// That process is not a session runner, so the on-disk enumeration in
-// withServer() cannot see it, and it outlives the home it was pointed at.
-//
-// Codex is hermetic for the same request: its discovery is a local-cache read
+// Codex keeps this rejection probe hermetic: its discovery is a local-cache read
 // (`{{configHome}}/models_cache.json`), which is simply absent under a throwaway
 // home, so it degrades to the manifest. models.dev enrichment does not fire
 // either -- it is demand-driven and every codex entry already declares
-// `efforts`. No child process, no network.
+// `efforts`. No child process, no network. Process-backed adapters are safe too:
+// preflight now resolves `partner_command` first and passes that exact absolute
+// executable into discovery instead of falling back to the adapter's bare
+// default command.
 test("a rejected model/effort pair never creates a session", async (t) => {
   await withServer(t, async (client, home) => {
     const res = await client.callTool({

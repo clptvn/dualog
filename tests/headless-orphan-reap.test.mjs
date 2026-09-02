@@ -15,24 +15,27 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
-import { execFileSync } from "node:child_process";
-
 import {
+  persistHeadlessChildRecord,
   reapOrphanedHeadlessChildren,
   terminateActiveHeadlessTurnsAndWait,
 } from "../src/engines/headless.mjs";
 import { isProcessAlive } from "../src/shared.mjs";
+import { processStartTime } from "../src/process-probe.mjs";
 
 /** The same identity the production record stores: PID plus OS start time. */
 function startTimeOf(pid) {
-  try {
-    return execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
-      encoding: "utf-8",
-      timeout: 5000,
-    }).trim() || null;
-  } catch {
-    return null;
+  return processStartTime(pid);
+}
+
+async function waitForStartTime(pid, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const startedAt = startTimeOf(pid);
+    if (startedAt) return startedAt;
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
+  return null;
 }
 
 function makeSession() {
@@ -49,6 +52,74 @@ function writeRecord(sessionDir, turnId, record) {
   );
   return path.join(turnDir, "headless-child.json");
 }
+
+test("headless startup captures one process identity and persists that exact value", (t) => {
+  const turnDir = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-headless-startup-"));
+  t.after(() => fs.rmSync(turnDir, { recursive: true, force: true }));
+  const captured = "638921234567890123";
+  let probes = 0;
+  let provisionalSeen = null;
+  const recordPath = path.join(turnDir, "headless-child.json");
+
+  const returned = persistHeadlessChildRecord(turnDir, { pid: 4242 }, "claude.cmd", {
+    platform: "win32",
+    processStartTimeFn(pid) {
+      probes += 1;
+      assert.equal(pid, 4242);
+      provisionalSeen = JSON.parse(fs.readFileSync(recordPath, "utf-8"));
+      assert.equal(
+        Object.hasOwn(provisionalSeen, "start_time"),
+        false,
+        "the provisional breadcrumb must exist before the OS identity probe starts"
+      );
+      return captured;
+    },
+    nowFn: () => "2026-09-01T00:00:00.000Z",
+  });
+
+  assert.equal(probes, 1, "startup must make only one OS identity query");
+  assert.equal(returned, captured, "the lease consumer receives the captured value");
+  assert.deepEqual(provisionalSeen, {
+    pid: 4242,
+    pgid: null,
+    command: "claude.cmd",
+    started_at: "2026-09-01T00:00:00.000Z",
+  });
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(recordPath, "utf-8")),
+    {
+      pid: 4242,
+      pgid: null,
+      command: "claude.cmd",
+      start_time: captured,
+      started_at: "2026-09-01T00:00:00.000Z",
+    },
+    "the immediately persisted breadcrumb must use the same captured value"
+  );
+});
+
+test("a failed process identity probe leaves the provisional breadcrumb", (t) => {
+  const turnDir = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-headless-provisional-"));
+  t.after(() => fs.rmSync(turnDir, { recursive: true, force: true }));
+  const recordPath = path.join(turnDir, "headless-child.json");
+
+  const returned = persistHeadlessChildRecord(turnDir, { pid: 4343 }, "codex.cmd", {
+    platform: "win32",
+    processStartTimeFn() {
+      assert.equal(fs.existsSync(recordPath), true, "provisional evidence must precede CIM");
+      throw new Error("CIM unavailable");
+    },
+    nowFn: () => "2026-09-01T00:00:01.000Z",
+  });
+
+  assert.equal(returned, null);
+  assert.deepEqual(JSON.parse(fs.readFileSync(recordPath, "utf-8")), {
+    pid: 4343,
+    pgid: null,
+    command: "codex.cmd",
+    started_at: "2026-09-01T00:00:01.000Z",
+  });
+});
 
 async function waitForExit(pid, timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs;
@@ -77,15 +148,20 @@ test("an orphaned headless child is terminated and its record cleared", async (t
     }
   });
 
-  const startTime = startTimeOf(child.pid);
+  const startTime = await waitForStartTime(child.pid);
   if (!startTime) {
+    if (process.platform === "win32") {
+      assert.fail(
+        "native Windows must obtain the CIM process identity used for orphan recovery"
+      );
+    }
     t.skip("this environment does not permit reading process start times");
     return;
   }
 
   const recordPath = writeRecord(sessionDir, "turn-1", {
     pid: child.pid,
-    pgid: child.pid,
+    pgid: process.platform === "win32" ? null : child.pid,
     command: process.execPath,
     start_time: startTime,
     started_at: new Date().toISOString(),
@@ -252,6 +328,11 @@ test("graceful shutdown escalates to SIGKILL instead of scheduling it", async (t
 });
 
 test("a leaderless group is retained, never signalled, because ownership is unprovable", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("leaderless process groups are a POSIX-only process shape");
+    return;
+  }
+
   // This case used to assert the opposite -- that a leaderless group is
   // recognizably ours and may be killed. The justification was POSIX fork()
   // ("the child process ID also shall not match any active process group ID")

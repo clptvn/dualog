@@ -43,7 +43,7 @@ function findGitRoot(startDir) {
 export function adapterSearchPath({ cwd = process.cwd(), env = process.env } = {}) {
   const dirs = [BUILTIN_DIR];
 
-  for (const base of (env.XDG_CONFIG_DIRS || "").split(":").filter(Boolean)) {
+  for (const base of (env.XDG_CONFIG_DIRS || "").split(path.delimiter).filter(Boolean)) {
     dirs.push(path.join(base, APP_DIR_NAME, "adapters"));
   }
 
@@ -68,7 +68,7 @@ export function adapterSearchPath({ cwd = process.cwd(), env = process.env } = {
     dirs.push(path.join(cwd, `.${APP_DIR_NAME}`, "adapters"));
   }
 
-  for (const explicit of (env.DUALOG_ADAPTER_PATH || "").split(":").filter(Boolean)) {
+  for (const explicit of (env.DUALOG_ADAPTER_PATH || "").split(path.delimiter).filter(Boolean)) {
     dirs.push(explicit);
   }
 

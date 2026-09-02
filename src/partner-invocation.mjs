@@ -17,6 +17,7 @@ import {
   resolveTmuxProjectContext,
   resolveTmuxRouteForPaths,
   resolveWslLoginShell,
+  resolveWslPartnerExecutable,
   resolveWslRouteDistro,
   seedWslCodexAuth,
   sendKeyToTmux,
@@ -38,6 +39,7 @@ import {
 import { probeProcess, processStartTime } from "./process-probe.mjs";
 import { resolveDiscoveryForValidation } from "./adapters/resolve-for-validation.mjs";
 import { getAdapter, tryGetAdapter } from "./adapters/registry.mjs";
+import { findBinary } from "./adapters/negotiate.mjs";
 import {
   isReady,
   detectStartupPrompt as detectStartupPromptFromTui,
@@ -205,7 +207,9 @@ export async function resolvePartnerRuntimeContext(
     tmuxRouteFn = tmuxRoute,
     resolveTmuxProjectContextFn = resolveTmuxProjectContext,
     resolveWslLoginShellFn = resolveWslLoginShell,
+    resolveWslPartnerExecutableFn = resolveWslPartnerExecutable,
     resolveWslRouteDistroFn = resolveWslRouteDistro,
+    probeWslPartnerCommandFn = probeWslPartnerCommand,
     platform = process.platform,
   } = {}
 ) {
@@ -374,14 +378,35 @@ export async function resolvePartnerRuntimeContext(
       loginShell: await resolveWslLoginShellFn(route),
     };
   }
+  const mustPinWslPartner = platform === "win32" && route.transport === "wsl";
+  let projectContext = null;
+  let pinnedWslPartnerCommand = null;
+  let attemptedWslPartnerResolution = false;
+  const resolvePinnedWslPartner = async () => {
+    if (!mustPinWslPartner) return partnerCommand;
+    if (attemptedWslPartnerResolution) return pinnedWslPartnerCommand;
+    attemptedWslPartnerResolution = true;
+    projectContext ??= await resolveTmuxProjectContextFn(projectPath, { route });
+    pinnedWslPartnerCommand = await resolveWslPartnerExecutableFn(partnerCommand, {
+      projectPath: projectContext.partnerProjectPath,
+      route: projectContext.tmuxRoute,
+      resolveWslLoginShellFn,
+    });
+    return pinnedWslPartnerCommand;
+  };
   const engine = await resolveRunnableEngineFn(adapter, {
     requested: requestedEngine,
     partnerCommand,
     log,
     tmuxRouteFn: () => route,
     probeTmuxAvailabilityFn: () => probeTmuxAvailability({ route }),
-    probeWslPartnerCommandFn: (command, versionArgs) =>
-      probeWslPartnerCommand(command, versionArgs, { route }),
+    probeWslPartnerCommandFn: async (command, versionArgs) => {
+      const executable = mustPinWslPartner
+        ? await resolvePinnedWslPartner()
+        : command;
+      if (!executable) return "unavailable";
+      return probeWslPartnerCommandFn(executable, versionArgs, { route });
+    },
   });
   if (engine !== "tmux-interactive") {
     return finalize({
@@ -402,12 +427,21 @@ export async function resolvePartnerRuntimeContext(
     });
   }
 
-  const projectContext = await resolveTmuxProjectContextFn(projectPath, { route });
+  projectContext ??= await resolveTmuxProjectContextFn(projectPath, { route });
+  const runtimePartnerCommand = mustPinWslPartner
+    ? await resolvePinnedWslPartner()
+    : partnerCommand;
+  if (!runtimePartnerCommand) {
+    throw new Error(
+      `WSL partner command ${JSON.stringify(partnerCommand)} is unavailable in distribution ${JSON.stringify(projectContext.tmuxDistro)}`
+    );
+  }
   return finalize({
     engine,
     adapterId: adapter.id,
     partnerAgent: normalizedAgent,
-    partnerCommand,
+    partnerCommand: runtimePartnerCommand,
+    requestedPartnerCommand: partnerCommand,
     requestedEngine,
     ...projectContext,
     toPartnerPath: (value) =>
@@ -425,7 +459,8 @@ function validatedRuntimeContext(
   if (
     runtimeContext.adapterId !== adapterId ||
     runtimeContext.partnerAgent !== partnerAgent ||
-    runtimeContext.partnerCommand !== partnerCommand ||
+    (runtimeContext.partnerCommand !== partnerCommand &&
+      runtimeContext.requestedPartnerCommand !== partnerCommand) ||
     runtimeContext.hostProjectPath !== projectPath ||
     runtimeContext.requestedEngine !== requestedEngine
   ) {
@@ -566,6 +601,17 @@ export async function runPartnerCommand({
         log,
       });
   const engine = selectedRuntimeContext.engine;
+  const runtimePartnerCommand =
+    selectedRuntimeContext.tmuxTransport === "wsl"
+      ? selectedRuntimeContext.partnerCommand
+      : findBinary(partnerCommand, process.env, {
+          excludedRoots: [projectPath],
+        });
+  if (!runtimePartnerCommand) {
+    throw new Error(
+      `Partner command ${JSON.stringify(partnerCommand)} is not an executable absolute path or on an absolute PATH entry`
+    );
+  }
 
   fs.mkdirSync(turnDir, { recursive: true });
 
@@ -594,7 +640,7 @@ export async function runPartnerCommand({
       await runHeadlessTurn({
         adapter: resolvedAdapter,
         lease,
-        partnerCommand,
+        partnerCommand: runtimePartnerCommand,
         bootstrap: buildBootstrapPrompt({
           promptPath,
           resultPath,
@@ -662,6 +708,7 @@ export async function runPartnerCommand({
       model,
       projectPath,
       engine: "tmux-interactive",
+      partnerCommand: runtimePartnerCommand,
       tmuxRoute: selectedRuntimeContext.tmuxRoute,
       log,
     });
@@ -673,7 +720,7 @@ export async function runPartnerCommand({
     const { command, args, env, usesInitialPrompt, notices } =
       buildInvocationFromAdapter(adapter, {
         engine: selectedRuntimeContext.engine,
-        partnerCommand,
+        partnerCommand: runtimePartnerCommand,
         projectPath,
         sessionDir,
         scratchDir: lease?.dir ?? null,

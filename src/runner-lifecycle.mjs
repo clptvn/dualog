@@ -1,9 +1,11 @@
 import fs from "fs";
 import path from "path";
-import { execFileSync } from "child_process";
 import { fileURLToPath } from "url";
 import { isProcessAlive } from "./shared.mjs";
 import { ENGINES } from "./adapters/schema.mjs";
+import { readProcessCommandLine } from "./process-command-line.mjs";
+
+export { readProcessCommandLine } from "./process-command-line.mjs";
 
 const RUNNER_TOKEN_PREFIX = "--runner-token=";
 const RUNNER_RUNTIME_PREFIX = "--dualog-runner-runtime=";
@@ -55,16 +57,18 @@ export function readRunnerToken(argv = process.argv) {
  * Carry the runtime decision selected by start-tool preflight into the detached
  * runner without turning persisted state into executable-path authority.
  *
- * Engine and comparison-only tmux identity cross the process boundary. The
- * runner recomputes executable paths and the login shell from its inherited
- * trusted environment, then refuses if launcher, control binary, socket, or
- * WSL distro differs. Encoded values never become executable authority.
+ * Engine, the preflight-resolved partner executable, and comparison-only tmux
+ * identity cross the process boundary. Re-resolving a bare partner command in
+ * the reviewed project would let a repository-local `.cmd` replace the PATH
+ * executable preflight approved. The encoded value is an internal argv token
+ * appended after the runner capability token; persisted status remains
+ * descriptive and never becomes executable authority.
  */
 function normalizeRunnerRuntimeDecision(decision, source) {
   if (!decision || typeof decision !== "object" || Array.isArray(decision)) {
     throw new Error(`${source} runtime decision must be an object`);
   }
-  if (decision.version !== 1) {
+  if (decision.version !== 2) {
     throw new Error(
       `${source} runtime decision has unsupported version ${JSON.stringify(decision.version)}`
     );
@@ -84,6 +88,15 @@ function normalizeRunnerRuntimeDecision(decision, source) {
   const tmuxLauncher = decision.tmuxLauncher ?? null;
   const tmuxControlBinary = decision.tmuxControlBinary ?? null;
   const tmuxSocketName = decision.tmuxSocketName ?? null;
+  const partnerCommand = decision.partnerCommand;
+  if (
+    typeof partnerCommand !== "string" ||
+    !partnerCommand ||
+    partnerCommand.length > 4096 ||
+    /[\u0000-\u001f\u007f]/u.test(partnerCommand)
+  ) {
+    throw new Error(`${source} runtime decision has an invalid partner command`);
+  }
 
   if (engine === "headless") {
     if (
@@ -132,9 +145,28 @@ function normalizeRunnerRuntimeDecision(decision, source) {
     }
   }
 
+  if (tmuxTransport === "wsl" && !path.posix.isAbsolute(partnerCommand)) {
+    throw new Error(
+      `${source} WSL runtime decision must pin an absolute Linux partner command`
+    );
+  }
+  if (
+    tmuxTransport !== "wsl" &&
+    !(
+      /^[A-Za-z]:[\\/]/u.test(partnerCommand) ||
+      /^\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/u.test(partnerCommand) ||
+      (process.platform !== "win32" && path.isAbsolute(partnerCommand))
+    )
+  ) {
+    throw new Error(
+      `${source} local runtime decision must pin an absolute partner command`
+    );
+  }
+
   return Object.freeze({
-    version: 1,
+    version: 2,
     engine,
+    partnerCommand,
     tmuxTransport,
     tmuxDistro,
     tmuxLauncher,
@@ -392,33 +424,6 @@ export function markSessionRunnerExited(
   };
   writeJsonAtomic(statusPath, next);
   return true;
-}
-
-export function readProcessCommandLine(pid) {
-  try {
-    if (process.platform === "win32") {
-      const script = [
-        `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"`,
-        "if ($null -ne $p) { $p.CommandLine }",
-      ].join("; ");
-      return execFileSync(
-        "powershell.exe",
-        ["-NoProfile", "-NonInteractive", "-Command", script],
-        {
-          encoding: "utf-8",
-          windowsHide: true,
-          timeout: 5000,
-        }
-      ).trim();
-    }
-
-    return execFileSync("ps", ["-p", String(pid), "-o", "command="], {
-      encoding: "utf-8",
-      timeout: 5000,
-    }).trim();
-  } catch {
-    return "";
-  }
 }
 
 function writeJsonAtomic(filePath, value) {

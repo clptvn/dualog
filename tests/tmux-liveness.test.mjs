@@ -230,7 +230,7 @@ test("nothing that can end a turn uses the two-valued predicate", () => {
   const src = fs.readFileSync(
     new URL("../src/partner-invocation.mjs", import.meta.url),
     "utf-8"
-  );
+  ).replace(/\r\n?/gu, "\n");
 
   assert.doesNotMatch(
     src,

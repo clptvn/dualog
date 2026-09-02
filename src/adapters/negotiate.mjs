@@ -16,8 +16,17 @@ import { execFile } from "child_process";
 import { Buffer } from "node:buffer";
 import crossSpawn from "cross-spawn";
 import { resolveContext } from "./argv.mjs";
-import { probeWslPartnerCommand, tmuxRoute } from "../tmux-runtime.mjs";
-import { terminateWindowsProcessTree } from "../windows-process-tree.mjs";
+import {
+  inspectWslPartnerCommand,
+  probeWslPartnerCommand,
+  resolveWslPartnerExecutable,
+  resolveWslRouteDistro,
+  tmuxRoute,
+} from "../tmux-runtime.mjs";
+import {
+  spawnWithTrustedWindowsComSpec,
+  terminateWindowsProcessTree,
+} from "../windows-process-tree.mjs";
 
 const MAX_VERSION_OUTPUT_BYTES = 64 * 1024;
 
@@ -25,22 +34,78 @@ const MAX_VERSION_OUTPUT_BYTES = 64 * 1024;
 export function findBinary(
   command,
   env = process.env,
-  { platform = process.platform, accessSync = fs.accessSync } = {}
+  {
+    platform = process.platform,
+    accessSync = fs.accessSync,
+    realpathSync = fs.realpathSync,
+    excludedRoots = [],
+  } = {}
 ) {
   if (!command) return null;
+  if (
+    platform === "win32" &&
+    (/^[A-Za-z]:(?![\\/])/u.test(command) || /^[\\/](?![\\/])/u.test(command))
+  ) {
+    // `C:tool` / `C:dir\\tool` use that drive's ambient current directory;
+    // `\\tool` uses the process's ambient current drive. Neither is a fully
+    // qualified explicit path, so neither may smuggle cwd authority through
+    // the explicit-path branch.
+    return null;
+  }
   const pathImpl = platform === "win32" ? path.win32 : path;
+  const exclusionRoots = (Array.isArray(excludedRoots) ? excludedRoots : [])
+    .filter((root) => typeof root === "string" && root.trim())
+    .map((root) => pathImpl.resolve(root));
+  const canonicalExclusionRoots = [...exclusionRoots];
+  for (const root of exclusionRoots) {
+    try {
+      const canonical = pathImpl.resolve(realpathSync(root));
+      if (!canonicalExclusionRoots.includes(canonical)) canonicalExclusionRoots.push(canonical);
+    } catch {
+      // The lexical root still excludes a reviewed path that cannot be resolved.
+    }
+  }
+  const isInsideExcludedRoot = (candidate, roots = exclusionRoots) =>
+    roots.some((root) => {
+      const relative = pathImpl.relative(root, candidate);
+      return (
+        relative === "" ||
+        (relative !== ".." &&
+          !relative.startsWith(`..${pathImpl.sep}`) &&
+          !pathImpl.isAbsolute(relative))
+      );
+    });
+  const usableCandidate = (candidate) => {
+    const resolved = pathImpl.resolve(candidate);
+    // Reject a project-local PATH entry before even touching it. Besides making
+    // the trust rule explicit, this prevents a reviewed repository from learning
+    // which executable suffixes the host probes through access timing/errors.
+    if (isInsideExcludedRoot(resolved)) return null;
+    try {
+      accessSync(candidate, fs.constants.X_OK);
+    } catch {
+      return null;
+    }
+    if (exclusionRoots.length > 0) {
+      let canonical;
+      try {
+        canonical = pathImpl.resolve(realpathSync(candidate));
+      } catch {
+        // Once an exclusion boundary is requested, a candidate whose target
+        // cannot be established is not trusted executable authority.
+        return null;
+      }
+      if (isInsideExcludedRoot(canonical, canonicalExclusionRoots)) return null;
+    }
+    return resolved;
+  };
   const isPath =
     platform === "win32"
       ? path.win32.isAbsolute(command) || /[\\/]/u.test(command)
       : command.includes(path.sep);
 
   if (isPath) {
-    try {
-      accessSync(command, fs.constants.X_OK);
-      return pathImpl.resolve(command);
-    } catch {
-      return null;
-    }
+    return usableCandidate(command);
   }
 
   const envValue = (name) => {
@@ -71,14 +136,22 @@ export function findBinary(
       platform === "win32" && /^".*"$/u.test(rawDir)
         ? rawDir.slice(1, -1)
         : rawDir;
+    // A relative PATH component delegates executable authority to the spawn
+    // cwd. That is especially dangerous for native Windows, where a reviewed
+    // repository can otherwise satisfy `claude.cmd` or `codex.cmd` before the
+    // operator's installed CLI. PATH lookup is only a trust decision when the
+    // directory itself is absolute. Explicit relative command paths still use
+    // the branch above and are resolved to an absolute path for callers that
+    // intentionally selected them.
+    const absolutePathDirectory =
+      platform === "win32"
+        ? /^[A-Za-z]:[\\/]/u.test(dir) || /^\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/u.test(dir)
+        : path.isAbsolute(dir);
+    if (!absolutePathDirectory) continue;
     for (const ext of exts) {
       const candidate = pathImpl.join(dir, command + ext);
-      try {
-        accessSync(candidate, fs.constants.X_OK);
-        return candidate;
-      } catch {
-        /* keep looking */
-      }
+      const resolved = usableCandidate(candidate);
+      if (resolved) return resolved;
     }
   }
   return null;
@@ -91,6 +164,7 @@ export function probeVersion(
   timeoutMs = 5000,
   {
     platform = process.platform,
+    env = process.env,
     execFileImpl = execFile,
     spawnImpl = crossSpawn,
     terminateWindowsTreeFn = terminateWindowsProcessTree,
@@ -100,10 +174,17 @@ export function probeVersion(
     return new Promise((resolve) => {
       let child;
       try {
-        child = spawnImpl(binaryPath, versionArgs, {
-          stdio: ["ignore", "pipe", "pipe"],
-          windowsHide: true,
-        });
+        child = spawnWithTrustedWindowsComSpec(
+          spawnImpl,
+          binaryPath,
+          versionArgs,
+          {
+            env,
+            stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
+          },
+          { platform, env }
+        );
       } catch {
         resolve(null);
         return;
@@ -192,6 +273,8 @@ export function negotiate(adapter, options = {}) {
     env = process.env,
     allowRecursiveMcp = false,
     requireBinary = true,
+    platform = process.platform,
+    findBinaryFn = findBinary,
     allowUnknownModel = false,
     // A discovery result for this adapter, when the caller has one. Without it
     // an unrecognized model can only be flagged, never rejected -- a declared
@@ -201,6 +284,7 @@ export function negotiate(adapter, options = {}) {
 
   const errors = [];
   const warnings = [];
+  let binaryPath = null;
   const sources = adapter.__sources?.join(" <- ") ?? "<unknown source>";
 
   // Option-level findings (model / effort / tool profile) come from the same
@@ -231,7 +315,11 @@ export function negotiate(adapter, options = {}) {
 
   if (requireBinary) {
     const command = partnerCommand || adapter.binary.default;
-    if (!findBinary(command, env)) {
+    binaryPath = findBinaryFn(command, env, {
+      platform,
+      excludedRoots: [options.projectPath || process.cwd()],
+    });
+    if (!binaryPath) {
       errors.push({
         code: "binary_not_found",
         message:
@@ -289,7 +377,7 @@ export function negotiate(adapter, options = {}) {
     });
   }
 
-  return { errors, warnings, notices, engine, resolution };
+  return { errors, warnings, notices, engine, resolution, binaryPath };
 }
 
 /** Runtime availability report for one adapter, for the discovery tools. */
@@ -303,27 +391,85 @@ export async function describeAdapter(
     probeVersionFn = probeVersion,
     tmuxRouteFn = tmuxRoute,
     probeWslPartnerCommandFn = probeWslPartnerCommand,
+    inspectWslPartnerCommandFn = inspectWslPartnerCommand,
+    resolveWslPartnerExecutableFn = resolveWslPartnerExecutable,
+    resolveWslRouteDistroFn = resolveWslRouteDistro,
+    projectPath = process.cwd(),
+    pinnedWslRuntime = null,
   } = {}
 ) {
   const command = adapter.binary.default;
-  const binaryPath = findBinaryFn(command, env, { platform });
+  const usesPinnedWslRuntime = pinnedWslRuntime !== null;
+  let pinnedWslCommand = null;
+  let pinnedWslRoute = null;
+  if (usesPinnedWslRuntime) {
+    pinnedWslCommand = pinnedWslRuntime?.partnerCommand;
+    pinnedWslRoute = pinnedWslRuntime?.tmuxRoute;
+    const pinnedDistro = String(pinnedWslRuntime?.tmuxDistro ?? "").trim();
+    if (
+      platform !== "win32" ||
+      typeof pinnedWslCommand !== "string" ||
+      !path.posix.isAbsolute(pinnedWslCommand) ||
+      /[\u0000-\u001f\u007f]/u.test(pinnedWslCommand) ||
+      pinnedWslRoute?.transport !== "wsl" ||
+      !pinnedDistro ||
+      String(pinnedWslRoute.distro ?? "").toLocaleLowerCase("en-US") !==
+        pinnedDistro.toLocaleLowerCase("en-US")
+    ) {
+      throw new Error("Pinned WSL adapter status requires one absolute executable and distribution");
+    }
+  }
+  // A frozen WSL runtime has already selected its Linux namespace and exact
+  // executable. Do not let a simultaneously installed Windows CLI replace that
+  // status simply because native PATH lookup happens first.
+  const binaryPath = usesPinnedWslRuntime
+    ? null
+    : findBinaryFn(command, env, {
+        platform,
+        excludedRoots: [projectPath || process.cwd()],
+      });
   let wslAvailable = false;
+  let wslBinaryPath = null;
+  let wslVersion = null;
   let route = null;
+
+  if (usesPinnedWslRuntime) {
+    route = pinnedWslRoute;
+    wslBinaryPath = pinnedWslCommand;
+    try {
+      const inspection = await inspectWslPartnerCommandFn(
+        pinnedWslCommand,
+        adapter.binary.versionArgs,
+        { env, platform, route }
+      );
+      wslAvailable = inspection?.availability === "available";
+      wslVersion = wslAvailable ? inspection.version ?? null : null;
+    } catch {
+      wslAvailable = false;
+      wslVersion = null;
+    }
+  }
 
   // Native Windows can host this MCP server while the selected interactive
   // partner lives only in WSL. Startup validates that exact command through
   // resolveRunnableEngine(); status must ask the same question instead of
   // declaring the adapter missing from the Windows PATH alone. The probe is
   // one bounded `--version` call and is skipped everywhere else.
-  if (!binaryPath && platform === "win32") {
+  if (!usesPinnedWslRuntime && !binaryPath && platform === "win32") {
     try {
       route = tmuxRouteFn({ env, platform });
       if (
         route?.transport === "wsl" &&
         adapter.engines.allowed.includes("tmux-interactive")
       ) {
+        route = await resolveWslRouteDistroFn(route);
+        wslBinaryPath = await resolveWslPartnerExecutableFn(command, {
+          projectPath: projectPath || process.cwd(),
+          route,
+        });
         wslAvailable =
-          (await probeWslPartnerCommandFn(command, adapter.binary.versionArgs, {
+          Boolean(wslBinaryPath) &&
+          (await probeWslPartnerCommandFn(wslBinaryPath, adapter.binary.versionArgs, {
             env,
             platform,
             route,
@@ -352,13 +498,28 @@ export async function describeAdapter(
     completion: adapter.completion.sidecar,
     binary: command,
     binary_available: available,
-    binary_path: binaryPath,
-    binary_transport: binaryPath ? "local" : wslAvailable ? "wsl" : null,
-    wsl_distro: wslAvailable ? (route?.distro ?? null) : null,
+    binary_path: usesPinnedWslRuntime ? pinnedWslCommand : binaryPath,
+    binary_transport: usesPinnedWslRuntime
+      ? "wsl"
+      : binaryPath
+        ? "local"
+        : wslAvailable
+          ? "wsl"
+          : null,
+    wsl_distro: usesPinnedWslRuntime
+      ? pinnedWslRuntime.tmuxDistro
+      : wslAvailable
+        ? (route?.distro ?? null)
+        : null,
     version:
       probe && binaryPath
-        ? await probeVersionFn(binaryPath, adapter.binary.versionArgs)
-        : undefined,
+        ? await probeVersionFn(binaryPath, adapter.binary.versionArgs, 5000, {
+            platform,
+            env,
+          })
+        : probe && usesPinnedWslRuntime
+          ? wslVersion
+          : undefined,
     install_hint: adapter.binary.installHint ?? null,
     sources: adapter.__sources,
   };

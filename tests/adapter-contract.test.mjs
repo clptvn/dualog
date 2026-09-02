@@ -12,7 +12,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { listAdapters, resetRegistry } from "../src/adapters/registry.mjs";
+import {
+  adapterSearchPath,
+  listAdapters,
+  resetRegistry,
+} from "../src/adapters/registry.mjs";
 import { modelEntries } from "../src/adapters/schema.mjs";
 import { buildInvocationFromAdapter } from "../src/adapters/argv.mjs";
 import { negotiate } from "../src/adapters/negotiate.mjs";
@@ -52,6 +56,21 @@ function invoke(adapter, engine, toolProfile) {
 
 test("the registry is non-empty", () => {
   assert.ok(ADAPTERS.length >= 7, `only ${ADAPTERS.length} adapters loaded`);
+});
+
+test("explicit adapter directories use the host path-list delimiter", () => {
+  const first = path.join(ROOT, "explicit-one");
+  const second = path.join(ROOT, "explicit-two");
+  const searchPath = adapterSearchPath({
+    cwd: ROOT,
+    env: {
+      XDG_CONFIG_HOME: path.join(ROOT, "xdg"),
+      XDG_CONFIG_DIRS: "",
+      DUALOG_ADAPTER_PATH: [first, second].join(path.delimiter),
+    },
+  });
+
+  assert.deepEqual(searchPath.slice(-2), [path.resolve(first), path.resolve(second)]);
 });
 
 for (const adapter of ADAPTERS) {

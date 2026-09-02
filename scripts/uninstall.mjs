@@ -28,6 +28,10 @@ const CLAUDE_HOOKS_ROOT = path.join(CLAUDE_DIR, "hooks");
 const CLAUDE_HOOKS_DIR = path.join(CLAUDE_HOOKS_ROOT, "dualog");
 const CLAUDE_HOOKS_PLATFORM = path.join(CLAUDE_HOOKS_ROOT, "dualog-platform.mjs");
 const CLAUDE_HOOKS_LEGACY_PLATFORM = path.join(CLAUDE_HOOKS_ROOT, "platform.mjs");
+const CLAUDE_HOOKS_RENAMED_LEGACY_PLATFORM = path.join(
+  CLAUDE_HOOKS_ROOT,
+  "codex-dialog-platform.mjs"
+);
 const CLAUDE_SETTINGS_JSON = path.join(CLAUDE_DIR, "settings.json");
 const CODEX_PATHS = resolveCodexPaths();
 const CODEX_DIR = CODEX_PATHS.root;
@@ -76,6 +80,33 @@ const HOOK_FILE_MARKERS = [
   "require-lgtm-or-cap.mjs",
   "mark-needs-investigation.mjs",
   "clear-investigation.mjs",
+  "enforce-investigation.sh",
+  "mark-needs-investigation.sh",
+  "clear-investigation.sh",
+];
+
+const OWNED_HOOK_DIRECTORIES = [
+  CLAUDE_HOOKS_DIR,
+  path.join(CLAUDE_HOOKS_ROOT, LEGACY_HOOKS_DIR_NAME),
+];
+
+const OWNED_PLATFORM_HELPER_HEADERS = [
+  [
+    'import fs from "fs";',
+    'import os from "os";',
+    'import path from "path";',
+    "",
+    "// dualog platform helpers. Keep this file dependency-light because",
+    "// Claude hook scripts import it from the user-level hooks directory.",
+  ].join("\n"),
+  [
+    'import fs from "fs";',
+    'import os from "os";',
+    'import path from "path";',
+    "",
+    "// claude-codex-dialog platform helpers. Keep this file dependency-light because",
+    "// Claude hook scripts import it from the user-level hooks directory.",
+  ].join("\n"),
 ];
 
 function parseMode(argv) {
@@ -115,29 +146,139 @@ function parseMode(argv) {
   return { removeClaude, removeCodex, hostOnly, wslDistro, wslBinary };
 }
 
+function removeClaudeMcpFromFile(filePath) {
+  const config = readJsonConfig(filePath);
+  const servers = config?.mcpServers;
+  if (servers === null || (typeof servers !== "object" && typeof servers !== "function")) {
+    return false;
+  }
+  let changed = false;
+  for (const key of ["dualog", LEGACY_MCP_KEY]) {
+    if (!Object.prototype.hasOwnProperty.call(servers, key)) continue;
+    delete servers[key];
+    changed = true;
+  }
+  if (changed) {
+    if (Object.keys(servers).length === 0) delete config.mcpServers;
+    writeJsonConfig(filePath, config);
+  }
+  return changed;
+}
+
 function removeClaudeMcp() {
-  const config = readJsonConfig(CLAUDE_JSON);
-  if (config.mcpServers?.["dualog"]) {
-    delete config.mcpServers["dualog"];
-    if (Object.keys(config.mcpServers).length === 0) delete config.mcpServers;
-    writeJsonConfig(CLAUDE_JSON, config);
-    console.log(`  Removed ${CLAUDE_JSON} MCP registration atomically OK`);
+  for (const filePath of [CLAUDE_JSON, CLAUDE_SETTINGS_JSON]) {
+    if (!removeClaudeMcpFromFile(filePath)) continue;
+    console.log(`  Removed ${filePath} MCP registration atomically OK`);
   }
 }
 
 function isCodexDialogHookCommand(command) {
   if (typeof command !== "string") return false;
-  return (
-    command.includes("dualog") ||
-    HOOK_FILE_MARKERS.some((marker) => command.includes(marker))
+  // The historical shell installer wrote an unquoted raw path. That command was
+  // broken when HOME contained whitespace, but uninstall still owns the exact
+  // string it generated. Equality against the full expected command removes it
+  // without interpreting a prefix, substring, or extra argument as ours.
+  for (const directory of OWNED_HOOK_DIRECTORIES) {
+    for (const marker of HOOK_FILE_MARKERS) {
+      const ownedPath = path.join(directory, marker);
+      const executable = marker.endsWith(".sh") ? "bash" : "node";
+      if (command === `${executable} ${ownedPath}`) return true;
+    }
+  }
+  const tokens = tokenizeHookCommand(command);
+  if (!tokens || tokens.length !== 2) return false;
+  const executable = tokens[0].replaceAll("\\", "/").split("/").at(-1)?.toLowerCase();
+  return OWNED_HOOK_DIRECTORIES.some((directory) =>
+    HOOK_FILE_MARKERS.some((marker) => {
+      const validExecutables = marker.endsWith(".sh")
+        ? ["bash", "bash.exe"]
+        : ["node", "node.exe"];
+      return (
+        (validExecutables.includes(executable) ||
+          (!marker.endsWith(".sh") && samePath(tokens[0], process.execPath))) &&
+        samePath(tokens[1], path.join(directory, marker))
+      );
+    })
   );
+}
+
+function samePath(left, right) {
+  try {
+    const normalizedLeft = path.resolve(left);
+    const normalizedRight = path.resolve(right);
+    return process.platform === "win32"
+      ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+      : normalizedLeft === normalizedRight;
+  } catch {
+    return false;
+  }
+}
+
+/** Parse the two-token command shapes written by every Dualog installer. */
+function tokenizeHookCommand(command) {
+  const tokens = [];
+  let token = "";
+  let quote = null;
+  let active = false;
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index];
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+        continue;
+      }
+      if (
+        process.platform !== "win32" &&
+        quote === '"' &&
+        char === "\\" &&
+        index + 1 < command.length &&
+        ['"', "\\", "$", "`"].includes(command[index + 1])
+      ) {
+        token += command[++index];
+        active = true;
+        continue;
+      }
+      token += char;
+      active = true;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      active = true;
+      continue;
+    }
+    if (/\s/u.test(char)) {
+      if (active) {
+        tokens.push(token);
+        token = "";
+        active = false;
+      }
+      continue;
+    }
+    if (char === "\\" && index + 1 < command.length) {
+      if (process.platform === "win32") token += char;
+      else token += command[++index];
+      active = true;
+      continue;
+    }
+    token += char;
+    active = true;
+  }
+  if (quote) return null;
+  if (active) tokens.push(token);
+  return tokens;
+}
+
+function hasOwnedPlatformHelperHeader(content) {
+  const normalized = content.replace(/^\uFEFF/u, "").replaceAll("\r\n", "\n");
+  return OWNED_PLATFORM_HELPER_HEADERS.some((header) => normalized.startsWith(header));
 }
 
 function removeOwnedPlatformHelper(filePath) {
   if (!fs.existsSync(filePath)) return;
   try {
     const content = fs.readFileSync(filePath, "utf-8");
-    if (content.includes("dualog platform helpers")) {
+    if (hasOwnedPlatformHelperHeader(content)) {
       fs.rmSync(filePath, { force: true });
       console.log(`  Removed Claude hook ${path.basename(filePath)} OK`);
     }
@@ -145,31 +286,48 @@ function removeOwnedPlatformHelper(filePath) {
 }
 
 function removeClaudeHooks() {
-  if (fs.existsSync(CLAUDE_HOOKS_DIR)) {
-    fs.rmSync(CLAUDE_HOOKS_DIR, { recursive: true, force: true });
-    console.log("  Removed Claude hook files OK");
+  for (const directory of OWNED_HOOK_DIRECTORIES) {
+    if (!fs.existsSync(directory)) continue;
+    fs.rmSync(directory, { recursive: true, force: true });
+    console.log(`  Removed Claude hook files ${path.basename(directory)} OK`);
   }
 
   removeOwnedPlatformHelper(CLAUDE_HOOKS_PLATFORM);
   removeOwnedPlatformHelper(CLAUDE_HOOKS_LEGACY_PLATFORM);
+  removeOwnedPlatformHelper(CLAUDE_HOOKS_RENAMED_LEGACY_PLATFORM);
 
   if (!fs.existsSync(CLAUDE_SETTINGS_JSON)) return;
 
   const config = readJsonConfig(CLAUDE_SETTINGS_JSON);
   if (!config.hooks) return;
 
+  let changed = false;
   for (const key of ["PreToolUse", "PostToolUse"]) {
     if (!Array.isArray(config.hooks[key])) continue;
-    config.hooks[key] = config.hooks[key]
-      .map((entry) => {
-        if (!Array.isArray(entry.hooks)) return entry;
-        const hooks = entry.hooks.filter((hook) => !isCodexDialogHookCommand(hook.command));
-        return { ...entry, hooks };
-      })
-      .filter((entry) => entry.hooks?.length > 0);
-    if (config.hooks[key].length === 0) delete config.hooks[key];
+    const entries = [];
+    let keyChanged = false;
+    for (const entry of config.hooks[key]) {
+      if (!Array.isArray(entry?.hooks)) {
+        entries.push(entry);
+        continue;
+      }
+      const hooks = entry.hooks.filter(
+        (hook) => !isCodexDialogHookCommand(hook?.command)
+      );
+      if (hooks.length === entry.hooks.length) {
+        entries.push(entry);
+        continue;
+      }
+      changed = true;
+      keyChanged = true;
+      if (hooks.length > 0) entries.push({ ...entry, hooks });
+    }
+    if (!keyChanged) continue;
+    if (entries.length === 0) delete config.hooks[key];
+    else config.hooks[key] = entries;
   }
 
+  if (!changed) return;
   if (Object.keys(config.hooks).length === 0) delete config.hooks;
   writeJsonConfig(CLAUDE_SETTINGS_JSON, config);
   console.log("  Removed Claude hook settings OK");
@@ -393,7 +551,7 @@ async function main() {
   await removeWslHosts(mode);
 
   if (mode.removeClaude) {
-    for (const command of CLAUDE_COMMANDS) {
+    for (const command of [...CLAUDE_COMMANDS, ...LEGACY_CLAUDE_COMMANDS]) {
       const target = path.join(CLAUDE_COMMANDS_DIR, `${command}.md`);
       if (fs.existsSync(target)) {
         fs.rmSync(target, { force: true });
@@ -406,7 +564,7 @@ async function main() {
   }
 
   if (mode.removeCodex) {
-    for (const skill of CODEX_SKILLS) {
+    for (const skill of [...CODEX_SKILLS, ...LEGACY_CODEX_SKILLS]) {
       const target = path.join(CODEX_SKILLS_DIR, skill);
       if (fs.existsSync(target)) {
         fs.rmSync(target, { recursive: true, force: true });

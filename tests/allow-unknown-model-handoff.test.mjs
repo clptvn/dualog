@@ -127,7 +127,11 @@ test("every hop between the start call and the turn carries the flag", () => {
   }
 
   assert.match(INVOCATION_SRC, /allowUnknownModel = false,/, "runPartnerCommand accepts it");
-  assert.match(INVOCATION_SRC, /allowUnknownModel,\n\s*\}\);/, "and passes it to the argv builder");
+  assert.match(
+    INVOCATION_SRC,
+    /allowUnknownModel,\r?\n\s*\}\);/,
+    "and passes it to the argv builder"
+  );
   assert.match(HEADLESS_SRC, /allowUnknownModel = false,/, "the headless engine accepts it");
   assert.match(HEADLESS_SRC, /allowUnknownModel,/, "and passes it on");
 });

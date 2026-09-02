@@ -42,8 +42,11 @@ import {
  * result -- would otherwise trigger a real 3.3MB models.dev fetch. Enrichment
  * has its own section at the bottom, where it is driven from a fixture.
  */
+// Generic resolver tests exercise the local/native discovery contract. Pin the
+// platform so a Windows CI host does not silently turn them into WSL-routing
+// tests; the Windows/WSL cases below opt into `platform: "win32"` explicitly.
 const resolveDiscovery = (adapter, options = {}) =>
-  resolveDiscoveryRaw(adapter, { enrich: false, ...options });
+  resolveDiscoveryRaw(adapter, { enrich: false, platform: "linux", ...options });
 
 const FIXTURES = fileURLToPath(new URL("./fixtures/discovery/", import.meta.url));
 const readFixture = (name) => fs.readFileSync(path.join(FIXTURES, name), "utf-8");
@@ -102,6 +105,53 @@ test("Windows binary lookup does not append PATHEXT to an existing exe or cmd su
   }
 });
 
+test("binary lookup ignores relative PATH entries while explicit paths become absolute", () => {
+  const posixAttempts = [];
+  const resolved = findBinary(
+    "claude",
+    { PATH: ".:relative/bin:/opt/trusted/bin" },
+    {
+      platform: "linux",
+      accessSync(candidate) {
+        posixAttempts.push(candidate);
+        if (candidate !== "/opt/trusted/bin/claude") {
+          throw Object.assign(new Error("missing"), { code: "ENOENT" });
+        }
+      },
+    }
+  );
+  assert.equal(resolved, "/opt/trusted/bin/claude");
+  assert.deepEqual(posixAttempts, ["/opt/trusted/bin/claude"]);
+
+  const explicit = "./reviewed tools/claude";
+  assert.equal(
+    findBinary(explicit, {}, { platform: "linux", accessSync: () => {} }),
+    path.resolve(explicit),
+    "an explicit relative path remains supported but cannot stay relative at spawn"
+  );
+});
+
+test("Windows drive- and root-relative executable paths are rejected before filesystem access", () => {
+  for (const command of [
+    "C:claude.cmd",
+    "C:tools\\claude.cmd",
+    "\\tools\\claude.cmd",
+    "/tools/claude.cmd",
+  ]) {
+    let accesses = 0;
+    assert.equal(
+      findBinary(command, {}, {
+        platform: "win32",
+        accessSync() {
+          accesses += 1;
+        },
+      }),
+      null
+    );
+    assert.equal(accesses, 0);
+  }
+});
+
 test("adapter status recognizes a CLI installed only in the selected WSL distro", async () => {
   const probes = [];
   const result = await describeAdapter(adapter("claude"), {
@@ -113,17 +163,76 @@ test("adapter status recognizes a CLI installed only in the selected WSL distro"
       assert.equal(env.DUALOG_WSL_DISTRO, "Ubuntu-24.04");
       return { transport: "wsl", command: "wsl.exe", distro: "Ubuntu-24.04" };
     },
+    resolveWslPartnerExecutableFn: async (command, { route }) => {
+      assert.equal(command, "claude");
+      assert.equal(route.distro, "Ubuntu-24.04");
+      return "/usr/local/bin/claude";
+    },
     probeWslPartnerCommandFn: async (command, versionArgs, { route }) => {
       probes.push([command, versionArgs, route.distro]);
       return "available";
     },
   });
 
-  assert.deepEqual(probes, [["claude", ["--version"], "Ubuntu-24.04"]]);
+  assert.deepEqual(probes, [["/usr/local/bin/claude", ["--version"], "Ubuntu-24.04"]]);
   assert.equal(result.binary_available, true);
   assert.equal(result.binary_path, null);
   assert.equal(result.binary_transport, "wsl");
   assert.equal(result.wsl_distro, "Ubuntu-24.04");
+});
+
+test("pinned check_adapter status prefers its selected WSL runtime when a native CLI coexists", async () => {
+  const nativeBinary = "C:\\Trusted\\Claude\\claude.cmd";
+  const pinnedBinary = "/opt/claude/bin/claude";
+  const route = {
+    transport: "wsl",
+    command: "C:\\Windows\\System32\\wsl.exe",
+    distro: "Ubuntu-24.04",
+    tmuxBinary: "tmux",
+    tmuxSocketName: "dualog",
+  };
+  let nativeLookups = 0;
+  let nativeVersionProbes = 0;
+  const wslProbes = [];
+
+  const result = await describeAdapter(adapter("claude"), {
+    probe: true,
+    platform: "win32",
+    env: { PATH: "C:\\Trusted\\Claude" },
+    projectPath: "C:\\reviewed",
+    // This fixture has a runnable native CLI too. A forced WSL status must not
+    // even consult it, because PATH order cannot replace the frozen runtime.
+    findBinaryFn: () => {
+      nativeLookups += 1;
+      return nativeBinary;
+    },
+    probeVersionFn: async () => {
+      nativeVersionProbes += 1;
+      return "native version must not be observed";
+    },
+    probeWslPartnerCommandFn: async () =>
+      assert.fail("forced status must not use the ordinary WSL availability path"),
+    resolveWslPartnerExecutableFn: async () =>
+      assert.fail("the frozen WSL executable must not be resolved again"),
+    inspectWslPartnerCommandFn: async (command, versionArgs, options) => {
+      wslProbes.push([command, versionArgs, options.route.distro]);
+      return { availability: "available", version: "2.1.258 (Claude Code)" };
+    },
+    pinnedWslRuntime: {
+      partnerCommand: pinnedBinary,
+      tmuxDistro: "Ubuntu-24.04",
+      tmuxRoute: route,
+    },
+  });
+
+  assert.equal(nativeLookups, 0);
+  assert.equal(nativeVersionProbes, 0);
+  assert.deepEqual(wslProbes, [[pinnedBinary, ["--version"], "Ubuntu-24.04"]]);
+  assert.equal(result.binary_available, true);
+  assert.equal(result.binary_transport, "wsl");
+  assert.equal(result.binary_path, pinnedBinary);
+  assert.equal(result.wsl_distro, "Ubuntu-24.04");
+  assert.equal(result.version, "2.1.258 (Claude Code)");
 });
 
 test("adapter status never probes WSL on macOS or Linux", async () => {
@@ -708,13 +817,49 @@ test("an adapter with no source attempts nothing and reports nothing", async () 
 // discovery.test.mjs; what is tested here is the wiring and the spawn argv.
 const CLAUDE_LINE = readFixture("claude-list-models.jsonl").trim();
 
+test("process-backed discovery uses and caches by the pinned local executable", async () => {
+  const cache = createDiscoveryCache();
+  const probes = [];
+  const reviewedProject = "/reviewed/project";
+  const discoverWith = (partnerCommand) =>
+    resolveDiscovery(adapter("claude"), {
+      engine: "headless",
+      partnerCommand,
+      projectPath: reviewedProject,
+      now: NOW,
+      cache,
+      findBinaryFn: (command, _env, options) => {
+        assert.deepEqual(options.excludedRoots, [reviewedProject]);
+        return command;
+      },
+      runControl: async ({ command }) => {
+        probes.push(command);
+        return { line: CLAUDE_LINE, error: null };
+      },
+    });
+
+  await discoverWith("/opt/trusted-a/claude");
+  await discoverWith("/opt/trusted-b/claude");
+  await discoverWith("/opt/trusted-a/claude");
+
+  assert.deepEqual(probes, [
+    "/opt/trusted-a/claude",
+    "/opt/trusted-b/claude",
+  ]);
+});
+
 test("native Windows runs Claude model discovery inside the selected WSL distro", async () => {
   let invocation = null;
   let requestText = "";
   const result = await resolveDiscovery(adapter("claude"), {
     platform: "win32",
     engine: "tmux-interactive",
-    env: { DUALOG_WSL_DISTRO: "Ubuntu-24.04" },
+    partnerCommand: "claude-wsl",
+    projectPath: "C:\\reviewed",
+    env: {
+      SystemRoot: "C:\\Windows",
+      DUALOG_WSL_DISTRO: "Ubuntu-24.04",
+    },
     now: NOW,
     cache: createDiscoveryCache(),
     tmuxRouteFn: () => ({
@@ -723,6 +868,12 @@ test("native Windows runs Claude model discovery inside the selected WSL distro"
       distro: "Ubuntu-24.04",
       loginShell: "/bin/bash",
     }),
+    resolveWslPartnerExecutableFn: async (command, { projectPath, route }) => {
+      assert.equal(command, "claude-wsl");
+      assert.equal(projectPath, "C:\\reviewed");
+      assert.equal(route.distro, "Ubuntu-24.04");
+      return "/usr/local/bin/claude-wsl";
+    },
     spawnImpl: (command, args, options) => {
       invocation = { command, args, options };
       const child = new EventEmitter();
@@ -747,7 +898,8 @@ test("native Windows runs Claude model discovery inside the selected WSL distro"
   ]);
   assert.ok(invocation.args.includes("dualog-wsl-discovery"));
   assert.deepEqual(invocation.args.slice(3, 5), ["/bin/bash", "-lic"]);
-  assert.ok(invocation.args.includes("claude"));
+  assert.ok(invocation.args.includes("/usr/local/bin/claude-wsl"));
+  assert.equal(invocation.args.includes("claude-wsl"), false);
   assert.ok(invocation.args.includes("--strict-mcp-config"));
   assert.match(requestText, /"subtype":"list_models"/u);
   assert.equal(result.strategy, "sdk-control");
@@ -759,6 +911,7 @@ test("WSL discovery pins the default distro before resolving its login shell", a
   const result = await resolveDiscovery(adapter("claude"), {
     platform: "win32",
     engine: "tmux-interactive",
+    projectPath: "C:\\reviewed",
     env: {},
     now: NOW,
     cache: createDiscoveryCache(),
@@ -775,6 +928,10 @@ test("WSL discovery pins the default distro before resolving its login shell", a
       events.push(`shell:${route.distro}`);
       return "/bin/bash";
     },
+    resolveWslPartnerExecutableFn: async (command, { route }) => {
+      events.push(`resolve:${route.distro}:${command}`);
+      return "/usr/local/bin/claude";
+    },
     runControl: async ({ route }) => {
       events.push(`probe:${route.distro}:${route.loginShell}`);
       return { line: CLAUDE_LINE, error: null };
@@ -784,9 +941,34 @@ test("WSL discovery pins the default distro before resolving its login shell", a
   assert.deepEqual(events, [
     "distro:null",
     "shell:Ubuntu-24.04",
+    "resolve:Ubuntu-24.04:claude",
     "probe:Ubuntu-24.04:/bin/bash",
   ]);
   assert.equal(result.strategy, "sdk-control");
+});
+
+test("WSL discovery never executes a partner command rejected by project exclusion", async () => {
+  const result = await resolveDiscovery(adapter("claude"), {
+    platform: "win32",
+    engine: "tmux-interactive",
+    projectPath: "C:\\reviewed",
+    env: {},
+    now: NOW,
+    cache: createDiscoveryCache(),
+    tmuxRouteFn: () => ({
+      transport: "wsl",
+      command: "wsl.exe",
+      distro: "Ubuntu",
+      loginShell: "/bin/bash",
+    }),
+    resolveWslPartnerExecutableFn: async () => {
+      throw new Error("resolves inside the reviewed project");
+    },
+    runControl: async () => assert.fail("an excluded WSL command must never execute"),
+  });
+
+  assert.equal(result.strategy, "static");
+  assert.match(result.notices[0].message, /not trusted in WSL.*reviewed project/u);
 });
 
 test("WSL discovery cache entries are isolated by pinned distro", async () => {
@@ -796,6 +978,7 @@ test("WSL discovery cache entries are isolated by pinned distro", async () => {
     resolveDiscovery(adapter("claude"), {
       platform: "win32",
       engine: "tmux-interactive",
+      projectPath: "C:\\reviewed",
       env: { DUALOG_WSL_DISTRO: distro },
       now: NOW,
       cache,
@@ -805,6 +988,10 @@ test("WSL discovery cache entries are isolated by pinned distro", async () => {
         distro: env.DUALOG_WSL_DISTRO,
         loginShell: "/bin/bash",
       }),
+      resolveWslPartnerExecutableFn: async (command, { route }) => {
+        assert.equal(command, "claude");
+        return `/usr/local/${route.distro}/claude`;
+      },
       runControl: async ({ route }) => {
         probes.push(route.distro);
         return { line: CLAUDE_LINE, error: null };

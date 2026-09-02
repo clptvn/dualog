@@ -3,7 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { terminateWindowsProcessTree } from "../src/windows-process-tree.mjs";
+import {
+  resolveWindowsSystem32Executable,
+  terminateWindowsProcessTree,
+} from "../src/windows-process-tree.mjs";
 import {
   DEFAULT_WSL_LOGIN_SHELL,
   assertSafeWslLauncher,
@@ -34,6 +37,64 @@ function firstConfigured(env, names) {
 
 function isDefaultWslLauncher(value) {
   return String(value).trim().toLowerCase() === "wsl.exe";
+}
+
+function exactWslBinary(
+  value,
+  { platform = process.platform, env = process.env } = {}
+) {
+  const candidate = String(value ?? "wsl.exe").trim();
+  if (platform !== "win32") return candidate;
+  if (isDefaultWslLauncher(candidate)) {
+    const resolved = resolveWindowsSystem32Executable("wsl.exe", { env });
+    if (!resolved) {
+      throw new Error(
+        "SystemRoot did not resolve to a trusted top-level Windows System32 directory for wsl.exe"
+      );
+    }
+    return resolved;
+  }
+  return assertSafeWslLauncher(candidate, { platform });
+}
+
+function exactWindowsCommandEnvironment(env) {
+  const cmd = resolveWindowsSystem32Executable("cmd.exe", { env });
+  if (!cmd) {
+    throw new Error(
+      "SystemRoot did not resolve to a trusted top-level Windows System32 directory for cmd.exe"
+    );
+  }
+  const sanitized = {};
+  for (const [key, value] of Object.entries(env ?? {})) {
+    if (key.toLocaleLowerCase("en-US") !== "comspec") sanitized[key] = value;
+  }
+  sanitized.ComSpec = cmd;
+  return sanitized;
+}
+
+function spawnWithExactAmbientComSpec(spawnFn, command, args, options) {
+  const trustedComSpec = options?.env?.ComSpec;
+  if (!trustedComSpec) return spawnFn(command, args, options);
+
+  // cross-spawn resolves an extensionless command before it creates the child.
+  // When that resolution lands on a .cmd shim, its parser reads the parent
+  // process's lowercase `comspec` instead of the child options environment.
+  // Keep that synchronous parser boundary exact too, then restore the parent
+  // immediately; JavaScript cannot interleave another probe before spawnFn
+  // returns its ChildProcess.
+  const previous = Object.entries(process.env).filter(
+    ([key]) => key.toLocaleLowerCase("en-US") === "comspec"
+  );
+  for (const [key] of previous) delete process.env[key];
+  process.env.comspec = trustedComSpec;
+  try {
+    return spawnFn(command, args, options);
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (key.toLocaleLowerCase("en-US") === "comspec") delete process.env[key];
+    }
+    for (const [key, value] of previous) process.env[key] = value;
+  }
 }
 
 function assertResolvableConfigParent(filePath) {
@@ -213,7 +274,7 @@ export function writeJsonConfig(filePath, config) {
 
 export function persistedWslEnv(
   cliStatus,
-  { platform = process.platform } = {}
+  { platform = process.platform, env: hostEnv = process.env } = {}
 ) {
   if (platform !== "win32") return {};
   const env = {};
@@ -226,10 +287,11 @@ export function persistedWslEnv(
     cliStatus.wsl.binary
   ) {
     try {
-      const binary = assertSafeWslLauncher(cliStatus.wsl.binary, {
+      const binary = exactWslBinary(cliStatus.wsl.binary, {
         platform,
+        env: hostEnv,
       });
-      if (!isDefaultWslLauncher(binary)) env.DUALOG_WSL_BINARY = binary;
+      env.DUALOG_WSL_BINARY = binary;
     } catch {
       // Never emit a route that Desktop cannot reproduce. The explicit
       // installer preflight reports the actionable error before mutation.
@@ -322,11 +384,11 @@ export function prepareWindowsCommandInvocation(
     escapeWindowsCmdCommand(command),
     ...args.map((arg) => escapeWindowsCmdArgument(arg, doubleEscape)),
   ].join(" ");
-  const env = options.env ?? process.env;
+  const env = exactWindowsCommandEnvironment(options.env ?? process.env);
   return {
-    command: env.ComSpec || env.COMSPEC || "cmd.exe",
+    command: env.ComSpec,
     args: ["/d", "/s", "/c", `"${shellCommand}"`],
-    options: { ...options, windowsVerbatimArguments: true },
+    options: { ...options, env, windowsVerbatimArguments: true },
   };
 }
 
@@ -349,23 +411,33 @@ export function runInstallProbe(
     Number.isSafeInteger(options.maxBuffer) && options.maxBuffer > 0
       ? options.maxBuffer
       : 1024 * 1024;
-  const spawnOptions = {
-    cwd: options.cwd,
-    env: options.env,
-    windowsHide: options.windowsHide,
-    stdio: options.stdio,
-  };
-
   return new Promise((resolve) => {
     let child;
     try {
+      const spawnOptions = {
+        cwd: options.cwd,
+        env:
+          platform === "win32"
+            ? exactWindowsCommandEnvironment(options.env ?? process.env)
+            : options.env,
+        windowsHide: options.windowsHide,
+        stdio: options.stdio,
+      };
       const invocation = prepareWindowsCommandInvocation(
         command,
         args,
         spawnOptions,
         { platform }
       );
-      child = spawnFn(invocation.command, invocation.args, invocation.options);
+      child =
+        platform === "win32"
+          ? spawnWithExactAmbientComSpec(
+              spawnFn,
+              invocation.command,
+              invocation.args,
+              invocation.options
+            )
+          : spawnFn(invocation.command, invocation.args, invocation.options);
     } catch (error) {
       resolve({ status: null, stdout: "", stderr: "", error, pid: null });
       return;
@@ -469,8 +541,9 @@ export async function preflightExplicitWslSelection(
   }
 
   const route = {
-    binary: assertSafeWslLauncher(explicit.wslBinary || "wsl.exe", {
+    binary: exactWslBinary(explicit.wslBinary || "wsl.exe", {
       platform,
+      env,
     }),
     distro: explicit.wslDistro || null,
   };
@@ -1097,9 +1170,15 @@ export function findPersistedWslDistro(options = {}) {
   return findPersistedWslSettings(options).distro;
 }
 
-export function resolveWslRoute({ env = process.env } = {}) {
+export function resolveWslRoute({
+  env = process.env,
+  platform = process.platform,
+} = {}) {
   return {
-    binary: firstConfigured(env, WSL_BINARY_ENV) ?? "wsl.exe",
+    binary: exactWslBinary(firstConfigured(env, WSL_BINARY_ENV) ?? "wsl.exe", {
+      platform,
+      env,
+    }),
     distro: firstConfigured(env, WSL_DISTRO_ENV),
   };
 }
@@ -1263,7 +1342,7 @@ export async function probeInstallEnvironment(
   };
   if (platform !== "win32") return status;
 
-  const requestedRoute = resolveWslRoute({ env });
+  const requestedRoute = resolveWslRoute({ env, platform });
   const binaryProbe = await invoke(runProbe, requestedRoute.binary, ["--status"], { cwd });
   const binary = executableStarted(binaryProbe);
   const distro =

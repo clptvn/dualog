@@ -24,6 +24,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 import { writeFakeCli, writeFakeAdapter } from "./helpers/fake-cli.mjs";
+import { findBinary } from "../src/adapters/negotiate.mjs";
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const SERVER_PATH = path.join(REPO_ROOT, "src", "dialog-server.mjs");
@@ -36,6 +37,13 @@ const BIN_DIR = path.join(ROOT, "bin");
 fs.mkdirSync(HOME, { recursive: true });
 fs.mkdirSync(BIN_DIR, { recursive: true });
 process.on("exit", () => fs.rmSync(ROOT, { recursive: true, force: true }));
+
+// Resolution now happens before the preload intercepts execFileSync, so expose
+// inert, executable gh placeholders on the test PATH for both host families.
+// Reaching either file would fail loudly; fake-vcs-preload owns the behavior.
+fs.writeFileSync(path.join(BIN_DIR, "gh"), "#!/bin/sh\nexit 97\n");
+fs.chmodSync(path.join(BIN_DIR, "gh"), 0o755);
+fs.writeFileSync(path.join(BIN_DIR, "gh.cmd"), "@exit /b 97\r\n");
 
 const FAKE_REPLY = [
   "The specialist reviewed the change.",
@@ -132,24 +140,31 @@ function readStatus(sessionsRoot, sessionId) {
 }
 
 async function withServer(t, body, { nodeArgs = [], env = {} } = {}) {
+  const serverEnv = {
+    ...process.env,
+    HOME,
+    USERPROFILE: HOME,
+    HOMEDRIVE: "",
+    HOMEPATH: HOME,
+    XDG_CONFIG_HOME: path.join(HOME, ".config"),
+    XDG_CONFIG_DIRS: "",
+    DUALOG_ADAPTER_PATH: ADAPTER_DIR,
+    DUALOG_ROLE: "",
+    DUALOG_DEPTH: "",
+    DUALOG_MAX_DEPTH: "",
+    ...env,
+  };
+  const inheritedPath =
+    Object.entries(serverEnv).find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "";
+  for (const key of Object.keys(serverEnv)) {
+    if (key.toUpperCase() === "PATH") delete serverEnv[key];
+  }
+  serverEnv.PATH = [BIN_DIR, inheritedPath].filter(Boolean).join(path.delimiter);
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [...nodeArgs, SERVER_PATH],
     cwd: HOME,
-    env: {
-      ...process.env,
-      HOME,
-      USERPROFILE: HOME,
-      HOMEDRIVE: "",
-      HOMEPATH: HOME,
-      XDG_CONFIG_HOME: path.join(HOME, ".config"),
-      XDG_CONFIG_DIRS: "",
-      DUALOG_ADAPTER_PATH: ADAPTER_DIR,
-      DUALOG_ROLE: "",
-      DUALOG_DEPTH: "",
-      DUALOG_MAX_DEPTH: "",
-      ...env,
-    },
+    env: serverEnv,
     stderr: "ignore",
   });
   const client = new Client({ name: "pr-review-e2e", version: "1.0.0" }, { capabilities: {} });
@@ -612,6 +627,154 @@ test("send_message is accepted once the panel has reported", async (t) => {
     const sent = JSON.parse(text);
     assert.equal(sent.sent, true);
   });
+});
+
+test("native Windows review VCS resolution skips project-local git and gh shims", () => {
+  const project = "C:\\reviewed repo & $meta;";
+  const trusted = "C:\\Program Files\\Trusted VCS";
+  const env = {
+    Path: `"${project}";.;"${trusted}"`,
+    Pathext: ".CMD;.EXE",
+  };
+  const available = new Set([
+    `${project}\\git.CMD`,
+    `${project}\\git.EXE`,
+    `${project}\\gh.CMD`,
+    `${project}\\gh.EXE`,
+    `${trusted}\\git.EXE`,
+    `${trusted}\\gh.CMD`,
+  ]);
+
+  for (const [command, expected] of [
+    ["git", `${trusted}\\git.EXE`],
+    ["gh", `${trusted}\\gh.CMD`],
+  ]) {
+    const attempted = [];
+    const resolved = findBinary(command, env, {
+      platform: "win32",
+      excludedRoots: [project],
+      realpathSync: (candidate) => candidate,
+      accessSync(candidate) {
+        attempted.push(candidate);
+        if (!available.has(candidate)) {
+          throw Object.assign(new Error("missing"), { code: "ENOENT" });
+        }
+      },
+    });
+    assert.equal(resolved, expected);
+    assert.ok(
+      attempted.every((candidate) => !candidate.toLowerCase().startsWith(project.toLowerCase())),
+      `${command} resolution consulted a reviewed-project shim: ${JSON.stringify(attempted)}`
+    );
+  }
+});
+
+test("review handlers keep metacharacter paths and refs in Windows-compatible git argv", async (t) => {
+  const repoPath = path.join(ROOT, `review repo (argv) & $meta; ${Date.now()}`);
+  const branch = "feature/argv-$dollar&semi;";
+  const changedFile = "review file & $meta;.txt";
+  const stagedFile = "staged file (argv) & $meta;.txt";
+  const gitLog = path.join(ROOT, `git-${Date.now()}-${Math.random()}.jsonl`);
+  fs.mkdirSync(repoPath, { recursive: true });
+
+  const git = (args) =>
+    execFileSync("git", args, {
+      cwd: repoPath,
+      stdio: "ignore",
+      timeout: 30000,
+    });
+
+  git(["init"]);
+  git(["config", "user.email", "dualog-tests@example.invalid"]);
+  git(["config", "user.name", "Dualog Tests"]);
+  fs.writeFileSync(path.join(repoPath, changedFile), "base\n");
+  git(["add", "--", changedFile]);
+  git(["commit", "-m", "base"]);
+  git(["branch", "-M", "main"]);
+  git(["checkout", "-b", branch]);
+  fs.appendFileSync(path.join(repoPath, changedFile), "branch change\n");
+  git(["add", "--", changedFile]);
+  git(["commit", "-m", "branch change"]);
+  fs.writeFileSync(path.join(repoPath, stagedFile), "staged change\n");
+  git(["add", "--", stagedFile]);
+
+  await withServer(
+    t,
+    async (client) => {
+      const review = await callJson(client, "start_code_review", {
+        project_path: repoPath,
+        diff_target: "branch",
+        branch,
+        base_branch: "main",
+        partner_agent: "fake-e2e",
+        max_rounds: 1,
+      });
+      assert.equal(review.diff_label, `${branch} vs main`);
+
+      const panel = await callJson(client, "start_pr_review", {
+        project_path: repoPath,
+        diff_target: "staged",
+        aspects: ["code"],
+        partner_agent: "fake-e2e",
+        follow_up_rounds: 1,
+      });
+      assert.equal(panel.scope, "staged");
+
+      const gitCalls = fs
+        .readFileSync(gitLog, "utf-8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.deepEqual(
+        [...new Set(gitCalls.map((call) => call.cwd))],
+        [repoPath],
+        "the project path must travel as cwd, not as shell text"
+      );
+      assert.ok(
+        gitCalls.every((call) => path.isAbsolute(call.command)),
+        "every review Git call must use the pre-resolved absolute executable"
+      );
+      assert.ok(
+        gitCalls.every((call) => {
+          const relative = path.relative(repoPath, call.command);
+          return relative !== "" && (relative.startsWith("..") || path.isAbsolute(relative));
+        }),
+        "the reviewed repository must never supply the Git executable"
+      );
+
+      const recordedArgv = new Set(gitCalls.map((call) => JSON.stringify(call.args)));
+      for (const expected of [
+        ["rev-parse", "HEAD"],
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        ["check-ref-format", "--branch", "main"],
+        ["check-ref-format", "--branch", branch],
+        ["diff", "--end-of-options", `main...${branch}`],
+        ["diff", "--stat", "--end-of-options", `main...${branch}`],
+        ["diff", "--cached"],
+      ]) {
+        assert.ok(
+          recordedArgv.has(JSON.stringify(expected)),
+          `expected an exact git argv call: ${JSON.stringify(expected)}`
+        );
+      }
+    },
+    {
+      nodeArgs: ["--require", FAKE_VCS_PRELOAD],
+      env: { DUALOG_TEST_GIT_LOG: gitLog },
+    }
+  );
+});
+
+test("review Git calls have no implicit-shell fallback", () => {
+  const source = fs.readFileSync(SERVER_PATH, "utf-8").replace(/\r\n?/gu, "\n");
+  assert.doesNotMatch(source, /\bexecSync\s*\(/u);
+  assert.doesNotMatch(source, /import\s*\{[^}]*\bexecSync\b[^}]*\}\s*from\s*["']child_process["']/u);
+  assert.doesNotMatch(
+    source,
+    /execFileSync\(\s*["'](?:git|gh)["']/u,
+    "review VCS calls must execute the resolved absolute path, never a bare command"
+  );
+  assert.match(source, /findBinary\(command, process\.env, \{ excludedRoots: \[projectPath\] \}\)/u);
 });
 
 test("the live server safely resolves and refreshes a PR through gh", async (t) => {

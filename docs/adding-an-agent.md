@@ -11,7 +11,7 @@ $XDG_CONFIG_HOME/dualog/adapters/*.json  your adapters  (usually ~/.config/dualo
 ~/.dualog/adapters/*.json                legacy, honored only if the XDG dir is absent
 <gitRoot>/.dualog/adapters/*.json        project-local
 ./.dualog/adapters/*.json
-$DUALOG_ADAPTER_PATH                     colon-separated, highest precedence
+$DUALOG_ADAPTER_PATH                     path-list (`:` on macOS/Linux, `;` on Windows), highest precedence
 ```
 
 Manifests merge **by `id`**, so a file that reuses an existing id patches that
@@ -125,6 +125,23 @@ isolation used to point partner homes at the session directory, which is kept so
 a conversation can be reread later — so every session ever run retained a live
 copy of the partner's auth. A manifest that renders `{{sessionDir}}` into a
 config home is now refused at runtime rather than quietly retained.
+
+The scratch lease also defines an adapter lifecycle contract, for both
+`headless` and `tmux-interactive` engines:
+
+- The adapter command must remain in the foreground until every helper that uses,
+  or could recreate, its scratch credential home has exited.
+- Those helpers must keep the same user identity as the Dualog runner. Delegating
+  the scratch home through `sudo`, setuid, or another UID is unsupported.
+- Fork-and-exit launchers and handoff to a pre-existing or persistent external
+  daemon are unsupported. Once the recorded foreground process (and, for
+  headless POSIX turns, its recorded process group) is proven gone, Dualog may
+  remove the scratch lease.
+
+This contract is what makes per-turn cleanup portable. An adapter that needs a
+persistent daemon must keep credentials outside `{{scratchDir}}` and manage that
+daemon's lifecycle explicitly; Dualog cannot safely infer hidden daemon use from
+the foreground process ending.
 
 ### Directories go in `dirs`, settings go in `env`
 

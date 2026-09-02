@@ -17,11 +17,15 @@ import { loadRegistry, resetRegistry } from "../src/adapters/registry.mjs";
 import { writeFakeCli, writeFakeAdapter } from "./helpers/fake-cli.mjs";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "headless-engine-"));
+const TRUSTED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "headless-engine-tools-"));
 const ADAPTER_DIR = path.join(ROOT, "adapters");
-const BIN_DIR = path.join(ROOT, "bin");
+const BIN_DIR = path.join(TRUSTED_ROOT, "bin");
 fs.mkdirSync(BIN_DIR, { recursive: true });
 
-process.on("exit", () => fs.rmSync(ROOT, { recursive: true, force: true }));
+process.on("exit", () => {
+  fs.rmSync(ROOT, { recursive: true, force: true });
+  fs.rmSync(TRUSTED_ROOT, { recursive: true, force: true });
+});
 
 // One fake binary + adapter per behavior under test.
 const BEHAVIORS = ["sidecar-ok", "sidecar-error", "stdout-only", "silent", "crash", "hang"];
@@ -49,6 +53,14 @@ writeFakeAdapter(ADAPTER_DIR, "fake-stdin", path.join(BIN_DIR, "fake-sidecar-ok.
   promptDelivery: { headless: "stdin" },
   argv: { headless: [{ args: ["--run"] }] },
 });
+
+const PROJECT_BIN_DIR = path.join(ROOT, "project-bin");
+const projectLocalCli = writeFakeCli(
+  PROJECT_BIN_DIR,
+  "fake-project-local.mjs",
+  "sidecar-ok"
+);
+writeFakeAdapter(ADAPTER_DIR, "fake-project-local", projectLocalCli);
 
 resetRegistry();
 const REG = {
@@ -116,6 +128,13 @@ test("a well-behaved partner returns its sidecar result", async () => {
 
 test("prompt delivery over stdin works as well as over argv", async () => {
   assert.equal(await run("fake-stdin"), "FAKE PARTNER REPLY");
+});
+
+test("an explicit partner executable inside the reviewed project is rejected", async () => {
+  await assert.rejects(
+    run("fake-project-local"),
+    /not an executable absolute path or on an absolute PATH entry/u
+  );
 });
 
 test("a partner reporting an error surfaces it rather than the result text", async () => {

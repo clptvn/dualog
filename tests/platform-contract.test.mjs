@@ -28,6 +28,14 @@ import {
 } from "../src/platform.mjs";
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+// Generated child-process modules must import URLs, not native absolute paths:
+// `import("D:\\...")` is parsed as an unsupported `d:` URL scheme on Windows.
+const PLATFORM_MODULE_URL = new URL("../src/platform.mjs", import.meta.url).href;
+const SHARED_MODULE_URL = new URL("../src/shared.mjs", import.meta.url).href;
+const ADAPTER_ENV_MODULE_URL = new URL(
+  "../src/adapters/env.mjs",
+  import.meta.url
+).href;
 
 // --- session id validation --------------------------------------------------
 
@@ -85,7 +93,7 @@ function inTempHome(t, body) {
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const out = execFileSync(
     process.execPath,
-    ["-e", `import(${JSON.stringify(path.join(REPO_ROOT, "src/platform.mjs"))}).then(async (m) => { ${body} })`],
+    ["-e", `import(${JSON.stringify(PLATFORM_MODULE_URL)}).then(async (m) => { ${body} })`],
     {
       encoding: "utf-8",
       // os.homedir() reads HOME on POSIX but USERPROFILE (or HOMEDRIVE+HOMEPATH)
@@ -156,7 +164,7 @@ test("importing shared.mjs survives a home where the sessions root cannot be cre
 
   const res = spawnSync(
     process.execPath,
-    ["-e", `import(${JSON.stringify(path.join(REPO_ROOT, "src/shared.mjs"))}).then(() => console.log("IMPORT_OK"))`],
+    ["-e", `import(${JSON.stringify(SHARED_MODULE_URL)}).then(() => console.log("IMPORT_OK"))`],
     {
       encoding: "utf-8",
       env: {
@@ -201,7 +209,7 @@ test("EAGAIN mid-stream never discards bytes (portable, no pty required)", () =>
   `;
   const out = execFileSync(
     process.execPath,
-    ["-e", `import(${JSON.stringify(path.join(REPO_ROOT, "src/platform.mjs"))}).then(async (m) => { ${child} })`],
+    ["-e", `import(${JSON.stringify(PLATFORM_MODULE_URL)}).then(async (m) => { ${child} })`],
     { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }
   );
   const parsed = JSON.parse(out.trim());
@@ -283,7 +291,7 @@ test("readStdin returns a string rather than throwing when stdin is empty", () =
     process.execPath,
     [
       "-e",
-      `import(${JSON.stringify(path.join(REPO_ROOT, "src/platform.mjs"))}).then((m) => {
+      `import(${JSON.stringify(PLATFORM_MODULE_URL)}).then((m) => {
          const v = m.readStdin();
          console.log(JSON.stringify({ type: typeof v, len: v.length }));
        })`,
@@ -340,7 +348,7 @@ sys.stdout.write(out.decode(errors="replace"))
 
   const res = spawnSync(
     "python3",
-    ["-c", script, process.execPath, path.join(REPO_ROOT, "src/platform.mjs")],
+    ["-c", script, process.execPath, PLATFORM_MODULE_URL],
     { encoding: "utf-8", timeout: 30000 }
   );
 
@@ -484,7 +492,9 @@ test("the start handlers carry the RESOLVED model, not the requested one", () =>
   // spawning a real runner. The regression is precisely that `preflight.model`
   // was computed and then ignored while `preflight.effort` was used, so pin
   // that both are consumed and that the raw request is not what travels.
-  const src = fs.readFileSync(path.join(REPO_ROOT, "src/dialog-server.mjs"), "utf-8");
+  const src = fs
+    .readFileSync(path.join(REPO_ROOT, "src/dialog-server.mjs"), "utf-8")
+    .replace(/\r\n?/gu, "\n");
   assert.equal(
     (src.match(/const effectiveModel = preflight\.model;/g) || []).length,
     2,
@@ -536,7 +546,7 @@ function inThrowawayHome(body, { seedSession = true } = {}) {
     const home = ${JSON.stringify(home)};
     const sessionDir = ${JSON.stringify(sessionDir)};
     const repoRoot = ${JSON.stringify(REPO_ROOT)};
-    const m = await import(${JSON.stringify(path.join(REPO_ROOT, "src/platform.mjs"))});
+    const m = await import(${JSON.stringify(PLATFORM_MODULE_URL)});
     const fs = (await import("node:fs")).default;
     const path = (await import("node:path")).default;
     const out = [];
@@ -712,7 +722,7 @@ test("a relocation cannot be smuggled through a settings map, and every declared
   // Runs under a throwaway HOME because the boundary resolves the sessions root
   // from os.homedir() at call time.
   const { results } = inThrowawayHome(`
-    const env = await import(${JSON.stringify(path.join(REPO_ROOT, "src/adapters/env.mjs"))});
+    const env = await import(${JSON.stringify(ADAPTER_ENV_MODULE_URL)});
     const base = {
       id: "probe",
       configIsolation: {

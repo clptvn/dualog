@@ -7,7 +7,6 @@ import { createRequire } from "module";
 import { fileURLToPath } from "url";
 import {
   assertSafeConfigWriteTarget,
-  atomicWriteFile,
   buildClaudeMcpRegistration,
   buildWslLifecycleInvocation,
   effectiveExplicitWslSelection,
@@ -16,14 +15,18 @@ import {
   persistedWslEnv,
   preflightExplicitWslSelection,
   readJsonConfig,
-  removeMcpServerConfig,
   replaceMcpServerSection,
   resolveCodexPaths,
   runInstallProbe,
   validateExplicitWslSelection,
-  writeJsonConfig,
   wslArgs,
 } from "./install-utils.mjs";
+import {
+  InstallTransaction,
+  copyTreeContents,
+  fingerprintInstallPath,
+  recoverPendingInstallTransaction,
+} from "./install-transaction.mjs";
 import { runNpmInstallBootstrap } from "./npm-bootstrap.mjs";
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -36,9 +39,12 @@ const CLAUDE_HOOKS_ROOT = path.join(CLAUDE_DIR, "hooks");
 const CLAUDE_HOOKS_DIR = path.join(CLAUDE_HOOKS_ROOT, "dualog");
 const CLAUDE_HOOKS_PLATFORM = path.join(CLAUDE_HOOKS_ROOT, "dualog-platform.mjs");
 const CLAUDE_HOOKS_LEGACY_PLATFORM = path.join(CLAUDE_HOOKS_ROOT, "platform.mjs");
+const CLAUDE_HOOKS_RENAMED_LEGACY_PLATFORM = path.join(
+  CLAUDE_HOOKS_ROOT,
+  "codex-dialog-platform.mjs"
+);
 const CLAUDE_SETTINGS_JSON = path.join(CLAUDE_DIR, "settings.json");
 const CODEX_PATHS = resolveCodexPaths();
-const CODEX_DIR = CODEX_PATHS.root;
 const CODEX_SKILLS_DIR = CODEX_PATHS.skills;
 const CODEX_CONFIG_TOML = CODEX_PATHS.config;
 const SERVER_PATH = path.join(REPO_ROOT, "src", "dialog-server.mjs");
@@ -78,6 +84,47 @@ const HOOK_FILES = [
   "require-lgtm-or-cap.mjs",
 ];
 
+const LEGACY_SHELL_HOOK_FILES = [
+  "mark-needs-investigation.sh",
+  "clear-investigation.sh",
+  "enforce-investigation.sh",
+];
+
+const OWNED_HOOK_DIRECTORIES = [
+  CLAUDE_HOOKS_DIR,
+  path.join(CLAUDE_HOOKS_ROOT, LEGACY_HOOKS_DIR_NAME),
+];
+
+const OWNED_PLATFORM_HELPER_HEADERS = [
+  [
+    'import fs from "fs";',
+    'import os from "os";',
+    'import path from "path";',
+    "",
+    "// dualog platform helpers. Keep this file dependency-light because",
+    "// Claude hook scripts import it from the user-level hooks directory.",
+  ].join("\n"),
+  [
+    'import fs from "fs";',
+    'import os from "os";',
+    'import path from "path";',
+    "",
+    "// claude-codex-dialog platform helpers. Keep this file dependency-light because",
+    "// Claude hook scripts import it from the user-level hooks directory.",
+  ].join("\n"),
+];
+
+const LEGACY_MATCHERS = new Map([
+  ["mcp__codex-dialog__send_message", "mcp__dualog__send_message"],
+  ["mcp__codex-dialog__end_dialog", "mcp__dualog__end_dialog"],
+  ["mcp__codex-dialog__check_messages", "mcp__dualog__check_messages"],
+  [
+    "mcp__codex-dialog__wait_for_partner_response",
+    "mcp__dualog__wait_for_partner_response",
+  ],
+  ["mcp__codex-dialog__get_full_history", "mcp__dualog__get_full_history"],
+]);
+
 const CODEX_SKILLS = [
   "dualog-review-code",
   "dualog-review-pr",
@@ -94,6 +141,64 @@ const LEGACY_CODEX_SKILLS = [
   "claude-audit",
   "claude-ui-implementer",
 ];
+
+function ownedInstallPaths() {
+  return new Set([
+    CLAUDE_JSON,
+    CLAUDE_SETTINGS_JSON,
+    CODEX_CONFIG_TOML,
+    CLAUDE_HOOKS_DIR,
+    CLAUDE_HOOKS_PLATFORM,
+    CLAUDE_HOOKS_LEGACY_PLATFORM,
+    CLAUDE_HOOKS_RENAMED_LEGACY_PLATFORM,
+    path.join(CLAUDE_HOOKS_ROOT, LEGACY_HOOKS_DIR_NAME),
+    ...CLAUDE_COMMANDS.map((name) => path.join(CLAUDE_COMMANDS_DIR, `${name}.md`)),
+    ...LEGACY_CLAUDE_COMMANDS.map((name) =>
+      path.join(CLAUDE_COMMANDS_DIR, `${name}.md`)
+    ),
+    ...LEGACY_SHELL_HOOK_FILES.map((name) => path.join(CLAUDE_HOOKS_DIR, name)),
+    ...CODEX_SKILLS.map((name) => path.join(CODEX_SKILLS_DIR, name)),
+    ...LEGACY_CODEX_SKILLS.map((name) => path.join(CODEX_SKILLS_DIR, name)),
+  ]);
+}
+
+function snapshotConfigTarget(filePath) {
+  const before = assertSafeConfigWriteTarget(filePath);
+  const snapshot = {
+    targetPath: before?.targetPath ?? null,
+    fingerprint: before ? fingerprintInstallPath(before.targetPath) : null,
+    mode: before ? before.target.mode & 0o777 : 0o600,
+  };
+  return snapshot;
+}
+
+function assertConfigSnapshotUnchanged(filePath, snapshot) {
+  const after = assertSafeConfigWriteTarget(filePath);
+  const afterTarget = after?.targetPath ?? null;
+  if (
+    afterTarget !== snapshot.targetPath ||
+    (afterTarget !== null &&
+      fingerprintInstallPath(afterTarget) !== snapshot.fingerprint)
+  ) {
+    throw new Error(`Config changed while preparing install: ${filePath}`);
+  }
+}
+
+function readJsonSnapshot(filePath) {
+  const snapshot = snapshotConfigTarget(filePath);
+  const config = readJsonConfig(filePath);
+  assertConfigSnapshotUnchanged(filePath, snapshot);
+  return { ...snapshot, config };
+}
+
+function readTextSnapshot(filePath) {
+  const snapshot = snapshotConfigTarget(filePath);
+  const content = snapshot.targetPath
+    ? fs.readFileSync(snapshot.targetPath, "utf-8")
+    : "";
+  assertConfigSnapshotUnchanged(filePath, snapshot);
+  return { ...snapshot, content };
+}
 
 function parseMode(argv) {
   let installClaude = true;
@@ -151,104 +256,207 @@ function createStepLogger(totalSteps) {
   };
 }
 
-/**
- * Remove pre-rename artifacts.
- *
- * The tool namespace moved from mcp__codex-dialog__* to mcp__dualog__*, so a
- * leftover command file or hook matcher does not merely look untidy -- it calls
- * tools that no longer exist. Clearing them is part of installing, not an
- * optional tidy-up.
- */
-function removeLegacyInstall() {
-  let removed = 0;
-
-  for (const name of LEGACY_CLAUDE_COMMANDS) {
-    const file = path.join(CLAUDE_COMMANDS_DIR, `${name}.md`);
-    if (fs.existsSync(file)) {
-      fs.rmSync(file, { force: true });
-      console.log(`  removed legacy command ${name}`);
-      removed++;
-    }
+function removeMcpKeys(config, keys) {
+  const servers = config?.mcpServers;
+  if (servers === null || (typeof servers !== "object" && typeof servers !== "function")) {
+    return false;
   }
-
-  for (const name of LEGACY_CODEX_SKILLS) {
-    const dir = path.join(CODEX_SKILLS_DIR, name);
-    if (fs.existsSync(dir)) {
-      fs.rmSync(dir, { recursive: true, force: true });
-      console.log(`  removed legacy skill ${name}`);
-      removed++;
-    }
+  let changed = false;
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(servers, key)) continue;
+    delete servers[key];
+    changed = true;
   }
+  if (changed && Object.keys(servers).length === 0) delete config.mcpServers;
+  return changed;
+}
 
-  const legacyHooks = path.join(CLAUDE_HOOKS_ROOT, LEGACY_HOOKS_DIR_NAME);
-  if (fs.existsSync(legacyHooks)) {
-    fs.rmSync(legacyHooks, { recursive: true, force: true });
-    console.log(`  removed legacy hooks directory ${LEGACY_HOOKS_DIR_NAME}`);
-    removed++;
-  }
-  const legacyPlatform = path.join(CLAUDE_HOOKS_ROOT, "codex-dialog-platform.mjs");
-  if (fs.existsSync(legacyPlatform)) {
-    fs.rmSync(legacyPlatform, { force: true });
-    removed++;
-  }
-
-  // Claude MCP registration
+function samePath(left, right) {
   try {
-    if (fs.existsSync(CLAUDE_JSON)) {
-      const config = readJsonConfig(CLAUDE_JSON);
-      if (config?.mcpServers?.[LEGACY_MCP_KEY]) {
-        delete config.mcpServers[LEGACY_MCP_KEY];
-        writeJsonConfig(CLAUDE_JSON, config);
-        console.log(`  removed legacy MCP registration "${LEGACY_MCP_KEY}" from ~/.claude.json`);
-        removed++;
+    const normalizedLeft = path.resolve(left);
+    const normalizedRight = path.resolve(right);
+    return process.platform === "win32"
+      ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+      : normalizedLeft === normalizedRight;
+  } catch {
+    return false;
+  }
+}
+
+/** Parse only the simple two-token command shape emitted by Dualog installers. */
+function tokenizeHookCommand(command) {
+  const tokens = [];
+  let token = "";
+  let quote = null;
+  let active = false;
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index];
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+        continue;
       }
+      if (
+        process.platform !== "win32" &&
+        quote === '"' &&
+        char === "\\" &&
+        index + 1 < command.length &&
+        ['"', "\\", "$", "`"].includes(command[index + 1])
+      ) {
+        token += command[++index];
+        active = true;
+        continue;
+      }
+      token += char;
+      active = true;
+      continue;
     }
-  } catch (err) {
-    console.log(`  warning: could not clean ~/.claude.json: ${err.message}`);
+    if (char === '"' || char === "'") {
+      quote = char;
+      active = true;
+      continue;
+    }
+    if (/\s/u.test(char)) {
+      if (active) {
+        tokens.push(token);
+        token = "";
+        active = false;
+      }
+      continue;
+    }
+    if (char === "\\" && index + 1 < command.length) {
+      if (process.platform === "win32") token += char;
+      else token += command[++index];
+      active = true;
+      continue;
+    }
+    token += char;
+    active = true;
+  }
+  if (quote) return null;
+  if (active) tokens.push(token);
+  return tokens;
+}
+
+function isOwnedHookCommand(
+  command,
+  { directories = OWNED_HOOK_DIRECTORIES, fileNames = [...HOOK_FILES, ...LEGACY_SHELL_HOOK_FILES] } = {}
+) {
+  if (typeof command !== "string") return false;
+
+  // Shell installers before the Windows-safe rewrite emitted this exact raw
+  // shape. It was unusable when HOME contained spaces, but remains ours to
+  // migrate. Full equality prevents substring or extra-argument ownership.
+  for (const directory of directories) {
+    for (const fileName of fileNames) {
+      const executable = fileName.endsWith(".sh") ? "bash" : "node";
+      if (command === `${executable} ${path.join(directory, fileName)}`) return true;
+    }
   }
 
-  // Codex MCP registration
-  try {
-    if (fs.existsSync(CODEX_CONFIG_TOML)) {
-      const toml = fs.readFileSync(CODEX_CONFIG_TOML, "utf-8");
-      const stripped = removeMcpServerConfig(toml, [LEGACY_MCP_KEY]);
-      if (stripped !== toml) {
-        atomicWriteFile(CODEX_CONFIG_TOML, stripped);
-        console.log(
-          `  removed old Dualog MCP registrations from ${CODEX_CONFIG_TOML}`
+  const tokens = tokenizeHookCommand(command);
+  if (!tokens || tokens.length !== 2) return false;
+  const executable = tokens[0].replaceAll("\\", "/").split("/").at(-1)?.toLowerCase();
+  return directories.some((directory) =>
+    fileNames.some((fileName) => {
+      const validExecutables = fileName.endsWith(".sh")
+        ? ["bash", "bash.exe"]
+        : ["node", "node.exe"];
+      return (
+        (validExecutables.includes(executable) ||
+          (!fileName.endsWith(".sh") && samePath(tokens[0], NODE_PATH))) &&
+        samePath(tokens[1], path.join(directory, fileName))
+      );
+    })
+  );
+}
+
+function hasOwnedPlatformHelperHeader(content) {
+  const normalized = content.replace(/^\uFEFF/u, "").replaceAll("\r\n", "\n");
+  return OWNED_PLATFORM_HELPER_HEADERS.some((header) => normalized.startsWith(header));
+}
+
+function migrateLegacySettings(config) {
+  let changed = removeMcpKeys(config, ["dualog", LEGACY_MCP_KEY]);
+  const legacyDirectory = path.join(CLAUDE_HOOKS_ROOT, LEGACY_HOOKS_DIR_NAME);
+  if (config?.hooks === null || typeof config?.hooks !== "object") return changed;
+
+  let hookStructureChanged = false;
+  for (const key of ["PreToolUse", "PostToolUse"]) {
+    if (!Array.isArray(config.hooks[key])) continue;
+    const migrated = [];
+    let keyChanged = false;
+    for (const original of config.hooks[key]) {
+      if (original === null || typeof original !== "object") {
+        migrated.push(original);
+        continue;
+      }
+      let entry = original;
+      const replacementMatcher = LEGACY_MATCHERS.get(original.matcher);
+      if (replacementMatcher) {
+        entry = { ...entry, matcher: replacementMatcher };
+        changed = true;
+        keyChanged = true;
+      }
+      if (Array.isArray(original.hooks)) {
+        const hooks = original.hooks.filter(
+          (hook) =>
+            !isOwnedHookCommand(hook?.command, {
+              directories: [legacyDirectory],
+            })
         );
-        removed++;
+        if (hooks.length !== original.hooks.length) {
+          changed = true;
+          keyChanged = true;
+          entry = { ...entry, hooks };
+          if (hooks.length === 0) continue;
+        }
+      }
+      migrated.push(entry);
+    }
+    if (!keyChanged) continue;
+    hookStructureChanged = true;
+    if (migrated.length === 0) delete config.hooks[key];
+    else config.hooks[key] = migrated;
+  }
+  if (hookStructureChanged && Object.keys(config.hooks).length === 0) delete config.hooks;
+  return changed;
+}
+
+function stageLegacyInstall(transaction, mode) {
+  let staged = 0;
+  if (mode.installClaude) {
+    for (const name of LEGACY_CLAUDE_COMMANDS) {
+      if (transaction.stageDelete(path.join(CLAUDE_COMMANDS_DIR, `${name}.md`))) {
+        staged++;
       }
     }
-  } catch (err) {
-    console.log(`  warning: could not clean ~/.codex/config.toml: ${err.message}`);
-  }
-
-  // Hook matchers referencing the old tool namespace.
-  try {
-    if (fs.existsSync(CLAUDE_SETTINGS_JSON)) {
-      const raw = fs.readFileSync(CLAUDE_SETTINGS_JSON, "utf-8");
-      if (raw.includes("mcp__codex-dialog__") || raw.includes("hooks/codex-dialog/")) {
-        // Validate before touching the file. String replacement preserves
-        // unrelated formatting, but malformed JSON must never be overwritten.
-        readJsonConfig(CLAUDE_SETTINGS_JSON);
-        atomicWriteFile(
-          CLAUDE_SETTINGS_JSON,
-          raw
-            .replaceAll("mcp__codex-dialog__", "mcp__dualog__")
-            .replaceAll("hooks/codex-dialog/", "hooks/dualog/")
-            .replaceAll("codex-dialog-platform.mjs", "dualog-platform.mjs")
-        );
-        console.log("  rewrote legacy hook matchers in ~/.claude/settings.json");
-        removed++;
+    if (
+      transaction.stageDelete(
+        path.join(CLAUDE_HOOKS_ROOT, LEGACY_HOOKS_DIR_NAME)
+      )
+    ) {
+      staged++;
+    }
+    for (const filePath of [
+      CLAUDE_HOOKS_RENAMED_LEGACY_PLATFORM,
+      CLAUDE_HOOKS_LEGACY_PLATFORM,
+    ]) {
+      if (!fs.existsSync(filePath)) continue;
+      const content = fs.readFileSync(filePath, "utf-8");
+      if (hasOwnedPlatformHelperHeader(content) && transaction.stageDelete(filePath)) {
+        staged++;
       }
     }
-  } catch (err) {
-    console.log(`  warning: could not clean settings.json: ${err.message}`);
   }
-
-  if (removed === 0) console.log("  no pre-rename artifacts found OK");
-  return removed;
+  if (mode.installCodex) {
+    for (const name of LEGACY_CODEX_SKILLS) {
+      if (transaction.stageDelete(path.join(CODEX_SKILLS_DIR, name))) staged++;
+    }
+  }
+  if (staged === 0) console.log("  no pre-rename artifacts found OK");
+  else console.log(`  staged ${staged} pre-rename artifact(s) for transactional cleanup OK`);
+  return staged;
 }
 
 function checkNode() {
@@ -259,8 +467,8 @@ function checkNode() {
   console.log(`  Node.js ${process.version} OK`);
 }
 
-function runNpmInstall() {
-  runNpmInstallBootstrap({ cwd: REPO_ROOT });
+async function runNpmInstall() {
+  await runNpmInstallBootstrap({ cwd: REPO_ROOT });
 }
 
 function dependencyAvailable(name) {
@@ -272,13 +480,13 @@ function dependencyAvailable(name) {
   }
 }
 
-function ensureDependencies() {
+async function ensureDependencies() {
   let missing = RUNTIME_DEPENDENCY_PROBES.filter(([, probe]) => !dependencyAvailable(probe));
   if (missing.length === 0) {
     console.log("  Dependencies already installed OK");
     return;
   }
-  runNpmInstall();
+  await runNpmInstall();
   missing = RUNTIME_DEPENDENCY_PROBES.filter(([, probe]) => !dependencyAvailable(probe));
   if (missing.length > 0) {
     throw new Error(
@@ -290,11 +498,13 @@ function ensureDependencies() {
   console.log("  Dependencies installed OK");
 }
 
-function prevalidateConfigTargets() {
-  for (const filePath of [CLAUDE_JSON, CLAUDE_SETTINGS_JSON]) {
-    readJsonConfig(filePath);
+function prevalidateConfigTargets(mode) {
+  if (mode.installClaude) {
+    for (const filePath of [CLAUDE_JSON, CLAUDE_SETTINGS_JSON]) {
+      readJsonConfig(filePath);
+    }
   }
-  assertSafeConfigWriteTarget(CODEX_CONFIG_TOML);
+  if (mode.installCodex) assertSafeConfigWriteTarget(CODEX_CONFIG_TOML);
 }
 
 async function loadSpawn() {
@@ -349,81 +559,63 @@ function hookCommand(fileName) {
   return `${shellQuote(NODE_PATH)} ${shellQuote(path.join(CLAUDE_HOOKS_DIR, fileName))}`;
 }
 
-function removeOwnedPlatformHelper(filePath) {
-  if (!fs.existsSync(filePath)) return;
-  try {
-    const content = fs.readFileSync(filePath, "utf-8");
-    if (content.includes("dualog platform helpers")) {
-      fs.rmSync(filePath, { force: true });
-    }
-  } catch {}
-}
-
-function installHookFile(fileName) {
-  const sourcePath = path.join(REPO_ROOT, "src", "hooks", fileName);
-  const targetPath = path.join(CLAUDE_HOOKS_DIR, fileName);
-  const content = fs
-    .readFileSync(sourcePath, "utf-8")
-    .replaceAll("../platform.mjs", "../dualog-platform.mjs");
-  fs.writeFileSync(targetPath, content);
-}
-
-function installSharedFile() {
-  const sourcePath = path.join(REPO_ROOT, "src", "shared.mjs");
-  const targetPath = path.join(CLAUDE_HOOKS_DIR, "shared.mjs");
-  const content = fs
-    .readFileSync(sourcePath, "utf-8")
-    .replaceAll("./platform.mjs", "../dualog-platform.mjs");
-  fs.writeFileSync(targetPath, content);
-}
-
-function registerClaudeMcp(cliStatus, logStep) {
-  console.log("");
-  logStep("Registering MCP server for Claude...");
-  const config = readJsonConfig(CLAUDE_JSON);
-  if (!config.mcpServers) config.mcpServers = {};
-  config.mcpServers["dualog"] = buildClaudeMcpRegistration({
-    serverPath: SERVER_PATH,
-    nodePath: NODE_PATH,
-    cliStatus,
-  });
-  writeJsonConfig(CLAUDE_JSON, config);
-  console.log(`  MCP server written atomically to ${CLAUDE_JSON} OK`);
-}
-
-function installClaudeCommandsAndHooks(logStep) {
-  console.log("");
-  logStep("Installing Claude commands and hooks...");
-
-  fs.mkdirSync(CLAUDE_COMMANDS_DIR, { recursive: true });
-  for (const command of CLAUDE_COMMANDS) {
-    fs.copyFileSync(
-      path.join(REPO_ROOT, ".claude", "commands", `${command}.md`),
-      path.join(CLAUDE_COMMANDS_DIR, `${command}.md`)
+function upsertOwnedHookEntry(
+  entries,
+  desired,
+  ownedFileNames,
+  directories = [CLAUDE_HOOKS_DIR]
+) {
+  let replacementIndex = -1;
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry?.matcher !== desired.matcher || !Array.isArray(entry.hooks)) continue;
+    const unrelated = entry.hooks.filter(
+      (hook) =>
+        !isOwnedHookCommand(hook?.command, { directories, fileNames: ownedFileNames })
     );
-    console.log(`  /${command} OK`);
+    if (unrelated.length === entry.hooks.length) continue;
+    if (replacementIndex < 0) {
+      entries[index] = { ...entry, hooks: [...desired.hooks, ...unrelated] };
+      replacementIndex = index;
+    } else if (unrelated.length > 0) {
+      entries[index] = { ...entry, hooks: unrelated };
+    } else {
+      entries.splice(index, 1);
+    }
   }
+  if (replacementIndex < 0) entries.push(desired);
+}
 
-  fs.mkdirSync(CLAUDE_HOOKS_DIR, { recursive: true });
-  fs.copyFileSync(path.join(REPO_ROOT, "src", "platform.mjs"), CLAUDE_HOOKS_PLATFORM);
-  installSharedFile();
-  for (const fileName of HOOK_FILES) {
-    installHookFile(fileName);
+function removeOwnedHookFromMatchers(
+  entries,
+  matchers,
+  ownedFileNames,
+  directories = [CLAUDE_HOOKS_DIR]
+) {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (!matchers.has(entry?.matcher) || !Array.isArray(entry.hooks)) continue;
+    const hooks = entry.hooks.filter(
+      (hook) =>
+        !isOwnedHookCommand(hook?.command, { directories, fileNames: ownedFileNames })
+    );
+    if (hooks.length === entry.hooks.length) continue;
+    if (hooks.length === 0) entries.splice(index, 1);
+    else entries[index] = { ...entry, hooks };
   }
-  removeOwnedPlatformHelper(CLAUDE_HOOKS_LEGACY_PLATFORM);
+}
 
-  for (const oldHook of [
-    "mark-needs-investigation.sh",
-    "clear-investigation.sh",
-    "enforce-investigation.sh",
-  ]) {
-    try {
-      fs.rmSync(path.join(CLAUDE_HOOKS_DIR, oldHook), { force: true });
-    } catch {}
+function writeStagedSource(sourcePath, targetPath, transform = (content) => content) {
+  const stat = fs.statSync(sourcePath);
+  const content = transform(fs.readFileSync(sourcePath));
+  fs.writeFileSync(targetPath, content, { mode: stat.mode & 0o777 });
+}
+
+function updateClaudeSettings(config) {
+  migrateLegacySettings(config);
+  if (!config.hooks || typeof config.hooks !== "object" || Array.isArray(config.hooks)) {
+    config.hooks = {};
   }
-
-  const config = readJsonConfig(CLAUDE_SETTINGS_JSON);
-  if (!config.hooks) config.hooks = {};
 
   if (!Array.isArray(config.hooks.PreToolUse)) config.hooks.PreToolUse = [];
   const preHooks = config.hooks.PreToolUse;
@@ -441,88 +633,150 @@ function installClaudeCommandsAndHooks(logStep) {
     },
   ];
 
-  for (const entry of preEntries) {
-    const idx = preHooks.findIndex((h) => h.matcher === entry.matcher);
-    if (idx >= 0) preHooks[idx] = entry;
-    else preHooks.push(entry);
-  }
+  upsertOwnedHookEntry(preHooks, preEntries[0], [
+    "enforce-investigation.mjs",
+    "enforce-resolution.mjs",
+    "enforce-investigation.sh",
+  ]);
+  upsertOwnedHookEntry(preHooks, preEntries[1], ["require-lgtm-or-cap.mjs"]);
 
   if (!Array.isArray(config.hooks.PostToolUse)) config.hooks.PostToolUse = [];
   const postHooks = config.hooks.PostToolUse;
-
   for (const matcher of [
     "mcp__dualog__check_messages",
     "mcp__dualog__wait_for_partner_response",
     "mcp__dualog__get_full_history",
   ]) {
-    const entry = {
-      matcher,
-      hooks: [{ type: "command", command: hookCommand("mark-needs-investigation.mjs") }],
-    };
-    const idx = postHooks.findIndex(
-      (h) => h.matcher === matcher && h.hooks?.[0]?.command?.includes("mark-needs")
+    upsertOwnedHookEntry(
+      postHooks,
+      {
+        matcher,
+        hooks: [{ type: "command", command: hookCommand("mark-needs-investigation.mjs") }],
+      },
+      ["mark-needs-investigation.mjs", "mark-needs-investigation.sh"]
     );
-    if (idx >= 0) postHooks[idx] = entry;
-    else postHooks.push(entry);
   }
-
-  const clearEntry = {
-    matcher: "Read",
-    hooks: [{ type: "command", command: hookCommand("clear-investigation.mjs") }],
-  };
-  const clearIdx = postHooks.findIndex(
-    (h) => h.matcher === "Read" && h.hooks?.[0]?.command?.includes("clear-investigation")
+  upsertOwnedHookEntry(
+    postHooks,
+    {
+      matcher: "Read",
+      hooks: [{ type: "command", command: hookCommand("clear-investigation.mjs") }],
+    },
+    ["clear-investigation.mjs", "clear-investigation.sh"]
   );
-  if (clearIdx >= 0) postHooks[clearIdx] = clearEntry;
-  else postHooks.push(clearEntry);
-
-  for (let i = postHooks.length - 1; i >= 0; i--) {
-    if (
-      (postHooks[i].matcher === "Grep" || postHooks[i].matcher === "Glob") &&
-      postHooks[i].hooks?.[0]?.command?.includes("clear-investigation")
-    ) {
-      postHooks.splice(i, 1);
-    }
-  }
-
-  writeJsonConfig(CLAUDE_SETTINGS_JSON, config);
-  console.log("  Claude hooks installed OK");
+  removeOwnedHookFromMatchers(
+    postHooks,
+    new Set(["Grep", "Glob"]),
+    ["clear-investigation.mjs", "clear-investigation.sh"]
+  );
+  return config;
 }
 
-function registerCodexMcp(cliStatus, logStep) {
+function stageClaudeRegistrations(transaction, cliStatus, logStep) {
   console.log("");
-  logStep("Registering MCP server for Codex...");
+  logStep("Registering MCP server for Claude...");
+  const claude = readJsonSnapshot(CLAUDE_JSON);
+  if (
+    !claude.config.mcpServers ||
+    typeof claude.config.mcpServers !== "object" ||
+    Array.isArray(claude.config.mcpServers)
+  ) {
+    claude.config.mcpServers = {};
+  }
+  removeMcpKeys(claude.config, [LEGACY_MCP_KEY]);
+  claude.config.mcpServers.dualog = buildClaudeMcpRegistration({
+    serverPath: SERVER_PATH,
+    nodePath: NODE_PATH,
+    cliStatus,
+  });
+  transaction.stageFile(CLAUDE_JSON, `${JSON.stringify(claude.config, null, 2)}\n`, {
+    targetPath: claude.targetPath,
+    mode: claude.mode,
+    expectedOriginalFingerprint: claude.fingerprint,
+  });
 
-  fs.mkdirSync(CODEX_DIR, { recursive: true });
-  let content = "";
-  if (fs.existsSync(CODEX_CONFIG_TOML)) {
-    content = fs.readFileSync(CODEX_CONFIG_TOML, "utf-8");
+  const settings = readJsonSnapshot(CLAUDE_SETTINGS_JSON);
+  updateClaudeSettings(settings.config);
+  transaction.stageFile(
+    CLAUDE_SETTINGS_JSON,
+    `${JSON.stringify(settings.config, null, 2)}\n`,
+    {
+      targetPath: settings.targetPath,
+      mode: settings.mode,
+      expectedOriginalFingerprint: settings.fingerprint,
+    }
+  );
+  console.log("  Claude registration and settings staged atomically OK");
+}
+
+function stageClaudeCommandsAndHooks(transaction, logStep) {
+  console.log("");
+  logStep("Installing Claude commands and hooks...");
+
+  for (const command of CLAUDE_COMMANDS) {
+    const source = path.join(REPO_ROOT, ".claude", "commands", `${command}.md`);
+    transaction.stageFile(
+      path.join(CLAUDE_COMMANDS_DIR, `${command}.md`),
+      fs.readFileSync(source),
+      { mode: fs.statSync(source).mode & 0o777 }
+    );
+    console.log(`  /${command} OK`);
   }
 
-  atomicWriteFile(
+  const platformSource = path.join(REPO_ROOT, "src", "platform.mjs");
+  transaction.stageFile(CLAUDE_HOOKS_PLATFORM, fs.readFileSync(platformSource), {
+    mode: fs.statSync(platformSource).mode & 0o777,
+  });
+  transaction.stageTree(CLAUDE_HOOKS_DIR, (stage) => {
+    const sharedSource = path.join(REPO_ROOT, "src", "shared.mjs");
+    writeStagedSource(sharedSource, path.join(stage, "shared.mjs"), (content) =>
+      Buffer.from(
+        content.toString("utf-8").replaceAll("./platform.mjs", "../dualog-platform.mjs")
+      )
+    );
+    for (const fileName of HOOK_FILES) {
+      const source = path.join(REPO_ROOT, "src", "hooks", fileName);
+      writeStagedSource(source, path.join(stage, fileName), (content) =>
+        Buffer.from(
+          content.toString("utf-8").replaceAll("../platform.mjs", "../dualog-platform.mjs")
+        )
+      );
+    }
+  });
+  console.log("  Claude command and complete hook generation staged OK");
+}
+
+function stageCodexRegistration(transaction, cliStatus, logStep) {
+  console.log("");
+  logStep("Registering MCP server for Codex...");
+  const config = readTextSnapshot(CODEX_CONFIG_TOML);
+  transaction.stageFile(
     CODEX_CONFIG_TOML,
-    replaceMcpServerSection(content, {
+    replaceMcpServerSection(config.content, {
       serverPath: SERVER_PATH,
       nodePath: NODE_PATH,
       env: persistedWslEnv(cliStatus),
-    })
+    }),
+    {
+      targetPath: config.targetPath,
+      mode: config.mode,
+      expectedOriginalFingerprint: config.fingerprint,
+    }
   );
-  console.log(`  MCP server written atomically to ${CODEX_CONFIG_TOML} OK`);
+  console.log(`  MCP server staged atomically for ${CODEX_CONFIG_TOML} OK`);
 }
 
-function installCodexSkills(logStep) {
+function stageCodexSkills(transaction, logStep) {
   console.log("");
   logStep("Installing Codex skills...");
-
-  fs.mkdirSync(CODEX_SKILLS_DIR, { recursive: true });
   for (const skill of CODEX_SKILLS) {
     const target = path.join(CODEX_SKILLS_DIR, skill);
-    fs.rmSync(target, { recursive: true, force: true });
-    fs.cpSync(path.join(REPO_ROOT, "dualog-skills", skill), target, {
-      recursive: true,
+    transaction.stageTree(target, (stage) => {
+      copyTreeContents(path.join(REPO_ROOT, "dualog-skills", skill), stage);
     });
     console.log(`  /${skill} OK`);
   }
+  console.log("  Codex skill generations staged for atomic replacement OK");
 }
 
 function modeArgument(mode) {
@@ -698,29 +952,42 @@ function printSummary(mode, cliStatus, { wslConfigured = false } = {}) {
 async function main() {
   const mode = parseMode(process.argv.slice(2));
 
-  console.log("dualog installer");
-  console.log("");
-  console.log(` Mode: ${modeLabel(mode)}`);
-  console.log("");
+  if (
+    recoverPendingInstallTransaction({
+      home: HOME_DIR,
+      allowedLogicalPaths: ownedInstallPaths(),
+    })
+  ) {
+    console.log("Recovered an interrupted Dualog install transaction OK");
+  }
+
+  // Acquire the installer generation before dependency bootstrap, WSL setup,
+  // directory creation, or any other fallible step that may mutate state.
+  const transaction = new InstallTransaction({
+    home: HOME_DIR,
+    allowedLogicalPaths: ownedInstallPaths(),
+  });
+  try {
+
+    console.log("dualog installer");
+    console.log("");
+    console.log(` Mode: ${modeLabel(mode)}`);
+    console.log("");
 
   const logStep = createStepLogger(plannedStepCount(mode));
 
   logStep("Checking prerequisites...");
   checkNode();
   // Explicit Windows routing is a hard prerequisite. Check it before legacy
-  // migration or dependency installation can mutate the repository/user home.
+  // cleanup or dependency installation can mutate the repository/user home.
   await preflightExplicitWslSelection(mode, { cwd: REPO_ROOT });
-  // Migration removes files as well as rewriting configs. Validate every JSON
-  // target first so malformed user data produces zero partial mutations.
-  prevalidateConfigTargets();
-
-  console.log("");
-  logStep("Migrating any pre-rename install...");
-  removeLegacyInstall();
+  // Validate only the selected hosts. A broken Codex config must not block a
+  // Claude-only install, and vice versa.
+  prevalidateConfigTargets(mode);
 
   console.log("");
   logStep("Installing dependencies...");
-  ensureDependencies();
+  await ensureDependencies();
 
   const spawn = await loadSpawn();
   const cliStatus = await checkPartnerClis(spawn, logStep, mode);
@@ -733,17 +1000,28 @@ async function main() {
       ? await configureWslHosts(spawn, mode, cliStatus, logStep)
       : false;
 
-  if (mode.installClaude) {
-    registerClaudeMcp(cliStatus, logStep);
-    installClaudeCommandsAndHooks(logStep);
+    // Build every selected generation before touching any live artifact. The
+    // transaction retains same-directory backups until both selected hosts and
+    // every config have committed and verified.
+    if (mode.installClaude) stageClaudeCommandsAndHooks(transaction, logStep);
+    if (mode.installCodex) stageCodexSkills(transaction, logStep);
+
+    console.log("");
+    logStep("Cleaning up any pre-rename install...");
+    stageLegacyInstall(transaction, mode);
+
+    // Configs commit last so an old registration remains usable until all
+    // command, hook, and skill generations are already in place. Any failure,
+    // including the second host of --both, rolls the complete transaction back.
+    if (mode.installClaude) stageClaudeRegistrations(transaction, cliStatus, logStep);
+    if (mode.installCodex) stageCodexRegistration(transaction, cliStatus, logStep);
+    transaction.commit();
+    printSummary(mode, cliStatus, { wslConfigured });
+  } catch (error) {
+    transaction.abort();
+    throw error;
   }
 
-  if (mode.installCodex) {
-    registerCodexMcp(cliStatus, logStep);
-    installCodexSkills(logStep);
-  }
-
-  printSummary(mode, cliStatus, { wslConfigured });
 }
 
 main().catch((err) => {

@@ -6,6 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 import {
+  inspectWslPartnerCommand,
   isWindowsPath,
   parseWslUncPath,
   prepareTmuxInvocation,
@@ -13,12 +14,14 @@ import {
   probeWslPartnerCommand,
   resolveTmuxProjectContext,
   resolveWslLoginShell,
+  resolveWslPartnerExecutable,
   seedWslCodexAuth,
   terminateTmuxSession,
   tmuxPaneProcessStartTime,
   probeTmuxSessionSync,
   tmuxRoute,
   translateTmuxPath,
+  WSL_PARTNER_EXECUTABLE_RESOLVE_SCRIPT,
 } from "../src/tmux-runtime.mjs";
 import {
   probePartnerPaneProcess,
@@ -35,9 +38,49 @@ const WSL_ROUTE = Object.freeze({
 
 test("native Windows uses the configured WSL distribution for tmux", () => {
   assert.deepEqual(
-    tmuxRoute({ platform: "win32", env: { DUALOG_WSL_DISTRO: "Ubuntu" } }),
-    WSL_ROUTE
+    tmuxRoute({
+      platform: "win32",
+      env: { SystemRoot: "C:\\Windows", DUALOG_WSL_DISTRO: "Ubuntu" },
+    }),
+    {
+      ...WSL_ROUTE,
+      command: "C:\\Windows\\System32\\wsl.exe",
+    }
   );
+});
+
+test("native Windows resolves bare default WSL through trusted System32 only", () => {
+  assert.equal(
+    tmuxRoute({
+      platform: "win32",
+      env: {
+        SystemRoot: "D:\\WinNT",
+        PATH: "C:\\attacker",
+        DUALOG_WSL_BINARY: "wsl.exe",
+      },
+    }).command,
+    "D:\\WinNT\\System32\\wsl.exe"
+  );
+
+  for (const systemRoot of [
+    undefined,
+    "C:\\Users\\test\\Windows",
+    "C:\\Windows\\..\\Temp",
+    '"C:\\Windows"',
+    "C:\\Windows:payload",
+  ]) {
+    assert.throws(
+      () =>
+        tmuxRoute({
+          platform: "win32",
+          env: {
+            ...(systemRoot === undefined ? {} : { SystemRoot: systemRoot }),
+            DUALOG_WSL_BINARY: "wsl.exe",
+          },
+        }),
+      /SystemRoot did not resolve to a trusted top-level Windows System32 directory/u
+    );
+  }
 });
 
 test("native macOS and Linux retain the local tmux route", () => {
@@ -440,6 +483,100 @@ test("partner runtime context keeps explicit headless execution host-native", as
   assert.equal(Object.isFrozen(context), true);
 });
 
+test("the four Codex and Claude Windows/WSL partner topologies keep their intended route", async () => {
+  for (const [label, partnerAgent, partnerCommand, resolvedCommand] of [
+    ["Codex Desktop -> Claude WSL", "claude", "claude", "/opt/claude/bin/claude"],
+    ["Claude Desktop -> Codex WSL", "codex", "codex", "/opt/codex/bin/codex"],
+  ]) {
+    const context = await resolvePartnerRuntimeContext(
+      {
+        partnerAgent,
+        partnerCommand,
+        projectPath: "C:\\reviewed",
+      },
+      {
+        platform: "win32",
+        tmuxRouteFn: () => WSL_ROUTE,
+        resolveWslLoginShellFn: async () => "/bin/bash",
+        resolveRunnableEngineFn: async (adapter, options) => {
+          assert.equal(
+            await options.probeWslPartnerCommandFn(
+              partnerCommand,
+              adapter.binary.versionArgs
+            ),
+            "available",
+            label
+          );
+          return "tmux-interactive";
+        },
+        probeWslPartnerCommandFn: async (command, _versionArgs, { route }) => {
+          assert.equal(command, resolvedCommand, label);
+          assert.equal(route.distro, "Ubuntu", label);
+          return "available";
+        },
+        resolveTmuxProjectContextFn: async (hostProjectPath, { route }) => ({
+          hostProjectPath,
+          partnerProjectPath: "/mnt/c/reviewed",
+          tmuxTransport: "wsl",
+          tmuxDistro: route.distro,
+          tmuxRoute: route,
+          tmuxLauncher: route.command,
+          tmuxControlBinary: route.tmuxBinary,
+          tmuxSocketName: route.tmuxSocketName,
+        }),
+        resolveWslPartnerExecutableFn: async (command, { projectPath, route }) => {
+          assert.equal(command, partnerCommand, label);
+          assert.equal(projectPath, "/mnt/c/reviewed", label);
+          assert.equal(route.distro, "Ubuntu", label);
+          return resolvedCommand;
+        },
+      }
+    );
+    assert.equal(context.tmuxTransport, "wsl", label);
+    assert.equal(context.tmuxDistro, "Ubuntu", label);
+    assert.equal(context.partnerCommand, resolvedCommand, label);
+  }
+
+  for (const [label, partnerAgent, partnerCommand] of [
+    ["Claude WSL -> Codex WSL", "codex", "codex"],
+    ["Codex WSL -> Claude WSL", "claude", "claude"],
+  ]) {
+    const route = {
+      transport: "local",
+      command: "tmux",
+      distro: null,
+      tmuxBinary: "tmux",
+      tmuxSocketName: "dualog",
+    };
+    const context = await resolvePartnerRuntimeContext(
+      {
+        partnerAgent,
+        partnerCommand,
+        projectPath: "/home/test/reviewed",
+      },
+      {
+        platform: "linux",
+        tmuxRouteFn: () => route,
+        resolveRunnableEngineFn: async () => "tmux-interactive",
+        resolveTmuxProjectContextFn: async (hostProjectPath) => ({
+          hostProjectPath,
+          partnerProjectPath: hostProjectPath,
+          tmuxTransport: "local",
+          tmuxDistro: null,
+          tmuxRoute: route,
+          tmuxLauncher: "tmux",
+          tmuxControlBinary: "tmux",
+          tmuxSocketName: "dualog",
+        }),
+        resolveWslPartnerExecutableFn: async () =>
+          assert.fail(`${label} must use native Linux resolution`),
+      }
+    );
+    assert.equal(context.tmuxTransport, "local", label);
+    assert.equal(context.partnerCommand, partnerCommand, label);
+  }
+});
+
 test("missing WSL falls back to native headless unless tmux was explicit", async () => {
   for (const [partnerAgent, partnerCommand] of [
     ["claude", "claude.cmd"],
@@ -610,6 +747,262 @@ test("WSL probes use the resolved interactive login shell with positional argv",
   assert.equal(invocation.args[7], command);
   assert.equal(invocation.args[8], "--version");
   assert.equal(invocation.args[5].includes(command), false);
+});
+
+test("WSL command inspection retains the bounded first version line", async () => {
+  let invocation = null;
+  const inspected = await inspectWslPartnerCommand(
+    "/opt/claude/bin/claude",
+    ["--version"],
+    {
+      route: { ...WSL_ROUTE, loginShell: "/bin/bash" },
+      runExecFileFn: async (command, args) => {
+        invocation = { command, args };
+        return {
+          exitCode: 0,
+          stdout: "2.1.258 (Claude Code)\nignored second line\n",
+          stderr: "",
+        };
+      },
+    }
+  );
+
+  assert.deepEqual(inspected, {
+    availability: "available",
+    version: "2.1.258 (Claude Code)",
+  });
+  assert.equal(invocation.command, "wsl.exe");
+  assert.deepEqual(invocation.args.slice(-2), [
+    "/opt/claude/bin/claude",
+    "--version",
+  ]);
+});
+
+test("WSL executable resolution pins the default distro and keeps dynamic values out of shell text", async () => {
+  const calls = [];
+  const resolved = await resolveWslPartnerExecutable("claude", {
+    projectPath: "C:\\reviewed repo & $meta",
+    route: { ...WSL_ROUTE, distro: null },
+    resolveWslLoginShellFn: async (route) => {
+      assert.equal(route.distro, "Ubuntu-24.04");
+      return "/bin/bash";
+    },
+    runExecFileFn: async (command, args) => {
+      calls.push({ command, args });
+      if (calls.length === 1) {
+        return { exitCode: 0, stdout: "Ubuntu-24.04\n", stderr: "" };
+      }
+      if (args.includes("wslpath")) {
+        return { exitCode: 0, stdout: "/mnt/c/reviewed repo & $meta\n", stderr: "" };
+      }
+      return {
+        exitCode: 0,
+        stdout: "login chatter\n\0/usr/local/bin/claude\0",
+        stderr: "",
+      };
+    },
+  });
+
+  assert.equal(resolved, "/usr/local/bin/claude");
+  const invocation = calls.at(-1);
+  assert.equal(invocation.command, "wsl.exe");
+  assert.deepEqual(invocation.args.slice(0, 3), [
+    "--distribution",
+    "Ubuntu-24.04",
+    "--exec",
+  ]);
+  const scriptIndex = invocation.args.indexOf(WSL_PARTNER_EXECUTABLE_RESOLVE_SCRIPT);
+  assert.ok(scriptIndex >= 0);
+  assert.equal(invocation.args[scriptIndex].includes("reviewed repo"), false);
+  assert.deepEqual(invocation.args.slice(scriptIndex + 1), [
+    "dualog-wsl-resolve-partner",
+    "claude",
+    "/mnt/c/reviewed repo & $meta",
+  ]);
+});
+
+test("WSL executable resolution rejects explicit relative partner paths before execution", async () => {
+  for (const command of ["./claude", "bin/claude", ".\\claude"]) {
+    await assert.rejects(
+      resolveWslPartnerExecutable(command, {
+        projectPath: "/work/reviewed",
+        route: WSL_ROUTE,
+        resolveWslLoginShellFn: async () =>
+          assert.fail("a relative command must fail before selecting a login shell"),
+        runExecFileFn: async () =>
+          assert.fail("a relative command must fail before invoking WSL"),
+      }),
+      /is relative/u
+    );
+  }
+});
+
+test("the fixed WSL resolver rejects project PATH shims and symlink crossings", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-wsl-command-"));
+  const project = path.join(root, "reviewed");
+  const trusted = path.join(root, "trusted");
+  fs.mkdirSync(project);
+  fs.mkdirSync(trusted);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const executable = (dir, name) => {
+    const filePath = path.join(dir, name);
+    fs.writeFileSync(filePath, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(filePath, 0o755);
+    return filePath;
+  };
+  const projectClaude = executable(project, "claude");
+  const trustedClaude = executable(trusted, "trusted-claude");
+  const run = (command, searchPath) =>
+    spawnSync(
+      "/bin/sh",
+      [
+        "-c",
+        WSL_PARTNER_EXECUTABLE_RESOLVE_SCRIPT,
+        "dualog-wsl-resolver-test",
+        command,
+        project,
+      ],
+      {
+        env: { ...process.env, PATH: searchPath },
+        encoding: "utf-8",
+      }
+    );
+
+  assert.equal(run("claude", `${project}:${trusted}:/usr/bin:/bin`).status, 66);
+  assert.equal(run("claude", `.:${trusted}:/usr/bin:/bin`).status, 66);
+  assert.equal(run(projectClaude, `${trusted}:/usr/bin:/bin`).status, 66);
+
+  const safe = run(trustedClaude, `${project}:${trusted}:/usr/bin:/bin`);
+  assert.equal(safe.status, 0);
+  assert.equal(safe.stdout, `\0${fs.realpathSync(trustedClaude)}\0`);
+
+  fs.symlinkSync(projectClaude, path.join(trusted, "linked-claude"));
+  assert.equal(run("linked-claude", `${trusted}:/usr/bin:/bin`).status, 68);
+  fs.symlinkSync(trustedClaude, path.join(project, "escape-claude"));
+  assert.equal(
+    run(path.join(project, "escape-claude"), `${trusted}:/usr/bin:/bin`).status,
+    66
+  );
+});
+
+test("check_adapter pins only a safe absolute executable in the selected WSL distro", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dualog-check-adapter-wsl-"));
+  const project = path.join(root, "reviewed");
+  const trusted = path.join(root, "trusted");
+  fs.mkdirSync(project);
+  fs.mkdirSync(trusted);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const executable = (dir, name, body = "exit 0") => {
+    const filePath = path.join(dir, name);
+    fs.writeFileSync(filePath, `#!/bin/sh\n${body}\n`);
+    fs.chmodSync(filePath, 0o755);
+    return filePath;
+  };
+  const projectClaude = executable(project, "claude");
+  const trustedClaude = executable(trusted, "claude");
+  const linkedToProject = path.join(trusted, "linked-claude");
+  fs.symlinkSync(projectClaude, linkedToProject);
+  // The resolver deliberately uses an interactive-login argv shape. This
+  // hermetic stand-in preserves that shape without reading the test host's
+  // shell profile, which would make PATH-dependent planting cases nondeterministic.
+  const loginShell = executable(
+    trusted,
+    "bash",
+    '[ "$1" = "-lic" ] || exit 64\nshift\nexec /bin/sh -c "$@"'
+  );
+
+  const resolveAsCheckAdapter = async (partnerCommand, searchPath) => {
+    const probes = [];
+    const contextPromise = resolvePartnerRuntimeContext(
+      {
+        partnerAgent: "claude",
+        partnerCommand,
+        // check_adapter supplies process.cwd(); this fixture is its translated
+        // partner-visible equivalent inside the selected distribution.
+        projectPath: project,
+        requestedEngine: "tmux-interactive",
+      },
+      {
+        platform: "win32",
+        tmuxRouteFn: () => ({ ...WSL_ROUTE, distro: null }),
+        resolveWslRouteDistroFn: async (route) => ({
+          ...route,
+          distro: "Ubuntu-24.04",
+        }),
+        resolveWslLoginShellFn: async (route) => {
+          assert.equal(route.distro, "Ubuntu-24.04");
+          return loginShell;
+        },
+        resolveTmuxProjectContextFn: async (hostProjectPath, { route }) => ({
+          hostProjectPath,
+          partnerProjectPath: project,
+          tmuxTransport: "wsl",
+          tmuxDistro: route.distro,
+          tmuxRoute: route,
+          tmuxLauncher: route.command,
+          tmuxControlBinary: route.tmuxBinary,
+          tmuxSocketName: route.tmuxSocketName,
+        }),
+        resolveWslPartnerExecutableFn: (command, options) =>
+          resolveWslPartnerExecutable(command, {
+            ...options,
+            resolveWslLoginShellFn: async () => loginShell,
+            runExecFileFn: async (_command, args) => {
+              const execAt = args.indexOf("--exec");
+              assert.ok(execAt >= 0, "the resolver must use fixed WSL --exec argv");
+              const child = spawnSync(args[execAt + 1], args.slice(execAt + 2), {
+                env: { ...process.env, PATH: searchPath },
+                encoding: "utf-8",
+              });
+              return {
+                exitCode: child.status ?? 127,
+                stdout: child.stdout ?? "",
+                stderr: child.stderr ?? child.error?.message ?? "",
+              };
+            },
+          }),
+        resolveRunnableEngineFn: async (adapter, options) => {
+          const status = await options.probeWslPartnerCommandFn(
+            partnerCommand,
+            adapter.binary.versionArgs
+          );
+          assert.equal(status, "available");
+          return "tmux-interactive";
+        },
+        probeWslPartnerCommandFn: async (command, _versionArgs, { route }) => {
+          probes.push(command);
+          assert.equal(route.distro, "Ubuntu-24.04");
+          assert.equal(path.posix.isAbsolute(command), true);
+          return "available";
+        },
+      }
+    );
+    return { contextPromise, probes };
+  };
+
+  for (const [label, command, searchPath] of [
+    ["absolute project PATH entry", "claude", `${project}:/usr/bin:/bin`],
+    ["relative PATH entry", "claude", `.:${trusted}:/usr/bin:/bin`],
+    ["explicit relative command", "./claude", `${trusted}:/usr/bin:/bin`],
+    ["explicit project command", projectClaude, `${trusted}:/usr/bin:/bin`],
+    ["trusted symlink into project", linkedToProject, `${trusted}:/usr/bin:/bin`],
+  ]) {
+    const { contextPromise, probes } = await resolveAsCheckAdapter(command, searchPath);
+    await assert.rejects(contextPromise, /inside the reviewed project|is relative/u, label);
+    assert.deepEqual(probes, [], `${label} must fail before the version probe`);
+  }
+
+  const safe = await resolveAsCheckAdapter(
+    trustedClaude,
+    `${project}:${trusted}:/usr/bin:/bin`
+  );
+  const context = await safe.contextPromise;
+  const canonical = fs.realpathSync(trustedClaude);
+  assert.equal(context.partnerCommand, canonical);
+  assert.equal(context.tmuxDistro, "Ubuntu-24.04");
+  assert.deepEqual(safe.probes, [canonical]);
 });
 
 test("the WSL launch preparation converts Windows paths and carries its route", async () => {

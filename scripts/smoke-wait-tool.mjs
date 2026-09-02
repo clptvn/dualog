@@ -5,11 +5,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { readProcessCommandLine } from "../src/process-command-line.mjs";
 import { terminateWindowsProcessTree } from "../src/windows-process-tree.mjs";
 
 const repoRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -167,28 +168,6 @@ function isPidAlive(pid) {
     return true;
   } catch {
     return false;
-  }
-}
-
-function readProcessCommandLine(pid) {
-  try {
-    if (process.platform === "win32") {
-      const script = [
-        `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"`,
-        "if ($null -ne $p) { $p.CommandLine }",
-      ].join("; ");
-      return execFileSync(
-        "powershell.exe",
-        ["-NoProfile", "-NonInteractive", "-Command", script],
-        { encoding: "utf-8", windowsHide: true, timeout: 5000 }
-      ).trim();
-    }
-    return execFileSync("ps", ["-p", String(pid), "-o", "command="], {
-      encoding: "utf-8",
-      timeout: 5000,
-    }).trim();
-  } catch {
-    return "";
   }
 }
 

@@ -37,8 +37,17 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Install macOS runtime dependencies
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
       - name: Install dependencies
         run: npm ci
+
+      - name: Smoke-test native Windows installer lifecycle
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\scripts\windows-installer-smoke.ps1
 
       - name: Run test suite
         run: npm test

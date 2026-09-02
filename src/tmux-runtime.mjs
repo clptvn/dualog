@@ -4,7 +4,10 @@ import { execFile } from "child_process";
 import crossSpawn from "cross-spawn";
 import { tryGetAdapter } from "./adapters/registry.mjs";
 import { isBlocked, isIdlePrompt } from "./tui/markers.mjs";
-import { terminateWindowsProcessTree } from "./windows-process-tree.mjs";
+import {
+  resolveWindowsSystem32Executable,
+  terminateWindowsProcessTree,
+} from "./windows-process-tree.mjs";
 import {
   assertSafeTmuxLauncher,
   assertSafeWslLauncher,
@@ -83,6 +86,18 @@ function tmuxBinary(env = process.env, { platform = process.platform } = {}) {
 function wslBinary(env = process.env, { platform = process.platform } = {}) {
   const configured = configuredEnvValue(WSL_BINARY_ENV, env);
   const trimmed = (configured ?? DEFAULT_WSL_BINARY).trim();
+  if (
+    platform === "win32" &&
+    trimmed.toLocaleLowerCase("en-US") === DEFAULT_WSL_BINARY
+  ) {
+    const systemWsl = resolveWindowsSystem32Executable(DEFAULT_WSL_BINARY, { env });
+    if (!systemWsl) {
+      throw new Error(
+        "SystemRoot did not resolve to a trusted top-level Windows System32 directory for wsl.exe"
+      );
+    }
+    return systemWsl;
+  }
   return assertSafeWslLauncher(trimmed, { platform });
 }
 
@@ -754,14 +769,159 @@ export async function prepareTmuxInvocation(
   };
 }
 
-/** Is the selected partner command runnable from the WSL distribution tmux uses? */
-export async function probeWslPartnerCommand(
+// Resolve inside the same interactive login shell that will launch the partner,
+// but pass every dynamic value as argv. `command -v` therefore sees the user's
+// real WSL PATH without granting the reviewed project any shell-program text.
+// Both the lexical path and its symlink-resolved target are checked: a shim
+// physically inside the project is unsafe even when it points out, and a trusted
+// looking path is unsafe when its final target points back in.
+export const WSL_PARTNER_EXECUTABLE_RESOLVE_SCRIPT = [
+  "candidate=$1",
+  "project_root=$2",
+  "reader=",
+  "for tool in /usr/bin/readlink /bin/readlink; do",
+  '  if [ -x "$tool" ] && [ ! -d "$tool" ]; then reader=$tool; break; fi',
+  "done",
+  '[ -n "$reader" ] || exit 67',
+  'case "$project_root" in /*) ;; *) exit 67;; esac',
+  'project_root=${project_root%/}',
+  '[ -n "$project_root" ] || project_root=/',
+  'project_canonical=$("$reader" -f -- "$project_root" 2>/dev/null) || exit 67',
+  '[ -n "$project_canonical" ] && [ -d "$project_canonical" ] || exit 67',
+  'cd "$project_canonical" || exit 67',
+  'case "$candidate" in',
+  '  /*) resolved=$candidate ;;',
+  '  *) resolved=$(command -v "$candidate" 2>/dev/null) || exit 127 ;;',
+  "esac",
+  '[ -n "$resolved" ] || exit 127',
+  'case "$resolved" in /*) lexical=$resolved ;; *) lexical=$PWD/$resolved ;; esac',
+  'if [ "$project_root" = / ] || [ "$project_canonical" = / ]; then exit 66; fi',
+  'case "$candidate" in "$project_root"|"$project_root"/*) exit 66;; esac',
+  'case "$lexical" in "$project_root"|"$project_root"/*) exit 66;; esac',
+  'case "$lexical" in "$project_canonical"|"$project_canonical"/*) exit 66;; esac',
+  '[ -f "$resolved" ] && [ -x "$resolved" ] || exit 127',
+  'canonical=$("$reader" -f -- "$resolved" 2>/dev/null) || exit 67',
+  '[ -n "$canonical" ] && [ -f "$canonical" ] && [ -x "$canonical" ] || exit 67',
+  'case "$canonical" in "$project_canonical"|"$project_canonical"/*) exit 68;; esac',
+  "printf '\\000%s\\000' \"$canonical\"",
+].join("\n");
+
+/**
+ * Pin one native-Windows -> WSL partner command to its exact canonical Linux
+ * executable outside the reviewed project. A missing command returns null so
+ * automatic engine selection can retain its documented native-headless
+ * fallback; unsafe or unprovable commands are refused.
+ */
+export async function resolveWslPartnerExecutable(
+  command,
+  {
+    projectPath,
+    route = tmuxRoute(),
+    runExecFileFn = runExecFile,
+    resolveWslLoginShellFn = resolveWslLoginShell,
+  } = {}
+) {
+  if (route?.transport !== "wsl") {
+    throw new Error("A WSL partner executable can only be resolved on a WSL route");
+  }
+  if (
+    typeof command !== "string" ||
+    !command ||
+    command.length > 4096 ||
+    /[\u0000-\u001f\u007f]/u.test(command)
+  ) {
+    throw new Error("WSL partner command is invalid");
+  }
+  if (
+    typeof projectPath !== "string" ||
+    !projectPath ||
+    projectPath.length > 4096 ||
+    /[\u0000-\u001f\u007f]/u.test(projectPath)
+  ) {
+    throw new Error("WSL reviewed project path is invalid");
+  }
+
+  let selectedRoute = resolveTmuxRouteForPaths(route, [command, projectPath]);
+  selectedRoute = await resolveWslRouteDistro(selectedRoute, { runExecFileFn });
+  const [translatedCommand, translatedProjectPath] = await Promise.all([
+    translateTmuxPath(command, { route: selectedRoute, runExecFileFn }),
+    translateTmuxPath(projectPath, { route: selectedRoute, runExecFileFn }),
+  ]);
+  const normalizedProjectPath = path.posix.normalize(translatedProjectPath);
+  if (!path.posix.isAbsolute(normalizedProjectPath)) {
+    throw new Error("WSL reviewed project path did not resolve to an absolute Linux path");
+  }
+  if (!path.posix.isAbsolute(translatedCommand)) {
+    if (
+      translatedCommand.startsWith("-") ||
+      translatedCommand.includes("/") ||
+      translatedCommand.includes("\\")
+    ) {
+      throw new Error(
+        `WSL partner command ${JSON.stringify(command)} is relative; use a bare command name or an absolute Linux path`
+      );
+    }
+  }
+
+  const loginShell = await resolveWslLoginShellFn(selectedRoute, { runExecFileFn });
+  const result = await runExecFileFn(
+    selectedRoute.command,
+    wslCommandArgs(
+      wslLoginShellArgs(loginShell, WSL_PARTNER_EXECUTABLE_RESOLVE_SCRIPT, {
+        arg0: "dualog-wsl-resolve-partner",
+        args: [translatedCommand, normalizedProjectPath],
+      }),
+      selectedRoute
+    )
+  );
+  if (result.exitCode === 127) return null;
+  if (result.exitCode === 66 || result.exitCode === 68) {
+    throw new Error(
+      `WSL partner command ${JSON.stringify(command)} resolves inside the reviewed project ${JSON.stringify(translatedProjectPath)}`
+    );
+  }
+  if (result.exitCode === 67) {
+    throw new Error(
+      `WSL could not safely canonicalize partner command ${JSON.stringify(command)} outside the reviewed project`
+    );
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `WSL could not safely resolve partner command ${JSON.stringify(command)} (exit ${result.exitCode})`
+    );
+  }
+
+  const stdout = String(result.stdout ?? "");
+  const end = stdout.lastIndexOf("\0");
+  const start = end > 0 ? stdout.lastIndexOf("\0", end - 1) : -1;
+  const executable = start >= 0 && end > start ? stdout.slice(start + 1, end) : "";
+  if (
+    !path.posix.isAbsolute(executable) ||
+    executable.length > 4096 ||
+    /[\u0000-\u001f\u007f]/u.test(executable)
+  ) {
+    throw new Error(
+      `WSL returned an invalid canonical path for partner command ${JSON.stringify(command)}`
+    );
+  }
+  return executable;
+}
+
+/**
+ * Probe one exact partner executable in the selected WSL distribution while
+ * retaining its bounded first version line for status callers.
+ */
+export async function inspectWslPartnerCommand(
   command,
   versionArgs = [],
   { route = tmuxRoute(), runExecFileFn = runExecFile } = {}
 ) {
-  if (route.transport !== "wsl") return "not-applicable";
-  if (typeof command !== "string" || !command.trim()) return "unavailable";
+  if (route.transport !== "wsl") {
+    return { availability: "not-applicable", version: null };
+  }
+  if (typeof command !== "string" || !command.trim()) {
+    return { availability: "unavailable", version: null };
+  }
 
   const executable = await translateTmuxPath(command, { route, runExecFileFn });
   const loginShell = await resolveWslLoginShell(route, { runExecFileFn });
@@ -778,7 +938,18 @@ export async function probeWslPartnerCommand(
       route
     )
   );
-  return result.exitCode === 0 ? "available" : "unavailable";
+  if (result.exitCode !== 0) {
+    return { availability: "unavailable", version: null };
+  }
+  const version = String(result.stdout || result.stderr || "")
+    .trim()
+    .split(/\r?\n/u)[0] || null;
+  return { availability: "available", version };
+}
+
+/** Is the selected partner command runnable from the WSL distribution tmux uses? */
+export async function probeWslPartnerCommand(command, versionArgs = [], options = {}) {
+  return (await inspectWslPartnerCommand(command, versionArgs, options)).availability;
 }
 
 /**
