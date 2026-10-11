@@ -8,6 +8,7 @@ import {
   buildTmuxSessionName,
   captureTmuxPane,
   inspectPartnerTerminal,
+  isTmuxPaneDead,
   prepareTmuxInvocation,
   probeTmuxAvailability,
   probeTmuxSession,
@@ -1005,7 +1006,7 @@ export async function runPartnerCommand({
       const finalCapture = handle
         ? await captureAndPersist(handle, capturePath, log)
         : null;
-      let finalCapturePath = finalCapture?.path || null;
+      let finalCapturePath = finalCapture?.path || persistCaptureText(capturePath, err.captureText, log);
       if (!finalCapturePath && fs.existsSync(capturePath)) {
         finalCapturePath = capturePath;
       }
@@ -1142,6 +1143,7 @@ async function waitForInteractiveReady({
         "terminal_exited"
       );
     }
+    await throwIfPartnerPaneExited(handle, capturePath, log, partnerDisplay);
     try {
       lastSnapshot = await captureTmuxPane(handle, { lines: 80 });
     } catch {
@@ -1247,6 +1249,7 @@ async function waitForPromptSubmission({
         "terminal_exited"
       );
     }
+    await throwIfPartnerPaneExited(handle, capturePath, log, partnerDisplay);
 
     try {
       lastSnapshot = await captureTmuxPane(handle, { lines: 80 });
@@ -1359,6 +1362,7 @@ async function waitForSidecarCompletion({
         `${partnerDisplay} tmux liveness could not be determined; continuing to wait rather than assuming the pane exited`
       );
     }
+    await throwIfPartnerPaneExited(handle, capturePath, log, partnerDisplay);
 
     const now = Date.now();
     const shouldLogProgress = now - lastProgressLog > 60000;
@@ -1384,6 +1388,17 @@ async function waitForSidecarCompletion({
 
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
+}
+
+async function throwIfPartnerPaneExited(handle, capturePath, log, partnerDisplay) {
+  if (!(await isTmuxPaneDead(handle))) return;
+  const capture = await captureAndPersist(handle, capturePath, log);
+  throw new PartnerTerminalFailureError(
+    `${partnerDisplay} pane exited` +
+      (capture?.text ? `; terminal: ${capture.text.trim().slice(-1000)}` : "") +
+      (capture?.path ? `; capture: ${capture.path}` : ""),
+    "terminal_exited"
+  );
 }
 
 function throwIfPartnerTerminalFailed(captureText, partnerDisplay, agent) {

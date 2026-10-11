@@ -70,6 +70,7 @@ export function partnerSentinelEnv() {
  * isolation mechanism.
  */
 export function prepareConfigIsolation(adapter, ctx) {
+  ctx.codexMcpOverrides = [];
   const isolation = adapter.configIsolation;
   if (!isolation) return {};
 
@@ -103,7 +104,14 @@ export function prepareConfigIsolation(adapter, ctx) {
     // between copyIfMissing and copyIfExists.
     for (const [name, tables] of Object.entries(isolation.dropTomlTables ?? {})) {
       assertSeedFileName(name, { fn: `adapter "${adapter.id}" configIsolation.dropTomlTables` });
-      applyTomlDrops(path.join(targetDir, name), tables);
+      const disabledMcpServers = adapter.id === "codex" && name === "config.toml"
+        ? new Set()
+        : null;
+      applyTomlDrops(path.join(targetDir, name), tables, disabledMcpServers);
+      if (disabledMcpServers?.size) {
+        const overrides = [...disabledMcpServers].map((server) => `${server}={enabled=false}`);
+        ctx.codexMcpOverrides.push("-c", `mcp_servers={${overrides.join(",")}}`);
+      }
     }
   }
 
@@ -382,22 +390,25 @@ function copyIfMissing(sourcePath, targetPath) {
 }
 
 /**
- * Normalize one TOML table path to dotted, unquoted segments.
+ * Split a TOML path without splitting dots inside quoted server names.
  *
  * `[mcp_servers."dualog"]` and `[mcp_servers.dualog]` name the same table, so a
  * stripper that only understood one spelling would silently leave the other in
  * place -- and silently leaving THIS table in place hands the partner dualog.
  */
-function normalizeTomlPath(raw) {
+function splitTomlPath(raw) {
   const segments = [];
   let current = "";
   let quote = null;
+  let escaped = false;
   for (const ch of raw.trim()) {
     if (quote) {
-      if (ch === quote) quote = null;
-      else current += ch;
+      current += ch;
+      if (!escaped && ch === quote) quote = null;
+      escaped = !escaped && quote === '"' && ch === "\\";
     } else if (ch === '"' || ch === "'") {
       quote = ch;
+      current += ch;
     } else if (ch === ".") {
       segments.push(current.trim());
       current = "";
@@ -406,7 +417,11 @@ function normalizeTomlPath(raw) {
     }
   }
   segments.push(current.trim());
-  return segments.filter(Boolean).join(".");
+  return segments.filter(Boolean);
+}
+
+function normalizeTomlPath(raw) {
+  return splitTomlPath(raw).map((part) => part.replace(/^(["'])(.*)\1$/, "$2")).join(".");
 }
 
 /**
@@ -420,8 +435,9 @@ function normalizeTomlPath(raw) {
  * Multi-line strings are tracked because a `[...]` line inside one is content,
  * not a table header, and treating it as a header would resume copying in the
  * middle of a value.
+ * For Codex, disabledMcpServers collects retained MCP tables for CLI disabling.
  */
-export function dropTomlTables(text, tables) {
+export function dropTomlTables(text, tables, disabledMcpServers = null) {
   const targets = (tables ?? []).map(normalizeTomlPath).filter(Boolean);
   if (!targets.length) return text;
 
@@ -429,6 +445,7 @@ export function dropTomlTables(text, tables) {
   const kept = [];
   let dropping = false;
   let openDelimiter = null;
+  let tableParts = [];
 
   for (const line of lines) {
     if (openDelimiter) {
@@ -439,12 +456,31 @@ export function dropTomlTables(text, tables) {
 
     const header = /^\s*\[\[?([^\]]+)\]\]?\s*(?:#.*)?$/.exec(line);
     if (header) {
+      tableParts = splitTomlPath(header[1]);
       const name = normalizeTomlPath(header[1]);
       // A table is dropped with its subtables: dropping `mcp_servers.dualog`
       // while keeping `mcp_servers.dualog.env` would leave an orphan table
       // that reintroduces the server under a partial definition.
       dropping = targets.some((t) => name === t || name.startsWith(`${t}.`));
+      if (dropping && disabledMcpServers) {
+        const parts = tableParts;
+        if (normalizeTomlPath(parts[0]) === "mcp_servers") {
+          // Codex validates disabled transports too; keep the merge base and
+          // disable it through CLI overrides after project config is loaded.
+          if (parts.length > 1) disabledMcpServers.add(parts[1]);
+          dropping = false;
+        }
+      }
     } else if (!dropping) {
+      if (disabledMcpServers && tableParts.length === 1 && normalizeTomlPath(tableParts[0]) === "mcp_servers") {
+        const key = /^\s*("(?:\\.|[^"])*"|'[^']*'|[\w-]+)\s*[.=]/.exec(line);
+        if (key) {
+          const name = normalizeTomlPath(`mcp_servers.${key[1]}`);
+          if (targets.some((target) => name === target || name.startsWith(`${target}.`))) {
+            disabledMcpServers.add(key[1]);
+          }
+        }
+      }
       for (const delimiter of ['"""', "'''"]) {
         const first = line.indexOf(delimiter);
         if (first !== -1 && line.indexOf(delimiter, first + 3) === -1) {
@@ -460,13 +496,14 @@ export function dropTomlTables(text, tables) {
   return kept.join("\n");
 }
 
-function applyTomlDrops(targetPath, tables) {
+function applyTomlDrops(targetPath, tables, disabledMcpServers = null) {
   try {
     if (!fs.existsSync(targetPath)) return;
     const original = fs.readFileSync(targetPath, "utf-8");
-    const stripped = dropTomlTables(original, tables);
+    const stripped = dropTomlTables(original, tables, disabledMcpServers);
     if (stripped !== original) fs.writeFileSync(targetPath, stripped, { mode: 0o600 });
-  } catch {
+  } catch (err) {
+    if (disabledMcpServers) throw err;
     // A seed we could not rewrite is left as copied. The alternative -- deleting
     // it -- would take the trust table and every global server with it, turning
     // a containment miss into a broken turn.

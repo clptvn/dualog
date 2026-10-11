@@ -487,6 +487,7 @@ export function buildInvocationFromAdapter(adapter, options) {
   ctx.mcpConfigPath = applyMcpSuppression(adapter, ctx);
 
   const args = buildArgs(adapter, engine, ctx);
+  args.push(...ctx.codexMcpOverrides);
 
   return {
     command: options.partnerCommand || adapter.binary.default,

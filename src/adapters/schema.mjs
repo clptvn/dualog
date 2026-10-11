@@ -223,11 +223,10 @@ const ConfigIsolation = z
      * absent -- and codex rejects the whole file and exits. Isolating the
      * config home without carrying the config is what produced that.
      *
-     * But the real config also names dualog's own MCP server, and a partner
-     * that can call dualog can open its own dialogs. Dropping the table is the
-     * containment: `-c mcp_servers.dualog.enabled=false` would instead CREATE a
-     * transport-less table for anyone who has no dualog server configured,
-     * which is the exact failure this whole mechanism exists to avoid.
+     * Codex MCP tables retain their transport definitions and are disabled
+     * through CLI overrides instead: removing them breaks partial project
+     * overrides, even when those overrides set enabled = false. Disable flags
+     * are emitted only for servers actually present in the seed.
      *
      * Keyed by seed file name; each value is a list of dotted table paths.
      */

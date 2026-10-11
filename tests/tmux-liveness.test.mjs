@@ -22,6 +22,8 @@ import {
   analyzeTerminalActivity,
   classifyTmuxProbeFailure,
   isTmuxSessionAlive,
+  isTmuxPaneDead,
+  captureTmuxPane,
   probeTmuxSession,
   probeTmuxSessionSync,
   startTmuxSession,
@@ -384,7 +386,7 @@ test("nothing that can end a turn uses the two-valued predicate", () => {
   );
 
   const terminalExited = src.match(/"terminal_exited"/g) || [];
-  assert.equal(terminalExited.length, 3, "the three turn-ending sites are still the only ones");
+  assert.equal(terminalExited.length, 4, "three absence guards plus the retained dead-pane guard");
 
   // Every liveness read in this module must resolve to a comparison against
   // "absent" -- either inline, or via the named `liveness` binding that the
@@ -423,7 +425,7 @@ test("native tmux keeps /bin/sh -lc while WSL uses its interactive login shell",
       },
       { runTmuxFn: local.runTmuxFn }
     );
-    let creation = local.calls.find(({ args }) => args[0] === "new-session");
+    let creation = local.calls.find(({ args }) => args.includes("new-session"));
     assert.ok(creation, "the native route must create a tmux session");
     let payload = creation.args.at(-1);
     assert.match(payload, /\/bin\/sh -lc/u);
@@ -449,7 +451,7 @@ test("native tmux keeps /bin/sh -lc while WSL uses its interactive login shell",
       },
       { runTmuxFn: wsl.runTmuxFn }
     );
-    creation = wsl.calls.find(({ args }) => args[0] === "new-session");
+    creation = wsl.calls.find(({ args }) => args.includes("new-session"));
     assert.ok(creation, "the WSL route must create a tmux session");
     payload = creation.args.at(-1);
     assert.match(payload, /'\/bin\/bash' -lic/u);
@@ -487,6 +489,7 @@ test("native tmux keeps /bin/sh -lc while WSL uses its interactive login shell",
     "/dev/null",
     "-L",
     socket,
+    "start-server", ";", "set-window-option", "-g", "remain-on-exit", "on", ";",
     "new-session",
     "-d",
     "-s",
@@ -527,6 +530,7 @@ test("native tmux keeps /bin/sh -lc while WSL uses its interactive login shell",
     "/dev/null",
     "-L",
     socket,
+    "start-server", ";", "set-window-option", "-g", "remain-on-exit", "on", ";",
     "new-session",
     "-d",
     "-s",
@@ -569,6 +573,27 @@ test("a started session reports the process running in its pane", async (t) => {
 
   await terminateTmuxSession(handle);
   assert.equal(await probeTmuxSession(handle.sessionName), "absent");
+});
+
+test("an immediate startup exit retains the real error until cleanup", async (t) => {
+  if (!realTmuxAvailable()) return t.skip("tmux is not installed");
+  const socket = `${SOCKET}-startup-error`;
+  t.after(() => killTmuxServer(socket));
+  const handle = await startTmuxSession({
+    sessionName: `dualog-startup-error-${process.pid}`,
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: ["-e", 'console.error("Error: invalid transport\\nin `mcp_servers.supabase`"); process.exit(1);'],
+    env: {},
+    socketName: socket,
+  });
+  const deadline = Date.now() + 5000;
+  while (!(await isTmuxPaneDead(handle)) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(await isTmuxPaneDead(handle), true);
+  assert.match(await captureTmuxPane(handle), /invalid transport[\s\S]*mcp_servers\.supabase/);
+  assert.equal(await terminateTmuxSession(handle), "absent");
 });
 
 test("a pane whose process could not be read is marked, not left ambiguous", async (t) => {
