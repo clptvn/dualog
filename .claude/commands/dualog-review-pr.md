@@ -1,6 +1,6 @@
 ---
 description: Have a partner agent run a multi-specialist PR review (pr-review-toolkit panel) via the dualog MCP server
-argument-hint: [optional: pr:<number|url>] [optional: diff_target (branch|uncommitted|staged|commit:<sha>)] [optional: aspects:code,tests,errors,comments,types,simplify] [optional: review focus] [optional: rounds:N] [optional: effort:<level>] [optional: model:<id>] [optional: partner:<agent-id>]
+argument-hint: [optional: pr:<number|url>] [optional: diff_target (branch|uncommitted|staged|commit:<sha>)] [optional: aspects:code,tests,errors,comments,types,simplify] [optional: review focus] [optional: rounds:N] [optional: effort:<level>] [optional: model:<id>] [optional: partner:<agent-id>] [optional: speed:fast|ultrafast]
 allowed-tools: mcp__dualog__start_pr_review, mcp__dualog__get_pr_review_report, mcp__dualog__check_messages, mcp__dualog__wait_for_partner_response, mcp__dualog__send_message, mcp__dualog__get_full_history, mcp__dualog__check_partner_alive, mcp__dualog__send_key, mcp__dualog__end_dialog, mcp__dualog__list_sessions, mcp__dualog__list_models, mcp__dualog__list_adapters, mcp__dualog__check_adapter, Bash, Read, Glob, Grep, Edit, Write, AskUserQuestion, LSP, Monitor
 ---
 
@@ -29,6 +29,8 @@ Review PR: $ARGUMENTS
 ---
 
 ## PHASE 0: PARSE AND DETECT
+
+For Codex partners, pass `speed: "ultrafast"` only when the user explicitly requests ultrafast mode, or `speed: "fast"` only when the user explicitly requests fast mode (including `speed:ultrafast` / `speed:fast` tokens). Strip these speed tokens before interpreting the remaining arguments. Otherwise omit `speed`. Never infer speed from urgency, a request for a quick review, model, effort, or host settings. Never substitute one speed for the other; non-Codex partners do not accept this option. Check the start response's `speed` against the request.
 
 ```bash
 PROJECT_DIR="$(git rev-parse --show-toplevel)"
@@ -66,7 +68,9 @@ Call `start_pr_review` with `project_path` and whatever the user specified.
 
 **Read the response before you wait on it.** It tells you:
 
-- `aspects` — the specialists that will run, one partner turn each
+- `aspects` — the specialists that will run
+- `panel_execution` — native parallel subagents or sequential partner turns
+- `partner_invocations` — initial CLI invocation count; `total_passes` counts logical reports
 - `skipped_aspects` — every aspect that will NOT run, with the reason
 - `total_passes` — specialists plus one consolidation pass
 - `max_rounds` / `follow_up_rounds` — the panel is counted in `max_rounds`,
@@ -111,7 +115,7 @@ then go quiet while five more passes ran unobserved.
 
 - `description`: `PR review panel progress in <SESSION_ID>`
 - `timeout_ms`: `1800000` — a panel is several full turns back to back, and the
-  per-turn wait hint applies to each pass, not to the panel as a whole
+  wait hint applies to the whole native invocation or to each sequential pass
 - `persistent`: `false`
 
 Call `get_pr_review_report` rather than `check_messages` to see where the panel

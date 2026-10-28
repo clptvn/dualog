@@ -115,6 +115,14 @@ export function prepareConfigIsolation(adapter, ctx) {
     }
   }
 
+  if (adapter.id === "codex" && ctx.speed) {
+    const profilePath = assertTurnPath(ctx, path.join(targetDir, `${ctx.speed}.config.toml`), {
+      fn: "Codex speed profile",
+    });
+    // Keep speed profiles independent of the user's model and permission presets.
+    fs.writeFileSync(profilePath, `service_tier = ${JSON.stringify(ctx.speed)}\n`, { mode: 0o600 });
+  }
+
   // RELOCATIONS. Contained unconditionally -- `dirs` means "this is a place",
   // so there is nothing left to decide at runtime.
   const relocations = {};

@@ -212,7 +212,9 @@ exports[`argv: codex / effort not in the codex set is dropped 1`] = `
     "never",
     "--no-alt-screen",
     "-c",
-    "approval_policy=\\"never\\""
+    "approval_policy=\\"never\\"",
+    "-c",
+    "service_tier=\\"default\\""
   ],
   "env": {
     "CODEX_HOME": "<SCRATCH_DIR>/codex-home",
@@ -237,7 +239,9 @@ exports[`argv: codex / implementation profile does not change argv 1`] = `
     "never",
     "--no-alt-screen",
     "-c",
-    "approval_policy=\\"never\\""
+    "approval_policy=\\"never\\"",
+    "-c",
+    "service_tier=\\"default\\""
   ],
   "env": {
     "CODEX_HOME": "<SCRATCH_DIR>/codex-home",
@@ -263,6 +267,8 @@ exports[`argv: codex / initial prompt is appended as a positional 1`] = `
     "--no-alt-screen",
     "-c",
     "approval_policy=\\"never\\"",
+    "-c",
+    "service_tier=\\"default\\"",
     "Read the prompt file at:\\n/fixture/session/turns/t1/prompt.md"
   ],
   "env": {
@@ -289,6 +295,8 @@ exports[`argv: codex / model only 1`] = `
     "--no-alt-screen",
     "-c",
     "approval_policy=\\"never\\"",
+    "-c",
+    "service_tier=\\"default\\"",
     "--model",
     "gpt-5.6-sol"
   ],
@@ -316,6 +324,8 @@ exports[`argv: codex / model, effort, and initial prompt together 1`] = `
     "--no-alt-screen",
     "-c",
     "approval_policy=\\"never\\"",
+    "-c",
+    "service_tier=\\"default\\"",
     "--model",
     "gpt-5.6-terra",
     "-c",
@@ -345,7 +355,9 @@ exports[`argv: codex / read profile / no model / no effort 1`] = `
     "never",
     "--no-alt-screen",
     "-c",
-    "approval_policy=\\"never\\""
+    "approval_policy=\\"never\\"",
+    "-c",
+    "service_tier=\\"default\\""
   ],
   "env": {
     "CODEX_HOME": "<SCRATCH_DIR>/codex-home",
@@ -371,6 +383,8 @@ exports[`argv: codex / valid effort 1`] = `
     "--no-alt-screen",
     "-c",
     "approval_policy=\\"never\\"",
+    "-c",
+    "service_tier=\\"default\\"",
     "-c",
     "model_reasoning_effort=\\"ultra\\""
   ],

@@ -24,6 +24,9 @@
     "args": ["models"]
   },
   "defaultToolProfile": "read",
+  "nativeSubagents": {
+    "instructions": "Use the Task tool with the built-in general subagent. Issue the independent Task calls together so they run in parallel, and wait for all results. Pass each child only its manifest task; do not rely on personal or project-defined agent roles."
+  },
   "toolProfiles": {},
   "mcp": { "strategy": "none" },
   "configIsolation": {

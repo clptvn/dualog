@@ -12,7 +12,7 @@ This is not `dualog-review-code` with a different name. That skill runs one
 general reviewer over the whole change in a single pass. This one runs several
 narrow specialists — general code quality, test coverage, error handling,
 comment accuracy, type design, and optionally simplification — each in its own
-partner turn with only its own rubric loaded, then consolidates them into one
+isolated context with only its own rubric loaded, then consolidates them into one
 prioritized report. It surfaces a different class of problem for that reason: no
 single pass is trying to hold six concerns at once.
 
@@ -20,6 +20,8 @@ Reach for `dualog-review-code` when the user wants a fast general read, and this
 skill when they want thoroughness or say "PR review".
 
 ## Parse the user's invocation
+
+For Codex partners, pass `speed: "ultrafast"` only when the user explicitly requests ultrafast mode, or `speed: "fast"` only when the user explicitly requests fast mode (including `speed:ultrafast` / `speed:fast` tokens). Strip these speed tokens before interpreting the remaining arguments. Otherwise omit `speed`. Never infer speed from urgency, a request for a quick review, model, effort, or host settings. Never substitute one speed for the other; non-Codex partners do not accept this option. Check the start response's `speed` against the request.
 
 - `pr:<number|url>`: review an actual pull request via `gh`. This reviews what is
   on the PR, not what is in the working tree, and needs an authenticated `gh`.
@@ -31,7 +33,7 @@ skill when they want thoroughness or say "PR review".
   `types`, `simplify`. Omit to let the server select from the diff.
 - `rounds:N`: soft budget for the conversation AFTER the panel reports.
 - `effort:<level>`, `model:<name>`: partner overrides.
-- `timeout:<minutes>`: per-pass wait hint.
+- `timeout:<minutes>`: per-invocation wait hint (the whole native panel, or each sequential pass).
 - Remaining free text: `review_focus`.
 
 `simplify` is opt-in and never auto-selected. It proposes rewrites rather than
@@ -45,8 +47,8 @@ the agent, and the table changes whenever a vendor ships. Call
 as given and surface any server error verbatim rather than pre-judging the pair.
 
 If `effort:max` is given with no `timeout:*`, set `partner_timeout_ms:
-1800000`. Note this hint is **per pass**, and a panel runs several passes back to
-back, so total wall-clock is roughly the hint times the number of aspects.
+1800000`. Native mode applies this to its single orchestrator invocation;
+sequential mode applies it separately to each pass.
 
 ## Start the panel
 
@@ -75,7 +77,9 @@ Save the returned `session_id`.
 
 **Read the response, do not just store it.**
 
-- `aspects` — which specialists will run, one partner turn each
+- `aspects` — which specialists will run
+- `panel_execution` — native parallel subagents or sequential partner turns
+- `partner_invocations` — initial CLI invocation count; `total_passes` counts logical reports
 - `skipped_aspects` — which will NOT run, and why
 - `total_passes` — specialists plus one consolidation pass
 - `max_rounds` includes the panel, because every pass appends a partner message;

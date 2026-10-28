@@ -31,6 +31,7 @@ import {
   extractNormalizedFindings,
 } from "../src/pr-review-aspects.mjs";
 import { computeReviewStatus, extractReviewVerdict } from "../src/shared.mjs";
+import { startNativePanel } from "../src/pr-review-native.mjs";
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const RUNNER_PATH = path.join(REPO_ROOT, "src", "pr-review-runner.mjs");
@@ -71,6 +72,7 @@ writeFakeAdapter(ADAPTER_DIR, "fake-panel", FAKE_BIN);
 // Passed as the runner's partner COMMAND, so it runs under the same adapter --
 // only the binary's behavior differs.
 const EMPTY_BIN = writeFakeCli(BIN_DIR, "fake-empty.mjs", "sidecar-ok", { reply: "" });
+const NATIVE_CONFIG = { instructions: "Launch independent native specialists in parallel.", toolProfile: "read" };
 
 // A specialist that ignores the instruction not to emit a session verdict, and
 // does it in the shape a model most plausibly would: as a markdown heading over
@@ -253,7 +255,7 @@ function readConversation(sessionDir) {
     .filter(Boolean);
 }
 
-function setupSession(label, aspects) {
+function setupSession(label, aspects, nativeSubagents = null) {
   const sessionId = `review-${Date.now()}-${label}`;
   const sessionDir = path.join(HOME, ".dualog", "sessions", sessionId);
   fs.mkdirSync(sessionDir, { recursive: true });
@@ -263,6 +265,7 @@ function setupSession(label, aspects) {
     path.join(sessionDir, "pr_review_meta.json"),
     JSON.stringify({
       review_kind: "pr_panel",
+      native_subagents: nativeSubagents,
       scope: "pr",
       scope_label: "pull request #9 (feature → main)",
       pr: {
@@ -967,4 +970,110 @@ test("a host message after the panel gets a follow-up turn, not a second panel",
   } finally {
     await stopRunner(child, sessionDir);
   }
+});
+
+for (const [label, options, expectedApproval] of [
+  ["success", {}, true],
+  ["failed-child", { failedAspect: "code" }, false],
+  ["missing-child", { omitAspect: "code" }, false],
+  ["premature", { premature: true }, false],
+]) {
+  test(`native panel: ${label}`, async () => {
+    const { sessionDir } = setupSession(`native-${label}`, ["code", "tests"], NATIVE_CONFIG);
+    const binary = writeFakeCli(BIN_DIR, `native-${label}`, "native-panel", { native: options });
+    const child = startRunner(sessionDir, 2, binary);
+    try {
+      const deadline = Date.now() + 20000;
+      let panel;
+      do {
+        try {
+          panel = JSON.parse(fs.readFileSync(path.join(sessionDir, "panel_state.json"), "utf-8"));
+        } catch {}
+        if (panel?.phase === "follow_up") break;
+        assert.ok(Date.now() < deadline, runnerLogTail(sessionDir));
+        assert.equal(child.exitCode, null, runnerLogTail(sessionDir));
+        await sleep(100);
+      } while (true);
+
+      const messages = readConversation(sessionDir);
+      const status = JSON.parse(fs.readFileSync(path.join(sessionDir, "status.json"), "utf-8"));
+      const review = computeReviewStatus(status, messages, { panelState: panel });
+      assert.equal(review.approved, expectedApproval, JSON.stringify(review.panel_integrity));
+      const events = fs.readFileSync(path.join(sessionDir, "panel", "events.jsonl"), "utf-8")
+        .trim().split("\n").map((line) => JSON.parse(line));
+      assert.deepEqual(events.slice(0, 2).map((event) => event.kind), ["start", "start"]);
+      assert.equal(events.find((event) => event.kind === "end")?.aspect, "tests");
+      const turns = fs.readdirSync(path.join(sessionDir, "turns"));
+      assert.equal(turns.length, 1, "the entire panel must use one partner invocation");
+      assert.ok(panel.completed.some((entry) => entry.aspect === "tests" && entry.status === "complete"));
+      if (expectedApproval) {
+        assert.deepEqual(panel.findings.map((finding) => finding.id), ["F-code-1", "F-tests-1"]);
+        const aggregation = fs.readFileSync(path.join(sessionDir, "panel", "received_aggregate.md"), "utf-8");
+        assert.match(aggregation, /F-code-1 \[CORRECTNESS\]/);
+        assert.match(aggregation, /F-tests-1 \[CORRECTNESS\]/);
+        assert.equal(review.panel_integrity.finding_contract.satisfied, true);
+      }
+      if (options.failedAspect || options.omitAspect) {
+        assert.equal(panel.completed.find((entry) => entry.aspect === "code").status, "failed");
+      }
+    } finally {
+      await stopRunner(child, sessionDir);
+    }
+  });
+}
+
+test("cancelling a native panel stops its orchestrator while reports are pending", async () => {
+  const { sessionDir } = setupSession("native-cancel", ["code", "tests"], NATIVE_CONFIG);
+  const binary = writeFakeCli(BIN_DIR, "native-cancel", "native-panel", { native: { hang: true } });
+  const child = startRunner(sessionDir, 2, binary);
+  try {
+    const deadline = Date.now() + 15000;
+    while (!fs.existsSync(path.join(sessionDir, "panel", "waiting"))) {
+      assert.ok(Date.now() < deadline, runnerLogTail(sessionDir));
+      assert.equal(child.exitCode, null, runnerLogTail(sessionDir));
+      await sleep(100);
+    }
+    fs.writeFileSync(path.join(sessionDir, "end_signal"), "");
+    while (child.exitCode === null && child.signalCode === null) {
+      assert.ok(Date.now() < deadline, runnerLogTail(sessionDir));
+      await sleep(100);
+    }
+    assert.equal(child.exitCode, 0);
+    assert.equal(readConversation(sessionDir).filter((message) => message.from === "fake-panel").length, 0);
+    for (const turn of fs.readdirSync(path.join(sessionDir, "turns"))) {
+      assert.equal(fs.existsSync(path.join(sessionDir, "turns", turn, "headless-child.json")), false);
+    }
+  } finally {
+    await stopRunner(child, sessionDir);
+  }
+});
+
+test("an unwritable consolidation handoff cannot leave the native coordinator waiting", async () => {
+  const { sessionDir } = setupSession("native-handoff-failure", ["code"], NATIVE_CONFIG);
+  let stopped = false;
+  const panel = await startNativePanel({
+    sessionDir,
+    projectPath: ROOT,
+    aspects: ["code"],
+    instructions: NATIVE_CONFIG.instructions,
+    model: "review-model",
+    reasoningEffort: "high",
+    buildPrompt: () => "Review the fixture.",
+    toPartnerPath: async (file) => file,
+    run: async (prompt) => {
+      assert.match(prompt, /Parent model: review-model/);
+      assert.match(prompt, /Parent reasoning effort: high/);
+      assert.match(prompt, /Parent speed: standard \(inherit; never opt into another speed\)/);
+      while (!fs.existsSync(path.join(sessionDir, "end_signal"))) await sleep(10);
+      stopped = true;
+      throw new Error("cancelled");
+    },
+  });
+  try {
+    fs.mkdirSync(path.join(sessionDir, "panel", "aggregate_prompt.md"));
+    await assert.rejects(panel.aggregate("consolidate"));
+  } finally {
+    await panel.stop();
+  }
+  assert.equal(stopped, true);
 });

@@ -155,8 +155,8 @@ then discusses it with you. It is the fast general read.
 `start_pr_review` runs a **panel**: the pr-review-toolkit flow, ported so any
 connected agent can perform it. The same change is reviewed once per aspect —
 general code quality, test coverage, error handling, comment accuracy, type
-design, and optionally simplification — each in its own partner turn carrying
-only that specialist's rubric, and a final pass consolidates them into one
+design, and optionally simplification — each in its own isolated context carrying
+only that specialist's rubric, and consolidation turns them into one
 prioritized report. Aspects are selected from the diff unless you name them, and
 the ones that were *not* run are reported as explicitly as the ones that were.
 
@@ -167,14 +167,23 @@ pre-existing, and duplicate dispositions require a rationale.
 
 Splitting the lenses is the point. A single prompt holding all six rubrics
 produces a generalist doing six things adequately, which is what the panel exists
-to avoid. It costs one partner turn per aspect plus one to consolidate, so it is
-slower and more expensive than a single-pass review — reach for it on a real PR,
-not on every save.
+to avoid. Built-in adapters declare native subagents: one partner orchestrator
+launches the specialists in parallel, waits for them, and consolidates in that
+same invocation. Dualog imports each raw report and assigns finding IDs before
+releasing the consolidation prompt. Follow-up discussion keeps its existing
+separate-turn behavior.
 
-The panel is sequential, not parallel: every turn in a session writes the same
-`current_terminal.json`, so two concurrent passes would leave that record
-describing whichever finished last, and session teardown would terminate the
-wrong pane.
+`panel_execution` reports `native-subagents` or `sequential`. `total_passes`
+counts logical specialist reports plus consolidation, not CLI invocations;
+`partner_invocations` states the initial invocation count. Native concurrency
+limits, model inheritance, and tool availability are controlled by the selected
+CLI. A native capability failure is reported as incomplete, never silently
+retried as a second review. Adapters without `nativeSubagents` retain sequential
+execution; set that field to `null` in an override to select that path.
+
+Native specialist reports live under the session's `panel/` directory. Report
+files establish what was reported; they do not independently prove that native
+subagents ran concurrently. Inspect the CLI transcript/events for that evidence.
 
 Use `get_pr_review_report` rather than `get_review_summary` for a panel session.
 It is the only view that distinguishes an aspect that found nothing from one that
@@ -249,6 +258,22 @@ This is unconditional and does not depend on per-CLI cooperation, which matters:
 ## Configuration
 
 `start_dialog` and `start_code_review` accept `partner_agent`, `partner_command`, `model`, `reasoning_effort`, `max_rounds`, `tool_profile`, `subject_path`.
+
+For Codex partners, `start_dialog`, `start_code_review`, `start_pr_review`, and
+`check_adapter` also accept `speed: "fast"` or `speed: "ultrafast"`. Only set this
+when the user explicitly requests that exact mode; urgency, a quick review,
+model choice, and reasoning effort do not opt in. Slash commands also accept
+`speed:fast` / `speed:ultrafast`. Omit `speed` for standard service, even when the
+user's Codex config enables a faster tier. Other partners reject this option.
+
+The start response and session status echo `speed` (`null` when omitted). The
+selection applies to every session turn, including PR panel and follow-up calls.
+Interactive launches use `codex -p fast` / `codex -p ultrafast`; headless launches
+use `codex exec -p fast` / `codex exec -p ultrafast`. Dualog creates a minimal
+profile in the isolated Codex home and overrides `service_tier` for the invocation,
+so user profiles cannot change the selected model or permissions. Your real
+Codex config is untouched. Account and model support still apply; see
+[Codex speed modes](https://learn.chatgpt.com/docs/agent-configuration/speed).
 
 `start_pr_review` takes the same partner options, plus `pr`, `aspects`, and
 `follow_up_rounds`. It uses `follow_up_rounds` rather than `max_rounds` because

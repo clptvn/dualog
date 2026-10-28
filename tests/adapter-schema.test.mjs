@@ -38,6 +38,23 @@ test("the base fixture validates", () => {
   assert.deepEqual(parsed.__sources, ["/fixtures/fake.json"]);
 });
 
+test("native delegation is optional, configurable, and can be disabled", () => {
+  assert.equal(parseManifest(baseManifest(), "/fake.json").nativeSubagents, undefined);
+  assert.equal(parseManifest(baseManifest({ nativeSubagents: null }), "/fake.json").nativeSubagents, null);
+  assert.deepEqual(parseManifest(baseManifest({
+    nativeSubagents: { instructions: "Use native workers." },
+  }), "/fake.json").nativeSubagents, { instructions: "Use native workers.", toolProfile: "read" });
+  assert.throws(() => parseManifest(baseManifest({
+    nativeSubagents: { instructions: " " },
+  }), "/fake.json"), /Invalid adapter manifest/);
+  assert.throws(() => parseManifest(baseManifest({
+    nativeSubagents: { instructions: "Use workers.", toolProfile: "missing" },
+  }), "/fake.json"), /must name an existing tool profile/);
+  assert.throws(() => parseManifest(baseManifest({
+    nativeSubagents: { instructions: "Use workers.", toolProfile: "constructor" },
+  }), "/fake.json"), /must name an existing tool profile/);
+});
+
 test("startup prompts declare one validated interaction shape", () => {
   const withStartupPrompt = (response) =>
     baseManifest({
@@ -488,6 +505,7 @@ test("every location in the invocation context is classified", async () => {
     "model",
     "reasoningEffort",
     "reasoningEffortJson",
+    "speed",
     "initialPrompt",
     "toolProfile",
     "toolProfileAllowedTools",

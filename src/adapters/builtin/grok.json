@@ -36,7 +36,11 @@
     "catalogProvider": "xai"
   },
   "defaultToolProfile": "read",
-  "toolProfiles": {},
+  "nativeSubagents": {
+    "toolProfile": "pr-review",
+    "instructions": "Call spawn_subagent once per aspect with run_in_background:true and the general-purpose type. Start all children before waiting. Collect every result with get_command_or_subagent_output; do not finish while any child is still running."
+  },
+  "toolProfiles": { "pr-review": {} },
   "mcp": { "strategy": "config-dir" },
   "configIsolation": {
     "env": "GROK_HOME",
@@ -63,11 +67,12 @@
           "--no-plan",
           "--no-ask-user",
           "--no-leader",
-          "--no-wait-for-background",
           "--no-auto-update",
           "--output-format", "json"
         ]
       },
+      { "when": { "equals": { "key": "toolProfile", "value": "read" } }, "args": ["--no-wait-for-background"] },
+      { "when": { "equals": { "key": "toolProfile", "value": "implementation" } }, "args": ["--no-wait-for-background"] },
       { "when": { "set": "model" }, "args": ["-m", "{{model}}"] },
       { "when": { "set": "reasoningEffort" }, "args": ["--reasoning-effort", "{{reasoningEffort}}"] },
       { "args": ["-p", "{{initialPrompt}}"] }

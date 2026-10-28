@@ -57,6 +57,11 @@ const FAKE_REPLY = [
 
 const FAKE_BIN = writeFakeCli(BIN_DIR, "fake-e2e.mjs", "sidecar-ok", { reply: FAKE_REPLY });
 writeFakeAdapter(ADAPTER_DIR, "fake-e2e", FAKE_BIN);
+const NATIVE_BIN = writeFakeCli(BIN_DIR, "fake-e2e-native.mjs", "native-panel");
+writeFakeAdapter(ADAPTER_DIR, "fake-e2e-native", NATIVE_BIN, {
+  nativeSubagents: { instructions: "Run native review children in parallel.", toolProfile: "custom-review" },
+  toolProfiles: { "custom-review": {} },
+});
 
 // A partner that returns nothing, so every pass fails. Used to reach the one
 // state get_pr_review_report's failed-aspect handling exists for.
@@ -667,6 +672,31 @@ test("send_message is accepted once the panel has reported", async (t) => {
     );
     const sent = JSON.parse(text);
     assert.equal(sent.sent, true);
+  });
+});
+
+test("a custom adapter opts into one native orchestrator through the live server", async (t) => {
+  await withServer(t, async (client) => {
+    const started = await callJson(client, "start_pr_review", {
+      project_path: REPO_ROOT,
+      diff_target: `commit:${HEAD_SHA}`,
+      aspects: ["code", "tests"],
+      partner_agent: "fake-e2e-native",
+    });
+    assert.equal(started.panel_execution, "native-subagents");
+    assert.equal(started.partner_invocations, 1);
+    assert.equal(started.total_passes, 3);
+    let report = await waitForSuccessfulPanel(client, started.session_id);
+    // The consolidation append can precede the final panel-state write.
+    const deadline = Date.now() + 5000;
+    while (report.phase !== "follow_up" && Date.now() < deadline) {
+      await sleep(100);
+      report = await callJson(client, "get_pr_review_report", { session_id: started.session_id });
+    }
+    assert.equal(report.panel_execution, "native-subagents");
+    assert.deepEqual(report.aspects_reported, ["code", "tests"]);
+    assert.equal(report.review_status.approved, true, JSON.stringify(report.review_status));
+    assert.deepEqual(report.undispositioned_finding_ids, []);
   });
 });
 

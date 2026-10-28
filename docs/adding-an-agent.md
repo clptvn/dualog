@@ -29,6 +29,58 @@ npm test               # the contract suite runs over every registered adapter
 
 Every validation error names the file it came from.
 
+## Native PR review subagents
+
+Adapters can opt into one native orchestrator that delegates specialist reviews
+in parallel. Omit `nativeSubagents`, or set it to `null`, for sequential turns.
+No JavaScript engine changes are required for a custom CLI:
+
+```json
+"nativeSubagents": {
+  "instructions": "Use this CLI's native task tool to start all specialist tasks together, then await every result. Pass only each task's instructions to its child; do not fork the orchestrator context.",
+  "toolProfile": "pr-review"
+},
+"toolProfiles": {
+  "pr-review": {}
+}
+```
+
+`instructions` must name the real native delegation tool and its wait semantics.
+`toolProfile` defaults to `read`; any other value must name a declared profile.
+Use existing argv conditions on `toolProfile` to enable native tools or extensions
+only for the orchestrator. For example:
+
+```json
+{ "when": { "equals": { "key": "toolProfile", "value": "pr-review" } },
+  "args": ["--enable-native-agents"] }
+```
+
+That flag is illustrative; use only flags supported by your CLI. Dualog supplies
+the aspect prompts, separate completion files, and a runner-generated aggregation
+prompt containing sanitized reports and the durable finding ledger. The coordinator
+must wait for that prompt before completing its outer turn. Children must write
+only their assigned report artifacts and must not edit the reviewed project.
+The native CLI must stay in the foreground until all children have stopped,
+including on cancellation, as required by the scratch lifecycle contract below.
+
+Built-in delegation mechanisms and their primary references:
+
+| Adapter | Native delegation | Launch requirements |
+| --- | --- | --- |
+| Claude | [Agent / general-purpose](https://code.claude.com/docs/en/sub-agents) | The review profile permits `Agent` |
+| Codex | [Native subagents](https://developers.openai.com/codex/multi-agent) | Review-only agent enablement and concurrency settings |
+| OpenCode | [Task / general](https://opencode.ai/docs/agents/) | Existing automatic tool permissions |
+| Qwen | [Regular isolated agents](https://qwenlm.github.io/qwen-code-docs/en/users/features/sub-agents/) | Await background completions; avoid `fork` and external executors |
+| Cursor | [Task](https://cursor.com/docs/subagents) | Issue independent calls together; avoid faster Explore roles |
+| Grok | [spawn_subagent](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/16-subagents.md) | Await outputs; omit `--no-wait-for-background`, retain `--no-leader` |
+| Goose | [Summon delegate](https://github.com/aaif-goose/goose/blob/main/crates/goose/src/agents/platform_extensions/summon.rs) | Enable `summon`; await foreground delegate calls |
+
+These declarations describe current documented interfaces, not a guarantee for
+every installed version or model. Native failures remain failed/unreviewed;
+there is no automatic sequential retry. A report file alone is not evidence of
+an actual subagent spawn: use native events or transcripts to verify delegation,
+child model selection, overlap, and cancellation on the installed CLI.
+
 ---
 
 ## The two engines

@@ -78,7 +78,11 @@
   },
 
   "defaultToolProfile": "read",
-  "toolProfiles": {},
+  "nativeSubagents": {
+    "toolProfile": "pr-review",
+    "instructions": "Use the native spawn_agent tool to create one isolated agent per aspect, then wait for all agents. Explicitly request parallel delegation. Do not fork the full orchestrator conversation into children. Preserve the parent's model and reasoning effort rather than selecting a different custom role. Close the child agents after collecting their results."
+  },
+  "toolProfiles": { "pr-review": {} },
 
   "mcp": { "strategy": "config-dir" },
 
@@ -97,6 +101,10 @@
   "argv": {
     "tmux-interactive": [
       {
+        "when": { "equals": { "key": "toolProfile", "value": "pr-review" } },
+        "args": ["-c", "agents.enabled=true", "-c", "agents.max_concurrent_threads_per_session=6"]
+      },
+      {
         "args": [
           "-C",
           "{{projectPath}}",
@@ -111,6 +119,8 @@
           "approval_policy=\"never\""
         ]
       },
+      { "when": { "set": "speed" }, "args": ["-p", "{{speed}}", "-c", "service_tier=\"{{speed}}\"", "-c", "features.{{speed}}_mode=true"] },
+      { "when": { "notSet": "speed" }, "args": ["-c", "service_tier=\"default\""] },
       { "when": { "set": "model" }, "args": ["--model", "{{model}}"] },
       {
         "when": { "set": "reasoningEffort" },
@@ -119,6 +129,10 @@
       { "when": { "set": "initialPrompt" }, "args": ["{{initialPrompt}}"] }
     ],
     "headless": [
+      {
+        "when": { "equals": { "key": "toolProfile", "value": "pr-review" } },
+        "args": ["-c", "agents.enabled=true", "-c", "agents.max_concurrent_threads_per_session=6"]
+      },
       {
         "args": [
           "exec",
@@ -132,6 +146,8 @@
           "approval_policy=\"never\""
         ]
       },
+      { "when": { "set": "speed" }, "args": ["-p", "{{speed}}", "-c", "service_tier=\"{{speed}}\"", "-c", "features.{{speed}}_mode=true"] },
+      { "when": { "notSet": "speed" }, "args": ["-c", "service_tier=\"default\""] },
       { "when": { "set": "model" }, "args": ["--model", "{{model}}"] },
       {
         "when": { "set": "reasoningEffort" },

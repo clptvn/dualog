@@ -229,6 +229,24 @@ test("every aspect builds a prompt carrying its own rubric", () => {
   }
 });
 
+test("the silent-failure specialist verifies every candidate before normalizing findings", () => {
+  const prompt = aspectPrompt("errors");
+  assert.ok(prompt.indexOf("PHASE 1: Hunt") < prompt.indexOf("PHASE 2: Verify by Tracing"));
+  assert.match(prompt, /For EVERY candidate from Phase 1 — no exceptions/);
+  for (const step of [
+    "Read the full source file",
+    "Follow the call chain",
+    "Identify every exception handler",
+    "Check what callers do with the return value",
+    "Check for self-healing mechanisms",
+    "Determine the real user impact",
+  ]) assert.ok(prompt.includes(step), `missing tracing requirement: ${step}`);
+  assert.match(prompt, /\*\*CONFIRMED\*\*/);
+  assert.match(prompt, /\*\*DISPROVED\*\*/);
+  assert.match(prompt, /Only confirmed findings belong in the required normalized-findings section/);
+  assert.match(prompt, /Do not attach category tags or finding IDs to disproved candidates/);
+});
+
 test("no specialist pass is allowed to emit a review verdict", () => {
   // The load-bearing invariant of the panel. shared.mjs resolves the whole
   // session from any partner line beginning VERDICT/STATUS/REVIEW_VERDICT, so a

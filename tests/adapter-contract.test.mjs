@@ -58,6 +58,23 @@ test("the registry is non-empty", () => {
   assert.ok(ADAPTERS.length >= 7, `only ${ADAPTERS.length} adapters loaded`);
 });
 
+test("native review launch settings are scoped to the declared orchestrator profile", () => {
+  const byId = Object.fromEntries(ADAPTERS.map((adapter) => [adapter.id, adapter]));
+  for (const adapter of ADAPTERS) assert.ok(adapter.nativeSubagents?.instructions);
+  const claude = invoke(byId.claude, "headless", "pr-review").args;
+  assert.ok(claude[claude.indexOf("--allowedTools") + 1].includes("Agent"));
+  assert.ok(claude[claude.indexOf("--allowedTools") + 1].includes("TaskOutput"));
+  assert.ok(claude.includes("stream-json"));
+  assert.equal(invoke(byId.claude, "headless", "read").args.includes("stream-json"), false);
+  const codex = invoke(byId.codex, "headless", "pr-review").args;
+  assert.ok(codex.includes("agents.enabled=true"));
+  assert.equal(invoke(byId.codex, "headless", "read").args.includes("agents.enabled=true"), false);
+  assert.equal(invoke(byId.grok, "headless", "pr-review").args.includes("--no-wait-for-background"), false);
+  assert.equal(invoke(byId.grok, "headless", "read").args.includes("--no-wait-for-background"), true);
+  assert.ok(invoke(byId.goose, "headless", "pr-review").args.includes("summon"));
+  assert.equal(invoke(byId.goose, "headless", "read").args.includes("summon"), false);
+});
+
 test("explicit adapter directories use the host path-list delimiter", () => {
   const first = path.join(ROOT, "explicit-one");
   const second = path.join(ROOT, "explicit-two");

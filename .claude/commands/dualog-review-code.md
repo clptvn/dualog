@@ -1,6 +1,6 @@
 ---
 description: Have a partner agent review your code changes via the dualog MCP server
-argument-hint: [optional: diff_target (uncommitted|staged|branch|commit:<sha>)] [optional: review focus] [optional: rounds:N] [optional: effort:<level>] [optional: model:<id>] [optional: partner:<agent-id>]
+argument-hint: [optional: diff_target (uncommitted|staged|branch|commit:<sha>)] [optional: review focus] [optional: rounds:N] [optional: effort:<level>] [optional: model:<id>] [optional: partner:<agent-id>] [optional: speed:fast|ultrafast]
 allowed-tools: mcp__dualog__start_code_review, mcp__dualog__check_messages, mcp__dualog__send_message, mcp__dualog__get_review_summary, mcp__dualog__get_full_history, mcp__dualog__check_partner_alive, mcp__dualog__send_key, mcp__dualog__end_dialog, mcp__dualog__list_sessions, mcp__dualog__list_models, mcp__dualog__check_adapter, Bash, Read, Glob, Grep, Edit, Write, AskUserQuestion, LSP, Monitor
 ---
 
@@ -25,6 +25,8 @@ Review code: $ARGUMENTS
 ---
 
 ## PHASE 0: DETECT CONTEXT
+
+For Codex partners, pass `speed: "ultrafast"` only when the user explicitly requests ultrafast mode, or `speed: "fast"` only when the user explicitly requests fast mode (including `speed:ultrafast` / `speed:fast` tokens). Strip these speed tokens before interpreting the remaining arguments. Otherwise omit `speed`. Never infer speed from urgency, a request for a quick review, model, effort, or host settings. Never substitute one speed for the other; non-Codex partners do not accept this option. Check the start response's `speed` against the request.
 
 Determine the project path:
 ```bash

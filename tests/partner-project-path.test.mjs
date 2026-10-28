@@ -81,8 +81,8 @@ test("every PR panel phase uses one captured partner path and runtime context", 
 
   assert.equal(
     (PR_REVIEW.match(/projectPath: partnerProjectPath,/gu) || []).length,
-    3,
-    "specialist, consolidation, and follow-up prompts must all use the partner path"
+    5,
+    "native orchestration, its specialists, and every sequential phase must use the partner path"
   );
   assert.equal(
     (PR_REVIEW.match(/runTurn\([\s\S]*?runtimeContext\n\s*\)/gu) || []).length,

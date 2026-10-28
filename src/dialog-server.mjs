@@ -163,6 +163,13 @@ const REASONING_EFFORT_DESCRIPTION =
 const ALL_EFFORTS = [
   ...new Set([...ALL_REASONING_EFFORTS, ...listAdapters().flatMap((a) => a.reasoningEfforts)]),
 ];
+const CODEX_SPEED = z.enum(["fast", "ultrafast"]).optional().describe(
+  "Codex only. Set 'ultrafast' ONLY when the user explicitly requests ultrafast mode, " +
+  "or 'fast' ONLY when the user explicitly requests fast mode. Never infer this from " +
+  "urgency, task size, model, effort, or host settings. Omit otherwise; Codex then uses " +
+  "standard service even if the user's config enables fast or ultrafast. Applies to " +
+  "every turn in this session. These modes can consume more usage."
+);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -401,6 +408,7 @@ async function preflightPartner(partnerAgent, {
   partnerCommand,
   model,
   reasoningEffort,
+  speed,
   toolProfile,
   projectPath,
   allowUnknownModel = false,
@@ -470,6 +478,7 @@ async function preflightPartner(partnerAgent, {
       toolProfile: toolProfile || "read",
       model: model || null,
       reasoningEffort: requestedEffort,
+      speed,
       projectPath: projectPath || process.cwd(),
       sessionDir: projectPath || process.cwd(),
       discoveredModels,
@@ -507,6 +516,7 @@ async function preflightPartner(partnerAgent, {
     tmuxLauncher: runtimeContext.tmuxLauncher,
     tmuxControlBinary: runtimeContext.tmuxControlBinary,
     tmuxSocketName: runtimeContext.tmuxSocketName,
+    ...(speed != null ? { speed } : {}),
   });
 
   return {
@@ -520,6 +530,7 @@ async function preflightPartner(partnerAgent, {
     // max) makes it differ for reasons that have nothing to do with loss.
     requestedModel: model ?? null,
     requestedEffort: reasoningEffort ?? null,
+    speed: result.resolution?.speed ?? null,
     // What the turn will actually run as, which is not always what was asked
     // for -- an alias may have been translated, or the CLI's own default used.
     //
@@ -835,6 +846,7 @@ server.tool(
       .describe(
         "Soft round budget (default: 5). The partner is asked to deliver all feedback within this many rounds. Hard cap = max_rounds + 5. Do not override unless the user explicitly requested a different budget."
       ),
+    speed: CODEX_SPEED,
     reasoning_effort: z
       .enum(ALL_EFFORTS)
       .optional()
@@ -882,6 +894,7 @@ server.tool(
     claude_command,
     max_rounds,
     reasoning_effort,
+    speed,
     model,
     partner_timeout_ms,
     tool_profile,
@@ -920,6 +933,7 @@ server.tool(
       partnerCommand,
       model,
       reasoningEffort: reasoning_effort,
+      speed,
       toolProfile: tool_profile,
       projectPath: resolvedProjectPath,
       allowUnknownModel: allow_unknown_model === true,
@@ -978,6 +992,7 @@ server.tool(
       ...(partnerAgent === "codex" ? { codex_command: partnerCommand } : {}),
       max_rounds: softCap,
       hard_cap: hardCap,
+      speed: preflight.speed,
       reasoning_effort: effectiveReasoningEffort,
       model: effectiveModel ?? null,
       engine: preflight.engine,
@@ -1064,6 +1079,7 @@ server.tool(
               hard_cap: hardCap,
               requested_model: preflight.requestedModel,
               requested_reasoning_effort: preflight.requestedEffort,
+              speed: preflight.speed,
               reasoning_effort: effectiveReasoningEffort,
               effective_reasoning_effort: preflight.effectiveEffort,
               warnings: preflightWarnings,
@@ -1146,6 +1162,7 @@ server.tool(
       .describe(
         "Soft round budget (default: 5). The reviewer is asked to deliver all feedback within this many rounds. Hard cap = max_rounds + 5. Do not override unless the user explicitly requested a different budget."
       ),
+    speed: CODEX_SPEED,
     reasoning_effort: z
       .enum(ALL_EFFORTS)
       .optional()
@@ -1180,6 +1197,7 @@ server.tool(
     claude_command,
     max_rounds,
     reasoning_effort,
+    speed,
     model,
     partner_timeout_ms,
     allow_unknown_model,
@@ -1219,6 +1237,7 @@ server.tool(
       partnerCommand,
       model,
       reasoningEffort: reasoning_effort,
+      speed,
       toolProfile: "read",
       projectPath: project_path,
       allowUnknownModel: allow_unknown_model === true,
@@ -1415,6 +1434,7 @@ server.tool(
       review_focus: review_focus || null,
       max_rounds: softCap,
       hard_cap: hardCap,
+      speed: preflight.speed,
       reasoning_effort: effectiveReasoningEffort,
       model: effectiveModel ?? null,
       engine: preflight.engine,
@@ -1508,6 +1528,7 @@ server.tool(
               hard_cap: hardCap,
               requested_model: preflight.requestedModel,
               requested_reasoning_effort: preflight.requestedEffort,
+              speed: preflight.speed,
               reasoning_effort: effectiveReasoningEffort,
               effective_reasoning_effort: preflight.effectiveEffort,
               warnings: preflightWarnings,
@@ -1767,7 +1788,7 @@ server.tool(
             (id) =>
               `'${id}' (${PR_REVIEW_ASPECTS[id].title}${PR_REVIEW_ASPECTS[id].optIn ? ", opt-in only" : ""})`
           ).join(", ") +
-          ". Each selected aspect costs one partner turn, plus one for consolidation."
+          ". Native adapters delegate these aspects in parallel inside one orchestrator; other adapters use one partner turn per aspect plus consolidation."
       ),
     review_focus: z
       .string()
@@ -1801,6 +1822,7 @@ server.tool(
       .describe(
         "Soft budget for the CONVERSATION after the panel reports (default: 5). Panel and consolidation passes are the review itself and are not charged against this. The follow-up conversation's own hard cap is follow_up_rounds + 5; the session-wide `hard_cap` in the response is larger, because it also covers the panel passes."
       ),
+    speed: CODEX_SPEED,
     reasoning_effort: z.enum(ALL_EFFORTS).optional().describe(REASONING_EFFORT_DESCRIPTION),
     model: z.string().optional().describe(MODEL_OVERRIDE_DESCRIPTION),
     partner_timeout_ms: z
@@ -1809,7 +1831,7 @@ server.tool(
       .min(MIN_PARTNER_TIMEOUT_MS)
       .optional()
       .describe(
-        "Per-turn wait hint in milliseconds (default: 900000 = 15 minutes). Note this is PER PASS, and a panel runs several passes back to back, so a full review takes roughly this times the number of aspects. Interactive tmux turns are not killed by this value."
+        "Per-invocation wait hint in milliseconds (default: 900000 = 15 minutes). Native mode uses one invocation for specialists and consolidation; sequential mode applies it to each pass. Interactive tmux turns are not killed by this value."
       ),
     allow_unknown_model: z
       .boolean()
@@ -1833,6 +1855,7 @@ server.tool(
     claude_command,
     follow_up_rounds,
     reasoning_effort,
+    speed,
     model,
     partner_timeout_ms,
     allow_unknown_model,
@@ -1863,6 +1886,7 @@ server.tool(
       };
     }
 
+    const nativeSubagents = tryGetAdapter(partnerAgent)?.nativeSubagents ?? null;
     const followUpRounds = follow_up_rounds || 5;
     const partnerTimeoutMs = normalizePartnerTimeout(partner_timeout_ms);
     let partnerCommand = resolvePartnerCommandValue(
@@ -1877,7 +1901,8 @@ server.tool(
       partnerCommand,
       model,
       reasoningEffort: reasoning_effort,
-      toolProfile: "read",
+      speed,
+      toolProfile: nativeSubagents?.toolProfile ?? "read",
       projectPath: project_path,
       allowUnknownModel: allow_unknown_model === true,
     });
@@ -2112,6 +2137,7 @@ server.tool(
 
     const meta = {
       review_kind: "pr_panel",
+      native_subagents: nativeSubagents,
       scope: target,
       scope_label: scopeLabel,
       pr: prInfo,
@@ -2159,9 +2185,11 @@ server.tool(
       aspects: selection.selected,
       skipped_aspects: skipped,
       panel_passes: panelPasses,
+      panel_execution: nativeSubagents ? "native-subagents" : "sequential",
       follow_up_rounds: followUpRounds,
       max_rounds: maxRounds,
       hard_cap: hardCap,
+      speed: preflight.speed,
       reasoning_effort: preflight.effort,
       model: preflight.model ?? null,
       engine: preflight.engine,
@@ -2242,6 +2270,8 @@ server.tool(
               aspects: selection.selected,
               skipped_aspects: skipped,
               panel_passes: panelPasses,
+              panel_execution: status.panel_execution,
+              partner_invocations: nativeSubagents ? 1 : totalPasses,
               total_passes: totalPasses,
               files_changed: changedFiles.length,
               diff_size: diff.length,
@@ -2256,6 +2286,7 @@ server.tool(
               hard_cap: hardCap,
               requested_model: preflight.requestedModel,
               requested_reasoning_effort: preflight.requestedEffort,
+              speed: preflight.speed,
               reasoning_effort: preflight.effort,
               effective_reasoning_effort: preflight.effectiveEffort,
               warnings: preflight.warnings ?? [],
@@ -2267,7 +2298,7 @@ server.tool(
               partner_timeout_ms: partnerTimeoutMs,
               message:
                 `PR review panel started: ${panelPasses} specialist pass(es) (${selection.selected.join(", ")}) ` +
-                `then 1 consolidation pass, run by ${partnerDisplay} at model ${preflight.model ?? "default"}, ` +
+                `then 1 consolidation pass${nativeSubagents ? " inside one native orchestrator turn" : " in sequential partner turns"}, run by ${partnerDisplay} at model ${preflight.model ?? "default"}, ` +
                 `effort ${describeEffort(preflight.effort, preflight.effectiveEffort)}. ` +
                 `Each pass appends its report as it lands, so expect ${totalPasses} partner messages before the follow-up ` +
                 `conversation begins — do not read the first one as the finished review. ` +
@@ -2513,6 +2544,7 @@ server.tool(
             {
               session_id,
               review_kind: "pr_panel",
+              panel_execution: status?.panel_execution ?? "sequential",
               scope_label: meta?.scope_label ?? status?.diff_label ?? null,
               pr: meta?.pr
                 ? {
@@ -3450,6 +3482,7 @@ server.tool(
       .optional()
       .describe("Execution engine to check. Defaults to the adapter's own default."),
     model: z.string().optional(),
+    speed: CODEX_SPEED,
     reasoning_effort: z
       .string()
       .optional()
@@ -3464,7 +3497,7 @@ server.tool(
         "Pass a model the server does not recognize anyway. Only relevant when a live catalog was consulted; an unrecognized model is otherwise a warning already."
       ),
   },
-  async ({ agent, engine, model, reasoning_effort, tool_profile, allow_unknown_model }) => {
+  async ({ agent, engine, model, reasoning_effort, speed, tool_profile, allow_unknown_model }) => {
     let adapter;
     try {
       adapter = getAdapter(agent);
@@ -3518,6 +3551,7 @@ server.tool(
       requireBinary,
       model: model ?? null,
       reasoningEffort: reasoning_effort ?? null,
+      speed,
       toolProfile: tool_profile ?? null,
       allowUnknownModel: allow_unknown_model === true,
       discoveredModels,
@@ -3546,6 +3580,7 @@ server.tool(
                 model_known: resolution.modelKnown,
                 accepted_efforts: resolution.efforts,
                 reasoning_effort: resolution.reasoningEffort,
+                speed: resolution.speed,
                 default_effort: resolution.defaultEffort,
                 effective_effort: resolution.effectiveEffort,
               },

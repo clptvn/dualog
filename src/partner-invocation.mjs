@@ -131,8 +131,10 @@ export function detectPartnerTerminalFailure(captureText) {
   return null;
 }
 
-function normalizeToolProfile(toolProfile) {
-  return VALID_TOOL_PROFILES.has(toolProfile) ? toolProfile : "read";
+function normalizeToolProfile(toolProfile, adapter) {
+  return VALID_TOOL_PROFILES.has(toolProfile) || Object.hasOwn(adapter.toolProfiles, toolProfile)
+    ? toolProfile
+    : "read";
 }
 
 function parsePositiveInt(value, fallback) {
@@ -545,6 +547,7 @@ export async function runPartnerCommand({
   projectPath,
   model,
   reasoningEffort,
+  speed = null,
   toolProfile,
   timeoutMs,
   log,
@@ -561,13 +564,13 @@ export async function runPartnerCommand({
   const normalizedAgent = normalizeAgent(partnerAgent, "codex");
   const partnerDisplay =
     tryGetAdapter(normalizedAgent)?.displayName ?? getAgentDisplayName(normalizedAgent);
-  const normalizedToolProfile = normalizeToolProfile(toolProfile);
+  const resolvedAdapter = getAdapter(normalizedAgent);
+  const normalizedToolProfile = normalizeToolProfile(toolProfile, resolvedAdapter);
 
   if (!sessionDir) {
     throw new Error("Partner invocation requires sessionDir");
   }
 
-  const resolvedAdapter = getAdapter(normalizedAgent);
   const turnId = `${tempPrefix || normalizedAgent}-${Date.now()}-${crypto
     .randomBytes(4)
     .toString("hex")}`;
@@ -656,6 +659,7 @@ export async function runPartnerCommand({
         donePath,
         model,
         reasoningEffort,
+        speed,
         allowUnknownModel,
         toolProfile: normalizedToolProfile,
         timeoutMs,
@@ -728,6 +732,7 @@ export async function runPartnerCommand({
         sessionName,
         model,
         reasoningEffort,
+        speed,
         toolProfile: normalizedToolProfile,
         initialPrompt: bootstrap,
         discoveredModels,
@@ -828,6 +833,7 @@ export async function runPartnerCommand({
       tool_profile: normalizedToolProfile,
       model: model || null,
       reasoning_effort: reasoningEffort || null,
+      speed,
       status: "starting",
       started_at: new Date().toISOString(),
     };

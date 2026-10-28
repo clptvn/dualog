@@ -15,6 +15,8 @@ Before starting, confirm the `dualog` MCP tools are available. If `mcp__dualog__
 
 ## Parse the user's request
 
+For Codex partners, pass `speed: "ultrafast"` only when the user explicitly requests ultrafast mode, or `speed: "fast"` only when the user explicitly requests fast mode (including `speed:ultrafast` / `speed:fast` tokens). Strip these speed tokens before interpreting the remaining arguments. Otherwise omit `speed`. Never infer speed from urgency, a request for a quick review, model, effort, or host settings. Never substitute one speed for the other; non-Codex partners do not accept this option. Check the start response's `speed` against the request.
+
 Interpret the invocation text as the feature request plus optional controls:
 
 - `rounds:N`: optional soft round budget override

@@ -74,6 +74,9 @@ function normalizeRunnerRuntimeDecision(decision, source) {
     );
   }
   const engine = decision.engine;
+  if (decision.speed != null && !["fast", "ultrafast"].includes(decision.speed)) {
+    throw new Error(`${source} runtime decision has an invalid Codex speed`);
+  }
   if (!ENGINES.includes(engine)) {
     throw new Error(
       `${source} runtime decision has unknown engine ${JSON.stringify(engine)}. ` +
@@ -172,6 +175,7 @@ function normalizeRunnerRuntimeDecision(decision, source) {
     tmuxLauncher,
     tmuxControlBinary,
     tmuxSocketName,
+    ...(decision.speed != null ? { speed: decision.speed } : {}),
   });
 }
 

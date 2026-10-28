@@ -9,6 +9,8 @@ Use this skill when the user wants Claude Code to review code changes through th
 
 ## Parse the user's invocation
 
+For Codex partners, pass `speed: "ultrafast"` only when the user explicitly requests ultrafast mode, or `speed: "fast"` only when the user explicitly requests fast mode (including `speed:ultrafast` / `speed:fast` tokens). Strip these speed tokens before interpreting the remaining arguments. Otherwise omit `speed`. Never infer speed from urgency, a request for a quick review, model, effort, or host settings. Never substitute one speed for the other; non-Codex partners do not accept this option. Check the start response's `speed` against the request.
+
 Interpret the user's invocation text as:
 
 - `diff_target`: `uncommitted` (default), `staged`, `branch`, or `commit:<sha>`

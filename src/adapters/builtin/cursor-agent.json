@@ -18,6 +18,9 @@
   "effortDelivery": "none",
   "models": [],
   "defaultToolProfile": "read",
+  "nativeSubagents": {
+    "instructions": "Use the native Task tool, issuing all specialist Task calls together in one message for parallel execution. Use general-purpose isolated agents with explicit task instructions, not the faster Explore role. Await every task result before consolidating."
+  },
   "toolProfiles": {},
   "mcp": { "strategy": "none" },
   "configIsolation": null,

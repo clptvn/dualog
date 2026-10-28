@@ -296,6 +296,7 @@ export function negotiate(adapter, options = {}) {
     sessionDir: options.sessionDir ?? process.cwd(),
     model: options.model ?? null,
     reasoningEffort: options.reasoningEffort ?? null,
+    speed: options.speed ?? null,
     toolProfile,
     allowUnknownModel,
     discoveredModels,
@@ -333,7 +334,7 @@ export function negotiate(adapter, options = {}) {
   // A read-only tool profile that the adapter can only express as prompt
   // wording is a safety property the host must not assume holds.
   if (
-    toolProfile === "read" &&
+    ["read", "pr-review"].includes(toolProfile) &&
     adapter.capabilities.toolProfiles !== "flags" &&
     adapter.capabilities.writesFiles
   ) {
@@ -493,6 +494,7 @@ export async function describeAdapter(
     reasoning_efforts: adapter.reasoningEfforts,
     models: adapter.models,
     tool_profiles: Object.keys(adapter.toolProfiles),
+    native_subagents: Boolean(adapter.nativeSubagents),
     mcp_suppression: adapter.mcp.strategy,
     config_isolation: adapter.configIsolation?.env ?? null,
     completion: adapter.completion.sidecar,

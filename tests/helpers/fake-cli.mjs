@@ -29,6 +29,7 @@ import path from "path";
 
 const behavior = ${JSON.stringify(behavior)};
 const reply = ${JSON.stringify(reply)};
+const nativeOptions = ${JSON.stringify(options.native ?? {})};
 
 // The bootstrap reaches us the same way it reaches a real partner: as the last
 // positional argument, or on stdin.
@@ -70,7 +71,53 @@ if (!donePath && resultPath) {
   donePath = path.join(path.dirname(resultPath), "done.json");
 }
 
-if (behavior === "hang") { setInterval(() => {}, 1000); }
+if (behavior === "native-panel") {
+  const sessionDir = path.resolve(path.dirname(resultPath), "../..");
+  const panelDir = path.join(sessionDir, "panel");
+  const taskPrompt = fs.readFileSync(path.join(path.dirname(resultPath), "prompt.md"), "utf-8");
+  if (taskPrompt.includes("## Native Delegation")) {
+    if (nativeOptions.hang) {
+      fs.writeFileSync(path.join(panelDir, "waiting"), "");
+      await new Promise(() => setInterval(() => {}, 1000));
+    }
+    const manifest = JSON.parse(fs.readFileSync(path.join(panelDir, "manifest.json"), "utf-8"));
+    const events = path.join(panelDir, "events.jsonl");
+    const event = (aspect, kind) => fs.appendFileSync(events, JSON.stringify({ aspect, kind }) + "\\n");
+    await Promise.all(manifest.map(async ({ aspect, task }, index) => {
+      event(aspect, "start");
+      await new Promise((resolve) => setTimeout(resolve, 100 * (manifest.length - index)));
+      if (aspect === nativeOptions.omitAspect) return;
+      const declared = JSON.parse(task.match(/\\{"status":"ok","result_path":.*,"summary":"completed","error":null\\}/u)[0]);
+      const report = "### Normalized Findings\\n[CORRECTNESS] src/app.ts:4 — retry loop never terminates\\nASPECT_RESULT: FINDINGS";
+      fs.writeFileSync(declared.result_path, report);
+      fs.writeFileSync(path.join(path.dirname(declared.result_path), "done.json"), JSON.stringify({
+        status: aspect === nativeOptions.failedAspect ? "error" : "ok",
+        error: aspect === nativeOptions.failedAspect ? "native child failed" : null,
+      }));
+      event(aspect, "end");
+    }));
+    if (!nativeOptions.premature && !nativeOptions.omitAspect) {
+      const aggregatePath = path.join(panelDir, "aggregate_prompt.md");
+      const deadline = Date.now() + 15000;
+      while (!fs.existsSync(aggregatePath)) {
+        if (Date.now() > deadline) throw new Error("runner never released consolidation");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const aggregate = fs.readFileSync(aggregatePath, "utf-8");
+      fs.writeFileSync(path.join(panelDir, "received_aggregate.md"), aggregate);
+      const ids = [...new Set([...aggregate.matchAll(/^- (F-[a-z0-9-]+) \\[CORRECTNESS\\]/gmu)].map((match) => match[1]))];
+      const dispositions = ids.map((id) => "FINDING_DISPOSITION: " + id + " | false-positive | fixture verified this is synthetic");
+      fs.writeFileSync(resultPath, "### Normalized Findings\\n(none)\\n" + dispositions.join("\\n") + "\\nREVIEW_VERDICT: APPROVE");
+    } else {
+      fs.writeFileSync(resultPath, "### Normalized Findings\\n(none)\\nREVIEW_VERDICT: APPROVE");
+    }
+  } else {
+    fs.writeFileSync(resultPath, reply);
+  }
+  fs.writeFileSync(donePath, JSON.stringify({ status: "ok", result_path: resultPath }));
+  process.exit(0);
+}
+else if (behavior === "hang") { setInterval(() => {}, 1000); }
 else if (behavior === "crash") {
   process.stderr.write("fake partner: exploded\\n");
   process.exit(1);

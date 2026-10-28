@@ -43,6 +43,18 @@ async function listTools() {
 
 const TOOLS = await listTools();
 
+test("Codex speed is optional and requires an explicit request on every entry point", () => {
+  for (const name of ["start_dialog", "start_code_review", "start_pr_review", "check_adapter"]) {
+    const { inputSchema } = TOOLS.find((tool) => tool.name === name);
+    assert.deepEqual(inputSchema.properties.speed.enum, ["fast", "ultrafast"]);
+    assert.ok(!inputSchema.required?.includes("speed"));
+    assert.equal(inputSchema.properties.speed.default, undefined);
+    assert.match(inputSchema.properties.speed.description, /ONLY when the user explicitly requests ultrafast/);
+    assert.match(inputSchema.properties.speed.description, /ONLY when the user explicitly requests fast/);
+    assert.match(inputSchema.properties.speed.description, /Never infer/);
+  }
+});
+
 test("the server exposes a tool surface to assert against", () => {
   assert.ok(TOOLS.length > 0, "no tools were served");
 });

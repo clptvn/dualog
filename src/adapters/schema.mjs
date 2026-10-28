@@ -727,6 +727,14 @@ export const AdapterManifest = z
 
     defaultToolProfile: z.string().default("read"),
     toolProfiles: z.record(z.string(), ToolProfile).default({}),
+    nativeSubagents: z
+      .object({
+        instructions: z.string().trim().min(1),
+        toolProfile: z.string().min(1).default("read"),
+      })
+      .strict()
+      .nullable()
+      .optional(),
 
     mcp: McpSuppression,
     configIsolation: ConfigIsolation.nullable().default(null),
@@ -813,6 +821,14 @@ export const AdapterManifest = z
   .superRefine((m, ctx) => {
     const fail = (message, path) =>
       ctx.addIssue({ code: "custom", message, path });
+
+    if (
+      m.nativeSubagents &&
+      m.nativeSubagents.toolProfile !== m.defaultToolProfile &&
+      !Object.hasOwn(m.toolProfiles, m.nativeSubagents.toolProfile)
+    ) {
+      fail("nativeSubagents.toolProfile must name an existing tool profile", ["nativeSubagents", "toolProfile"]);
+    }
 
     if (!m.engines.allowed.includes(m.engines.default)) {
       fail(

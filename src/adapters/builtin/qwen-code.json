@@ -25,6 +25,9 @@
     "capabilityProbe": "ollama-show"
   },
   "defaultToolProfile": "read",
+  "nativeSubagents": {
+    "instructions": "Use Qwen's native agent tool to start one regular isolated-context agent per aspect in parallel. Do not use the fork subagent type or external CLI executors. Await every completion notification; use list_agents and send_message as needed to collect outcomes before consolidating."
+  },
   "toolProfiles": {},
   "mcp": { "strategy": "flag" },
   "configIsolation": {

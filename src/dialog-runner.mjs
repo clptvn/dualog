@@ -392,6 +392,7 @@ async function main() {
           projectPath,
           model: PARTNER_MODEL,
           reasoningEffort: REASONING_EFFORT,
+          speed: PREFLIGHT_RUNTIME?.speed ?? null,
           allowUnknownModel: ALLOW_UNKNOWN_MODEL,
           toolProfile: TOOL_PROFILE,
           timeoutMs: PARTNER_TIMEOUT_MS,

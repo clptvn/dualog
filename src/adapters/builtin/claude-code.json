@@ -80,7 +80,15 @@
   },
 
   "defaultToolProfile": "read",
+  "nativeSubagents": {
+    "toolProfile": "pr-review",
+    "instructions": "Use the Agent tool with general-purpose subagents and run_in_background:true for EVERY specialist. Start ALL children before waiting for any child, saving their agent/task IDs. Collect every completion using TaskOutput or completion notifications; use TaskStop to stop remaining tasks on failure. Give each agent only its manifest task. Do not fork the orchestrator context or use Explore, which may select a different model."
+  },
   "toolProfiles": {
+    "pr-review": {
+      "allowedTools": "Read,Grep,Glob,Bash,LSP,Agent,TaskOutput,TaskStop",
+      "disallowedTools": "Edit,Write,NotebookEdit"
+    },
     "read": {
       "allowedTools": "Read,Grep,Glob,Bash,LSP",
       "disallowedTools": "Edit,Write,NotebookEdit"
@@ -130,6 +138,10 @@
       }
     ],
     "headless": [
+      {
+        "when": { "equals": { "key": "toolProfile", "value": "pr-review" } },
+        "args": ["--verbose", "--output-format", "stream-json"]
+      },
       {
         "args": [
           "--print",

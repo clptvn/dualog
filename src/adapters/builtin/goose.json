@@ -26,7 +26,11 @@
     "capabilityProbe": "ollama-show"
   },
   "defaultToolProfile": "read",
-  "toolProfiles": {},
+  "nativeSubagents": {
+    "toolProfile": "pr-review",
+    "instructions": "Use the Summon extension's delegate tool (summon__delegate). Issue one foreground delegate call per aspect together in the same batch and await every result. Do not use the removed background subagent or orchestrator APIs. Pass each child's manifest task as its instructions."
+  },
+  "toolProfiles": { "pr-review": {} },
   "mcp": { "strategy": "flag" },
   "configIsolation": {
     "env": "GOOSE_PATH_ROOT",
@@ -38,6 +42,7 @@
   "argv": {
     "headless": [
       { "args": ["run", "--no-session", "--no-profile", "--with-builtin", "developer", "-q"] },
+      { "when": { "equals": { "key": "toolProfile", "value": "pr-review" } }, "args": ["--with-builtin", "summon"] },
       { "when": { "set": "model" }, "args": ["--model", "{{model}}"] },
       { "args": ["-t", "{{initialPrompt}}"] }
     ]

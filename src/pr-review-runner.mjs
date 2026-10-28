@@ -3,15 +3,15 @@
  * PR Review Runner - drives a multi-specialist review panel against one change.
  *
  * Where review-runner.mjs runs ONE reviewer that looks at everything, this runs
- * several narrow specialists in sequence and then consolidates them, which is
+ * several narrow specialists and then consolidates them, which is
  * the shape of Anthropic's pr-review-toolkit plugin. The specialists live in
  * pr-review-aspects.mjs; this file is the loop that schedules them.
  *
  * Three phases:
  *
- *   1. Panel — one partner turn per selected aspect. Each is a fresh invocation
- *      carrying only its own lens, and each appends its report as soon as it
- *      lands so the host can read pass 1 while pass 2 is still running.
+ *   1. Panel — a native orchestrator delegates selected aspects in parallel,
+ *      or an adapter without nativeSubagents runs separate sequential turns.
+ *      Reports are committed in planned order under runner-owned finding IDs.
  *   2. Consolidation — one turn that merges the reports, re-ranks by real
  *      severity, and is the FIRST turn permitted to emit a REVIEW_VERDICT. No
  *      specialist pass may; follow-up turns are required to.
@@ -19,15 +19,9 @@
  *      spending six specialist turns to confirm one fix would exhaust the round
  *      budget on a line of code.
  *
- * The passes are sequential rather than parallel, which is the one place this
- * departs from the plugin's optional "parallel" mode. It is not a performance
- * oversight: every TMUX partner turn in a session writes the same
- * current_terminal.json, and two concurrent turns in one session directory would
- * leave that record describing whichever finished last -- so end_dialog and
- * check_partner_alive would be reasoning about, and terminating, the wrong pane.
- * A headless partner has no such record, but shares this session's
- * partner_processing marker and last_error.txt, which carry the same
- * single-writer assumption.
+ * Native delegation keeps one outer partner turn, so terminal tracking and
+ * lifecycle cleanup retain their single-owner contract. Only this runner
+ * commits reports and releases the numbered ledger for consolidation.
  */
 
 import fs from "fs";
@@ -57,6 +51,7 @@ import {
 } from "./runner-lifecycle.mjs";
 import { tryGetAdapter } from "./adapters/registry.mjs";
 import { terminateActiveHeadlessTurnsAndWait } from "./engines/headless.mjs";
+import { startNativePanel } from "./pr-review-native.mjs";
 import {
   MAX_REVIEW_DIFF_CHARS,
   requestedReasoningEffortForAdapter,
@@ -450,7 +445,7 @@ function readActiveDiff(originalDiff) {
   return { text: originalDiff, authoritativePath: DIFF_PATH };
 }
 
-async function runTurn(prompt, tempPrefix, runtimeContext) {
+async function runTurn(prompt, tempPrefix, runtimeContext, toolProfile = "read") {
   return runPartnerCommand({
     partnerAgent: PARTNER_AGENT,
     partnerCommand,
@@ -458,6 +453,8 @@ async function runTurn(prompt, tempPrefix, runtimeContext) {
     projectPath,
     model: PARTNER_MODEL,
     reasoningEffort: REASONING_EFFORT,
+    speed: PREFLIGHT_RUNTIME?.speed ?? null,
+    toolProfile,
     allowUnknownModel: ALLOW_UNKNOWN_MODEL,
     timeoutMs: PARTNER_TIMEOUT_MS,
     log,
@@ -557,6 +554,36 @@ async function main() {
   const reports = [];
   const priorFindings = [];
   let terminalFailure = false;
+  const nativeConfig = meta.native_subagents;
+  const nativePanel = nativeConfig
+    ? await startNativePanel({
+        sessionDir,
+        projectPath: partnerProjectPath,
+        aspects: selected,
+        instructions: nativeConfig.instructions,
+        model: PARTNER_MODEL,
+        reasoningEffort: REASONING_EFFORT,
+        speed: PREFLIGHT_RUNTIME?.speed ?? null,
+        toPartnerPath: runtimeContext.toPartnerPath,
+        buildPrompt: (aspect) => buildAspectPrompt({
+          aspect,
+          meta,
+          diff: originalDiff,
+          projectPath: partnerProjectPath,
+          authoritativeDiffPath: partnerDiffPaths.get(DIFF_PATH),
+          maxDiffChars: MAX_REVIEW_DIFF_CHARS,
+          passIndex: selected.indexOf(aspect) + 1,
+          passTotal: selected.length + 1,
+          reviewFocus,
+        }),
+        run: (prompt) => runTurn(
+          prompt,
+          `${PARTNER_AGENT}-pr-panel`,
+          runtimeContext,
+          nativeConfig.toolProfile
+        ),
+      })
+    : null;
 
   for (const [index, aspectId] of selected.entries()) {
     if (fs.existsSync(END_SIGNAL_PATH)) {
@@ -616,11 +643,13 @@ async function main() {
         priorFindings: priorFindings.slice(0, 40),
       });
 
-      const response = await runTurn(
-        prompt,
-        `${PARTNER_AGENT}-pr-${aspectId}`,
-        runtimeContext
-      );
+      const response = nativePanel
+        ? await nativePanel.readAspect(aspectId)
+        : await runTurn(
+            prompt,
+            `${PARTNER_AGENT}-pr-${aspectId}`,
+            runtimeContext
+          );
 
       // An empty response is a FAILED pass, not a clean one.
       //
@@ -790,11 +819,13 @@ async function main() {
         hostDisplay: HOST_DISPLAY,
         findingLedger: panelState.findings,
       });
-      const response = await runTurn(
-        prompt,
-        `${PARTNER_AGENT}-pr-aggregate`,
-        runtimeContext
-      );
+      const response = nativePanel
+        ? await nativePanel.aggregate(prompt)
+        : await runTurn(
+            prompt,
+            `${PARTNER_AGENT}-pr-aggregate`,
+            runtimeContext
+          );
 
       // Same rule as a panel pass, and it matters more here. An empty aggregate
       // was appended as a header-only message reading "Panel complete: 5 of 5
@@ -862,6 +893,19 @@ async function main() {
     );
   }
 
+  if (nativePanel && (ended || terminalFailure || !anyReport)) {
+    try {
+      await nativePanel.aggregate(
+        "The panel could not produce a usable review. Stop all children and return NEEDS_DISCUSSION with the failure; do not approve."
+      );
+    } catch (err) {
+      log(`Native panel stopped: ${err.message}`);
+    }
+  }
+  // A failed consolidation-prompt write must not strand a native coordinator
+  // waiting for a file while this runner starts accepting follow-up turns.
+  if (nativePanel) await nativePanel.stop();
+
   panelState.phase = "follow_up";
   panelState.pending = [];
   panelState.panel_finished_at = new Date().toISOString();
@@ -881,7 +925,7 @@ async function main() {
     log("=== PR review runner exiting (partner terminal failure) ===");
     return "partner_terminal_failure";
   }
-  if (ended) {
+  if (ended || fs.existsSync(END_SIGNAL_PATH)) {
     log("=== PR review runner exiting (end signal) ===");
     return "end_signal";
   }

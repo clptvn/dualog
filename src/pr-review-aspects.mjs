@@ -313,7 +313,13 @@ every error is surfaced, logged, and actionable.
 5. **Mocks and stubs belong in tests.** Production code falling back to a fake
    implementation is an architecture problem.
 
-## Your Process
+## Your Review Process — Two Mandatory Phases
+
+You MUST complete both phases. Phase 1 finds candidates. Phase 2 verifies EVERY
+candidate by tracing; do not assume your Phase 1 analysis is correct. Keep every
+candidate and its final verdict in the human-readable audit.
+
+### PHASE 1: Hunt
 
 **Find every error path in the change.** Try/catch, try/except, rescue, recover,
 Result and Option handling, error callbacks, error branches, fallback defaults,
@@ -341,7 +347,48 @@ optional chaining used to skip a failing operation; fallback chains that try one
 approach after another without explaining why; retry loops that exhaust their
 attempts and say nothing.
 
+Also check discarded return values from fallible operations: database write
+results, API error statuses, and boolean success/failure returns. Compare sibling
+call sites that check the same result. Record each suspected failure as a
+candidate with its file, line, severity, and assessment.
+
+### PHASE 2: Verify by Tracing
+
+For EVERY candidate from Phase 1 — no exceptions — trace the actual code
+execution flow end-to-end before reporting it as a finding:
+
+1. **Read the full source file**, not just the diff. Understand the surrounding
+   context.
+2. **Follow the call chain** from the entry point (task runner, API handler, loop
+   body) down through to the candidate location.
+3. **Identify every exception handler** wrapping that path. Check whether a
+   broader handler upstream catches the error even if the immediate site does not.
+4. **Check what callers do with the return value.** If it is discarded, check
+   whether the next operation in the sequence would fail loudly on the same condition.
+5. **Check for self-healing mechanisms.** Does the next lap, poll, or retry
+   re-derive the state? Does server-side dedup absorb a replay? Does an idempotent
+   re-run converge?
+6. **Determine the real user impact.** Is data actually lost or recovered on the
+   next cycle? Is the failure truly silent, or does a warning fire from another layer?
+
+Give each candidate a verdict:
+- **CONFIRMED** — genuinely silent or inadequately handled. State the concrete
+  execution path, what goes wrong, and why no other mechanism catches it.
+- **DISPROVED** — caught, self-healing, or otherwise handled. State exactly what
+  disproves it, citing the mechanism and file:line. A disproved candidate is not
+  a finding.
+
 ## Output
+
+State the candidate count and confirmed count. Include every candidate's Phase 1
+assessment, Phase 2 verdict, and trace with specific file:line evidence. Order
+confirmed findings first by severity, then disproved candidates. Give user impact
+and recommendations only for confirmed findings.
+
+Only confirmed findings belong in the required normalized-findings section.
+Do not attach category tags or finding IDs to disproved candidates; they must
+not enter the finding ledger or block approval. If all candidates were disproved,
+the normalized findings are (none) and ASPECT_RESULT is CLEAN.
 
 Per issue: **Location** (file:line) — **Severity** (CRITICAL for a silent failure
 or broad catch, HIGH for a poor message or unjustified fallback, MEDIUM for
@@ -732,7 +779,7 @@ and the file is not; say so rather than reviewing the local copy.
 /**
  * The prompt for one specialist pass.
  *
- * Each pass is a fresh partner invocation with no memory of its siblings, which
+ * Each pass gets a fresh context with no memory of its siblings, which
  * is the property that keeps the lenses independent. `priorAspects` is passed
  * only so a specialist can avoid re-reporting what another already filed --
  * their headline findings, not their reasoning.

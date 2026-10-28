@@ -76,6 +76,7 @@ export function resolveContext(adapter, options) {
     sessionName = null,
     model = null,
     reasoningEffort = null,
+    speed = null,
     toolProfile = null,
     initialPrompt = null,
     allowUnknownModel = false,
@@ -123,6 +124,18 @@ export function resolveContext(adapter, options) {
     });
   }
   const profile = adapter.toolProfiles[resolvedProfileName] ?? {};
+
+  const validSpeed = speed === null || (adapter.id === "codex" && ["fast", "ultrafast"].includes(speed));
+  if (!validSpeed) {
+    note({
+      code: "unsupported_speed",
+      severity: "error",
+      field: "speed",
+      requested: speed,
+      applied: null,
+      reason: 'speed must be "fast" or "ultrafast" and is only supported for Codex',
+    });
+  }
 
   let effectiveModel = model;
   if (model && !adapter.capabilities.modelFlag) {
@@ -386,6 +399,7 @@ export function resolveContext(adapter, options) {
     model: effectiveModel,
     reasoningEffort: effectiveEffort,
     reasoningEffortJson: effectiveEffort ? JSON.stringify(effectiveEffort) : null,
+    speed: validSpeed ? speed : null,
     initialPrompt,
     toolProfile: resolvedProfileName,
     toolProfileAllowedTools: profile.allowedTools ?? null,
@@ -404,6 +418,7 @@ export function resolveContext(adapter, options) {
       modelEntry: entry,
       efforts: entry?.efforts ?? null,
       reasoningEffort: effectiveEffort,
+      speed: validSpeed ? speed : null,
       defaultEffort,
       // What the turn will actually run at, whether we said so or the CLI did.
       effectiveEffort: effectiveEffort ?? defaultEffort,
